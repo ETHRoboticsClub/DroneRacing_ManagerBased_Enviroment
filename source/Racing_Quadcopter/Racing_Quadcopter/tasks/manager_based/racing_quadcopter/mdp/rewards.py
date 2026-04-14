@@ -117,6 +117,7 @@ DIRECT_GATE_PROGRESS = 2.0
 DIRECT_GATE_CENTERING = 0.5
 DIRECT_VELOCITY_TOWARD_GATE = 0.1
 DIRECT_VELOCITY_LIMIT = -0.05
+DIRECT_PERCEPTION = -0.01
 DIRECT_ORIENTATION = -0.005
 DIRECT_ANGULAR_VELOCITY = -0.001
 DIRECT_ACTION_SMOOTHNESS = -0.0001
@@ -130,6 +131,7 @@ WEIGHT_GATE_PROGRESS = MANAGER_SCALE * DIRECT_GATE_PROGRESS
 WEIGHT_GATE_CENTERING = MANAGER_SCALE * DIRECT_GATE_CENTERING
 WEIGHT_VELOCITY_TOWARD_GATE = MANAGER_SCALE * DIRECT_VELOCITY_TOWARD_GATE
 WEIGHT_VELOCITY_LIMIT = MANAGER_SCALE * DIRECT_VELOCITY_LIMIT
+WEIGHT_PERCEPTION = MANAGER_SCALE * DIRECT_PERCEPTION
 WEIGHT_ORIENTATION = MANAGER_SCALE * DIRECT_ORIENTATION
 WEIGHT_ANGULAR_VELOCITY = MANAGER_SCALE * DIRECT_ANGULAR_VELOCITY
 WEIGHT_ACTION_SMOOTHNESS = MANAGER_SCALE * DIRECT_ACTION_SMOOTHNESS
@@ -171,6 +173,30 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     centering_value = torch.exp(-3.0 * lateral_dist / gate_size)
     return centering_value * proximity_factor * on_approach_side.float()
 
+def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi / 3.0) -> torch.Tensor:
+    """Penalty when next gate leaves the forward camera cone.
+
+    p_perc = lambda_perc * theta_cam if theta_cam > theta_threshold else 0
+    """
+    drone_pos = env._robot.data.root_pos_w
+    drone_quat = env._robot.data.root_quat_w
+    gate_pos, gate_ori = gather_current_gate(env)
+
+    to_gate = gate_pos - drone_pos
+    to_gate_norm = to_gate / (torch.norm(to_gate, dim=1, keepdim=True) + 1e-8)
+
+    drone_forward = quat_apply(drone_quat, env._y_local.expand(env.num_envs, -1))
+    drone_forward_norm = drone_forward / (torch.norm(drone_forward, dim=1, keepdim=True) + 1e-8)
+
+    gate_fwd = gate_forward(env, gate_ori)
+    dist_to_plane = -(to_gate * gate_fwd).sum(dim=1)
+    on_approach_side = dist_to_plane <= 0.0
+
+    cos_theta = torch.sum(drone_forward_norm * to_gate_norm, dim=1).clamp(-1.0, 1.0)
+    theta_cam = torch.acos(cos_theta)
+
+    penalty = theta_cam * on_approach_side.float()
+    return torch.where(theta_cam > theta_threshold, penalty, torch.zeros_like(theta_cam))
 
 def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
     drone_pos = env._robot.data.root_pos_w

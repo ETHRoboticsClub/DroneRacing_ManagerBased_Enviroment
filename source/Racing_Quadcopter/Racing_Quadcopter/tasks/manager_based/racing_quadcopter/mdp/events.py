@@ -56,50 +56,134 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     return gate_log
 
 
-def apply_racing_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
-    """Reset gate progress and place the robot at the start line (behind gate 0)."""
-    env._current_gate_idx[env_ids] = 0
-    env._gates_passed[env_ids] = 0
+def _quat_from_euler_xyz(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Quaternion from XYZ Euler angles in wxyz order."""
+    hr = 0.5 * roll
+    hp = 0.5 * pitch
+    hy = 0.5 * yaw
+    cr, sr = torch.cos(hr), torch.sin(hr)
+    cp, sp = torch.cos(hp), torch.sin(hp)
+    cy, sy = torch.cos(hy), torch.sin(hy)
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    return torch.stack([qw, qx, qy, qz], dim=-1)
 
-    first_gate_pos = env._gate_positions[env_ids, 0]
-    first_gate_ori = env._gate_orientations[env_ids, 0]
-    fwd = quat_apply(first_gate_ori, env._y_local.expand(len(env_ids), -1))
 
-    start_pos = first_gate_pos - 2.0 * fwd
-    start_pos[:, 2] = first_gate_pos[:, 2]
-
+def _write_spawn_state(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    start_pos: torch.Tensor,
+    start_quat: torch.Tensor,
+    root_vel: torch.Tensor,
+    init_actions: torch.Tensor | None = None,
+) -> None:
     root_poses = torch.zeros(len(env_ids), 7, device=env.device)
     root_poses[:, :3] = start_pos
-    root_poses[:, 3:7] = first_gate_ori
-    root_vel = torch.zeros(len(env_ids), 6, device=env.device)
+    root_poses[:, 3:7] = start_quat
 
     joint_pos = env._robot.data.default_joint_pos[env_ids]
     joint_vel = env._robot.data.default_joint_vel[env_ids]
-
     env._robot.write_root_pose_to_sim(root_poses, env_ids)
     env._robot.write_root_velocity_to_sim(root_vel, env_ids)
     env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
     env._prev_drone_pos[env_ids] = start_pos
-    env._actions_buf[env_ids] = 0.0
-    env._prev_actions[env_ids] = 0.0
+    if init_actions is None:
+        env._actions_buf[env_ids] = 0.0
+        env._prev_actions[env_ids] = 0.0
+    else:
+        env._actions_buf[env_ids] = init_actions
+        env._prev_actions[env_ids] = init_actions
+
+
+
+def _apply_ground_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Original ground initialization: start behind first gate with gate orientation."""
+    n = len(env_ids)
+    env._current_gate_idx[env_ids] = 0
+    env._gates_passed[env_ids] = 0
+    first_gate_pos = env._gate_positions[env_ids, 0]
+    first_gate_ori = env._gate_orientations[env_ids, 0]
+    fwd = quat_apply(first_gate_ori, env._y_local.expand(n, -1))
+
+    start_pos = first_gate_pos - 2.0 * fwd
+    start_pos[:, 2] = first_gate_pos[:, 2]
+    start_quat = first_gate_ori
+    root_vel = torch.zeros(n, 6, device=env.device)
+
+    _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel)
+
+
+def _apply_uniform_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Uniform initialization in expanded per-env gate bounding box."""
+    n = len(env_ids)
+    gate_pos = env._gate_positions[env_ids]  # [N, G, 3]
+    mins = gate_pos.amin(dim=1)
+    maxs = gate_pos.amax(dim=1)
+
+    # Expand borders by 5m in x/y and 3m in z.
+    x_min = mins[:, 0] - 2.0
+    x_max = maxs[:, 0] + 2.0
+    y_min = mins[:, 1] - 2.0
+    y_max = maxs[:, 1] + 2.0
+    z_min = 0.0
+    z_max = 4.0
+    rx = torch.rand(n, device=env.device)
+    ry = torch.rand(n, device=env.device)
+    rz = torch.rand(n, device=env.device)
+    x = x_min + rx * (x_max - x_min)
+    y = y_min + ry * (y_max - y_min)
+    z = z_min + rz * (z_max - z_min)
+    start_pos = torch.stack([x, y, z], dim=-1)
+
+    roll = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
+    pitch = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
+    yaw = -torch.pi + torch.rand(n, device=env.device) * (2.0 * torch.pi)
+    start_quat = _quat_from_euler_xyz(roll, pitch, yaw)
+
+    lin_vel = -0.5 + torch.rand(n, 3, device=env.device) * 1.0
+    ang_vel = -0.1 + torch.rand(n, 3, device=env.device) * 0.2
+    root_vel = torch.cat([lin_vel, ang_vel], dim=-1)
+
+    init_actions = -1.0 + torch.rand(n, 4, device=env.device) * 2.0
+    _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel, init_actions=init_actions)
+
+    # Start from nearest gate for uniformly sampled starts.
+    dist = torch.norm(gate_pos - start_pos.unsqueeze(1), dim=-1)
+    env._current_gate_idx[env_ids] = torch.argmin(dist, dim=1)
+    env._gates_passed[env_ids] = 0
+
+
+def reset_racing_spawn(
+    env: ManagerBasedRLEnv, env_ids: torch.Tensor | slice | None, method: str = "mixed"
+) -> None:
+    """Reset gate progress and sample initialization method.
+
+    Args:
+        method: One of ``"ground"``, ``"uniform"``, or ``"mixed"``.
+    """
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    if method == "ground":
+        _apply_ground_initialization(env, env_ids)
+    elif method == "uniform":
+        _apply_uniform_initialization(env, env_ids)
+    elif method == "mixed":
+        ground_prob = float(getattr(env.cfg, "ground_init_prob", 0.5))
+        use_ground = torch.rand(n, device=env.device) < ground_prob
+        ground_ids = env_ids[use_ground]
+        uniform_ids = env_ids[~use_ground]
+        if len(ground_ids) > 0:
+            _apply_ground_initialization(env, ground_ids)
+        if len(uniform_ids) > 0:
+            _apply_uniform_initialization(env, uniform_ids)
+    else:
+        raise ValueError(f"Unknown reset method '{method}'. Use 'ground', 'uniform', or 'mixed'.")
 
     if env.cfg.randomize_velocity_limit:
         lo, hi = env.cfg.velocity_limit_range
         env._velocity_limit[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo
-
-
-def reset_racing_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor | slice | None) -> None:
-    """Event term: place the drone at the task start after :func:`reset_scene_to_default`.
-
-    ``env_ids`` follows the event manager convention (tensor of indices, or ``slice(None)`` for all).
-    """
-    if env_ids is None:
-        return
-    if isinstance(env_ids, slice):
-        env_ids_t = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    else:
-        env_ids_t = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
-    if env_ids_t.numel() == 0:
-        return
-    apply_racing_spawn(env, env_ids_t)

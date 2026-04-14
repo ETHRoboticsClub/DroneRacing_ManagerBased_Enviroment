@@ -107,7 +107,8 @@ class RewardsCfg:
         func=racing_rewards.reward_velocity_toward_gate, weight=racing_rewards.WEIGHT_VELOCITY_TOWARD_GATE
     )
     velocity_limit = RewTerm(func=racing_rewards.penalty_velocity_limit, weight=racing_rewards.WEIGHT_VELOCITY_LIMIT)
-    orientation = RewTerm(func=racing_rewards.penalty_orientation, weight=racing_rewards.WEIGHT_ORIENTATION)
+    perception = RewTerm(func=racing_rewards.penalty_perception, weight=racing_rewards.WEIGHT_PERCEPTION)
+    # orientation = RewTerm(func=racing_rewards.penalty_orientation, weight=racing_rewards.WEIGHT_ORIENTATION)
     angular_velocity = RewTerm(
         func=racing_rewards.penalty_angular_velocity, weight=racing_rewards.WEIGHT_ANGULAR_VELOCITY
     )
@@ -126,7 +127,7 @@ class EventsCfg:
     """Reset pipeline: Isaac scene defaults, then racing start pose and buffers."""
 
     reset_scene_to_default = EventTerm(func=reset_scene_to_default, mode="reset")
-    reset_racing_spawn = EventTerm(func=reset_racing_spawn, mode="reset")
+    reset_racing_spawn = EventTerm(func=reset_racing_spawn, mode="reset", params={"method": "uniform"})
 
 
 @configclass
