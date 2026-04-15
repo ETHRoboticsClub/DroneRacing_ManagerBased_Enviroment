@@ -23,8 +23,9 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from Racing_Quadcopter.terrains.racing_terrain import create_racing_gates_terrain
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-from isaaclab.envs.mdp import base_ang_vel, base_lin_vel, projected_gravity, reset_scene_to_default, time_out
+from isaaclab.envs.mdp import *
 from isaaclab_assets import CRAZYFLIE_CFG
 
 from .mdp.actions import QuadcopterThrustActionCfg
@@ -34,12 +35,12 @@ from .mdp import rewards as racing_rewards
 from .mdp.terminations import collision_termination, lap_complete, runaway_velocity, upside_down
 
 
+
 @configclass
 class GateObservationConfig:
     """Observation parameters."""
 
     num_next_gates: int = 3
-    history_length: int = 0
     include_velocity_limit: bool = True
 
 
@@ -76,14 +77,42 @@ class ActionsCfg:
 @configclass
 class ObservationsCfg:
     """Policy observations."""
-
+    
     @configclass
     class PolicyCfg(ObsGroup):
-        base_lin_vel = ObsTerm(func=base_lin_vel, params={"asset_cfg": SceneEntityCfg("robot")})
-        base_ang_vel = ObsTerm(func=base_ang_vel, params={"asset_cfg": SceneEntityCfg("robot")})
-        projected_gravity = ObsTerm(func=projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
-        velocity_limit = ObsTerm(func=velocity_limit_obs)
-        obs_gates = ObsTerm(func=_compute_next_gates_rel_and_fwd_body)
+        history_length: int = 3
+        # base_lin_vel = ObsTerm(func=base_lin_vel, params={"asset_cfg": SceneEntityCfg("robot")}, history_length=history_length)
+        
+        #IMU 
+        base_ang_vel = ObsTerm(
+            func=base_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+            history_length=history_length,
+        )
+        projected_gravity = ObsTerm(
+            func=projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+            history_length=history_length,
+        )
+
+        #ROBOT
+        #TODO: Add motors speeds
+
+        #ACTION
+        last_action = ObsTerm(func=last_action, history_length=history_length)
+
+
+        #Perception
+        obs_gates = ObsTerm(
+            func=_compute_next_gates_rel_and_fwd_body,
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+            history_length=history_length,
+        )
+        velocity_limit = ObsTerm(func=velocity_limit_obs, history_length=history_length)
+        
+
 
 
         def __post_init__(self) -> None:
@@ -126,6 +155,28 @@ class RewardsCfg:
 class EventsCfg:
     """Reset pipeline: Isaac scene defaults, then racing start pose and buffers."""
 
+    randomize_robot_mass = EventTerm(
+        func=randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_robot_actuator_gains = EventTerm(
+        func=randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
     reset_scene_to_default = EventTerm(func=reset_scene_to_default, mode="reset")
     reset_racing_spawn = EventTerm(func=reset_racing_spawn, mode="reset", params={"method": "uniform"})
 
