@@ -60,7 +60,9 @@ class QuadcopterThrustAction(ActionTerm):
         self._processed_actions[:] = self._raw_actions
 
     def apply_actions(self):
-        self._asset.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+        self._asset.permanent_wrench_composer.set_forces_and_torques(
+            forces=self._thrust, torques=self._moment, body_ids=self._body_id
+        )
 
 
 @configclass
