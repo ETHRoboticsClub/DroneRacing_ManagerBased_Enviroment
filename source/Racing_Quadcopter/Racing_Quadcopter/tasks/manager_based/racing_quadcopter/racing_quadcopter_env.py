@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -16,94 +17,136 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
+
 from Racing_Quadcopter.terrains.racing_gates import get_gate_registry
+from .mdp import rewards as racing_rewards
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.rewards import update_racing_state
-from .mdp import rewards as racing_rewards
-import os
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg
 
 
 class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
-    """Gate racing with terrain meshes."""
+    """Gate racing environment with procedural gate terrain and manager-based RL."""
 
     cfg: RacingQuadcopterEnvCfg
 
     def __init__(self, cfg: RacingQuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
+        # Type-hint only; both are populated during load_managers → _prepare_racing_task.
         self._robot: Articulation
         self._contact_sensor: ContactSensor
         super().__init__(cfg, render_mode, **kwargs)
 
     def load_managers(self):
+        # _prepare_racing_task must come BEFORE super().load_managers() because the
+        # reward/obs/termination functions reference env buffers (e.g. _gate_positions,
+        # _actions_buf) at manager construction time to infer output shapes.
         self._prepare_racing_task()
         super().load_managers()
+        # filter_collisions is only supported on CPU; GPU broad-phase handles it automatically.
         if str(self.device) == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.scene.terrain.prim_path])
 
     def _prepare_racing_task(self) -> None:
+        """Allocate all racing-specific GPU buffers before managers are built."""
         self._robot = self.scene["robot"]
         self._contact_sensor = self.scene.sensors["contact_sensor"]
         self._setup_gate_tracking()
 
+        # Per-env speed cap; re-sampled each episode if cfg.randomize_velocity_limit.
         self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
+
+        # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
+
+        # Float 0/1 per env: set by check_gate_passages each step.
         self._gate_passed_buf = torch.zeros(self.num_envs, device=self.device)
+
+        # _crashed_buf: contact OR upside-down → drives crash penalty.
+        # _collision_termination_buf: contact-force only, used for early termination.
+        # They differ because upside-down fires the penalty but not the termination
+        # until the curriculum threshold is met.
         self._crashed_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._collision_termination_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Gate-frame basis vectors on device; reused in every quat_apply call.
+        # Gate convention: +Y = forward (passage), +X = right, +Z = up.
         self._y_local = torch.tensor([0.0, 1.0, 0.0], device=self.device)
         self._x_local = torch.tensor([1.0, 0.0, 0.0], device=self.device)
         self._z_local = torch.tensor([0.0, 0.0, 1.0], device=self.device)
 
+        # All body IDs monitored for contact; ".*" captures every link.
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*")
 
+        # Running episode stats (reset per env at episode end).
         self._episode_velocity_sum = torch.zeros(self.num_envs, device=self.device)
         self._episode_step_count = torch.zeros(self.num_envs, device=self.device)
         self._episode_collision_count = torch.zeros(self.num_envs, device=self.device)
+
+        # Per-passage quality stats accumulated each gate crossing.
         self._passage_velocity_sum = torch.zeros(self.num_envs, device=self.device)
         self._passage_centering_sum = torch.zeros(self.num_envs, device=self.device)
         self._passage_count = torch.zeros(self.num_envs, device=self.device)
 
+        # Curriculum gate: collision termination enabled only once the agent is competent.
+        # Starts False so early training always runs to timeout regardless of crashes.
         self._collision_detection_enabled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Snapshots of last episode metrics; used by curriculum check every step.
+        # Kept separate from live accumulators because those are zeroed at episode start.
         self._last_episode_gates_passed = torch.zeros(self.num_envs, device=self.device)
         self._last_episode_mean_velocity = torch.zeros(self.num_envs, device=self.device)
         self._last_episode_center_offset = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_gate_tracking(self) -> None:
+        """Build world-frame gate position/orientation tables for all envs.
+
+        Gate registry design:
+            racing_gates_terrain() stores its output in a module-level dict because
+            TerrainGenerator discards the function's return value. The dict is keyed
+            by (difficulty, seed). TerrainGenerator differentiates the seed per cell,
+            so a 4×4 grid produces 16 unique registry entries — every cell has its own
+            random gate layout. Difficulty varies per row (4 levels); columns within a
+            row share difficulty but differ in seed, so their circuits are distinct.
+
+        Centre-offset correction:
+            Gate positions are generated in a corner-origin local frame (origin at mesh
+            corner). TerrainGenerator places each cell so its CENTER sits at terrain_origin,
+            so we subtract (size_x/2, size_y/2, 0) before adding the origin.
+
+        Padding:
+            Different difficulty rows may have different gate counts. All tensors are
+            padded to max_gates; _gate_counts[env_id] stores the true count so modular
+            indexing never reads a padding slot.
+        """
         registry = get_gate_registry()
         if not registry:
             raise RuntimeError(
                 "Gate registry is empty — use terrain that calls racing_gates_terrain (MeshRacingGatesTerrainCfg)."
             )
 
-        # Registry may contain one entry per generated sub-terrain cell.
         gate_datas = list(registry.values())
         terrain = self.scene.terrain
         if terrain is None or terrain.cfg.terrain_generator is None:
             raise RuntimeError("Racing quadcopter requires a generator terrain with gates.")
         terrain_cfg = terrain.cfg.terrain_generator
+
+        # Shift from corner-origin (mesh builder) to centre-origin (TerrainGenerator).
         centre_offset = np.array([-terrain_cfg.size[0] / 2.0, -terrain_cfg.size[1] / 2.0, 0.0])
-        # Build per-cell base gate positions/orientations if registry provides multiple entries
+
         per_cell_base_pos = []
         per_cell_base_ori = []
         gate_size = None
         for gd in gate_datas:
-            local_gate_pos = gd.positions + centre_offset
+            local_gate_pos = gd.positions + centre_offset  # numpy [G, 3], centre-origin frame
             per_cell_base_pos.append(torch.from_numpy(local_gate_pos).float().to(self.device))
             per_cell_base_ori.append(torch.from_numpy(gd.orientations).float().to(self.device))
             gate_size = gd.gate_size if gate_size is None else gate_size
 
-        if len(per_cell_base_pos) == 0:
-            raise RuntimeError("Gate registry is empty — use terrain that calls racing_gates_terrain (MeshRacingGatesTerrainCfg).")
-
-        # Cells may have differing numbers of gates. Use the maximum across cells
-        # and pad shorter cells with zeros so tensors have fixed shape.
         per_cell_counts = [p.shape[0] for p in per_cell_base_pos]
         max_gates = max(per_cell_counts)
-        self._num_gates = max_gates
-        self._gate_size = gate_size
+        self._num_gates = max_gates  # padded dimension; use _gate_counts for true count per env
+        self._gate_size = gate_size  # aperture side length in metres (scalar)
 
         terrain_origins = terrain.terrain_origins
         if terrain_origins is None:
@@ -114,7 +157,6 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             terrain_origins = terrain_origins.to(self.device)
         num_rows, num_cols = terrain_origins.shape[:2]
 
-        # Optional debug: check whether terrains/gates are per-subterrain (per-cell)
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
                 keys = list(registry.keys())
@@ -123,57 +165,49 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             except Exception:
                 pass
             try:
-                # show terrain_origins stats
                 to_cpu = terrain_origins.cpu().numpy()
                 print("DEBUG_TERRAIN: terrain_origins_shape=", to_cpu.shape)
-                # show unique origins count (rounded)
                 uniq = np.unique(np.round(to_cpu.reshape(-1, 3), 5), axis=0)
                 print("DEBUG_TERRAIN: unique_origins_count=", uniq.shape[0])
                 print("DEBUG_TERRAIN: terrain_origins_sample=", to_cpu.reshape(-1, 3)[:5])
             except Exception:
                 pass
 
+        # Shape [N, max_gates, 3/4]; padded slots are zero.
         self._gate_positions = torch.zeros(self.num_envs, max_gates, 3, device=self.device)
         self._gate_orientations = torch.zeros(self.num_envs, max_gates, 4, device=self.device)
-        # Per-environment gate counts (actual number of gates before padding)
         self._gate_counts = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-        # Map registry entries to terrain grid cells. We assume insertion order of the
-        # registry matches the TerrainGenerator's generation order (row-major).
-        num_cells = num_rows * num_cols
+        # env_id → (row, col) mirrors TerrainGenerator's row-major cell assignment.
+        # If num_envs < num_rows*num_cols some cells have no drone (static geometry only).
+        # If num_envs > num_rows*num_cols the row/col indices wrap and multiple envs
+        # share the same layout but differ by terrain_origin.
         for env_id in range(self.num_envs):
             row = (env_id // num_cols) % num_rows
             col = env_id % num_cols
-            origin = terrain_origins[row, col]
+            origin = terrain_origins[row, col]  # world-frame cell centre [3]
 
-            cell_idx = row * num_cols + col
-            # if registry has fewer/more entries than cells, wrap or clamp
-            cell_idx = cell_idx % len(per_cell_base_pos)
-            cell_base_pos = per_cell_base_pos[cell_idx]
-            cell_base_ori = per_cell_base_ori[cell_idx]
+            # 16 registry entries for a 4×4 grid; wrap defensively if counts diverge.
+            cell_idx = (row * num_cols + col) % len(per_cell_base_pos)
+            cell_base_pos = per_cell_base_pos[cell_idx]  # [G, 3] centre-origin frame
+            cell_base_ori = per_cell_base_ori[cell_idx]  # [G, 4]
 
             n = cell_base_pos.shape[0]
-            # assign existing gates
-            self._gate_positions[env_id, :n] = cell_base_pos + origin
+            self._gate_positions[env_id, :n] = cell_base_pos + origin  # → world frame
             self._gate_orientations[env_id, :n] = cell_base_ori.clone()
-            # record how many gates this env actually has (for safe wrapping)
             self._gate_counts[env_id] = int(n)
-            # pad remaining slots with zeros for positions and orientations
-            if n < max_gates:
+            if n < max_gates:  # zero-pad remaining slots to prevent NaN contamination
                 self._gate_positions[env_id, n:] = 0.0
                 self._gate_orientations[env_id, n:] = 0.0
 
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
-                # print first few env gate centers to verify per-env differences
                 print("DEBUG_TERRAIN: gate_positions_env0_sample=", self._gate_positions[0, :3].cpu().numpy())
                 if self.num_envs > 1:
                     print("DEBUG_TERRAIN: gate_positions_env1_sample=", self._gate_positions[1, :3].cpu().numpy())
-                # count distinct per-env gate centroid positions (rough check)
                 centroids = self._gate_positions.mean(dim=1).cpu().numpy()
                 uniq_cent = np.unique(np.round(centroids, 4), axis=0)
                 print("DEBUG_TERRAIN: unique_env_centroids=", uniq_cent.shape[0], "of", self.num_envs)
-                # per-env non-zero gate counts and first-gate positions
                 try:
                     gates_nonzero = (self._gate_positions.abs().sum(dim=2) > 0.0).sum(dim=1).cpu().numpy()
                     print("DEBUG_TERRAIN: nonzero_gate_counts_sample=", gates_nonzero[:5])
@@ -183,17 +217,23 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             except Exception:
                 pass
 
+        # Wraps modulo _gate_counts[env_id] on each passage; never reads padding slots.
         self._current_gate_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Cumulative passages this episode; used for lap_complete and logging.
         self._gates_passed = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Previous-step drone position in world frame; required for line-crossing detection
+        # and for the gate-progress reward (distance reduction over one step).
         self._prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
         self.action_manager.process_action(action.to(self.device))
 
         self.recorder_manager.record_pre_step()
 
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
 
+        # Steps 2a-e: decimation loop — apply forces, advance physics, refresh sensors.
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1
             self.action_manager.apply_action()
@@ -204,6 +244,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 self.sim.render()
             self.scene.update(dt=self.physics_dt)
 
+        # Step 3: gate passage detection, crash buffer refresh, episode velocity stats.
+        # Must run after the final scene.update() so all sensor data is current.
         update_racing_state(self)
 
         self.episode_length_buf += 1
@@ -215,9 +257,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
-        # Optional debug: print per-term unweighted factors and weighted sums
         if os.getenv("DEBUG_REWARDS") == "1":
-            # compute unweighted factors directly from mdp.rewards functions
             with torch.no_grad():
                 terms = {
                     "gate_passage": racing_rewards.reward_gate_passage(self),
@@ -232,7 +272,6 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                     "crash": racing_rewards.penalty_crash(self),
                     "wrong_side": racing_rewards.penalty_wrong_side(self),
                 }
-
                 weights = {
                     "gate_passage": racing_rewards.WEIGHT_GATE_PASSAGE,
                     "gate_progress": racing_rewards.WEIGHT_GATE_PROGRESS,
@@ -246,29 +285,31 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                     "crash": racing_rewards.WEIGHT_CRASH,
                     "wrong_side": racing_rewards.WEIGHT_WRONG_SIDE,
                 }
-
                 per_term_weighted = {}
                 for k, v in terms.items():
                     w = weights.get(k, 1.0)
                     per_term_weighted[k] = (v * float(w))
-
-                # Sum weighted terms per-env
                 stacked = torch.stack(list(per_term_weighted.values()), dim=0)
                 summed = stacked.sum(dim=0)
-
                 print("DEBUG_REWARDS: dt=", float(self.step_dt), "reward_buf_sample=", self.reward_buf[:5].cpu().numpy())
                 print("DEBUG_REWARDS: summed_unscaled_sample=", summed[:5].cpu().numpy())
-                # print per-term means for quick inspection
                 for k, v in terms.items():
                     try:
                         print(f"DEBUG_REWARDS: term={k} mean={v.mean().item():.6e} weight={weights[k]:.6e} weighted_mean={(v*float(weights[k])).mean().item():.6e}")
                     except Exception:
                         pass
 
+        # Update _prev_drone_pos AFTER rewards: reward_gate_progress reads it as the
+        # "old" position to compute distance reduction over this step. Updating it first
+        # would make prev_dist == curr_dist → zero progress signal every step.
         self._prev_drone_pos[:] = self._robot.data.root_pos_w
 
+        # reset_terminated covers all non-timeout terminations (collision, upside-down,
+        # runaway velocity) — not just contact collisions.
         self._episode_collision_count += self.reset_terminated.float()
 
+        # First obs pass: only for the recorder (needs pre-reset state). Does NOT
+        # update history to avoid double-advancing the history buffer.
         if len(self.recorder_manager.active_terms) > 0:
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
@@ -276,13 +317,10 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
             self.recorder_manager.record_pre_reset(reset_env_ids)
-
             self._reset_idx(reset_env_ids)
-
             if self.sim.has_rtx_sensors() and self.cfg.num_rerenders_on_reset > 0:
                 for _ in range(self.cfg.num_rerenders_on_reset):
                     self.sim.render()
-
             self.recorder_manager.record_post_reset(reset_env_ids)
 
         self.command_manager.compute(dt=self.step_dt)
@@ -290,6 +328,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        # Second obs pass: the "real" obs returned to the policy, with history update.
+        # Runs after resets so freshly-spawned envs contribute correct observations.
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
@@ -297,11 +337,14 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
     def _reset_idx(self, env_ids: Sequence[int] | None):
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
 
+        # Must run BEFORE super()._reset_idx: the super call triggers the EventManager
+        # reset mode which zeros _gates_passed, _current_gate_idx, etc. via
+        # reset_racing_spawn. Calling collect_episode_metrics_before_reset after that
+        # would always log zero gates passed.
         gate_log = collect_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
 
-        # DEBUG: after reset, log current gate idx and counts for these envs
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
                 ids_cpu = env_ids_tensor.cpu().numpy()
