@@ -71,6 +71,7 @@ class GateData:
     gate_size: float            # aperture side length in metres (square gate)
     start_position: np.ndarray  # [3]  first waypoint — informational, not currently used
     start_tangent: np.ndarray   # [3]  tangent at first waypoint — informational
+    waypoints: np.ndarray       # [num_waypoints, 3]  full trajectory sample points, local frame
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +159,13 @@ def racing_gates_terrain(
         gate_size=gate_size,
         start_position=waypoints[0].copy(),
         start_tangent=tangents[0].copy(),
+        waypoints=waypoints.copy(),
     )
 
-    # Build trimesh geometry for every gate: frame bars + sky-facing index label
-    # + forward-direction indicator stick.
-    for i, (pos, quat) in enumerate(zip(gate_positions, gate_orientations)):
+    # Build trimesh geometry for every gate: frame bars only.
+    # Labels and direction indicators are drawn as collision-free USD BasisCurves
+    # from the env (see trajectory_vis.py).
+    for pos, quat in zip(gate_positions, gate_orientations):
         meshes_list.extend(_create_gate_frame(
             position=pos,
             orientation=quat,
@@ -170,8 +173,6 @@ def racing_gates_terrain(
             bar_thickness=cfg.bar_thickness,
             color=cfg.gate_color,
         ))
-        meshes_list.extend(_create_gate_label(pos, quat, i, gate_size))
-        meshes_list.extend(_create_direction_indicator(pos, quat))
 
     # The origin is the centre of this cell's ground patch (corner-origin + size/2).
     # TerrainGenerator uses this to align the mesh in the world grid.
@@ -519,137 +520,4 @@ def _create_gate_frame(
     return meshes
 
 
-# ---------------------------------------------------------------------------
-# 7-segment gate index labels
-# ---------------------------------------------------------------------------
-# trimesh has no built-in text primitive, so digits are assembled from thin
-# box segments arranged like a 7-segment LED display.
 
-_SEVEN_SEG: dict[str, str] = {
-    # segment IDs: a=top, b=top-right, c=bottom-right, d=bottom,
-    #              e=bottom-left, f=top-left, g=middle
-    "0": "abcdef",
-    "1": "bc",
-    "2": "abdeg",
-    "3": "abcdg",
-    "4": "bcfg",
-    "5": "acdfg",
-    "6": "acdefg",
-    "7": "abc",
-    "8": "abcdefg",
-    "9": "abcdfg",
-}
-
-_SEG_SL    = 0.08   # segment length (the long dimension of each bar)
-_SEG_SW    = 0.02   # segment width  (the short dimension)
-_SEG_DEPTH = 0.02   # thickness in the direction facing up (Z in digit local frame)
-_SEG_HALF  = _SEG_SL / 2.0 + _SEG_SW / 2.0  # half-step between segment centres
-
-# Segment geometry in digit-local space (X=digit-right, Y=digit-forward, Z=depth).
-# Digits lie flat in the world XY plane (Z = world up = thin depth direction).
-# _H_DIMS: wide in X (across digit), thin in Y (forward), thin in Z (depth).
-# _V_DIMS: thin in X, tall in Y (up the digit), thin in Z.
-_H_DIMS = np.array([_SEG_SL, _SEG_SW, _SEG_DEPTH])  # horizontal bar
-_V_DIMS = np.array([_SEG_SW, _SEG_SL, _SEG_DEPTH])  # vertical bar
-
-_SEG_CENTERS: dict[str, tuple[np.ndarray, np.ndarray]] = {
-    # (centre_in_digit_local_XY, bar_dims)
-    "a": (np.array([0.0,          _SEG_HALF * 2,  0.0]), _H_DIMS),  # top
-    "b": (np.array([ _SEG_HALF,   _SEG_HALF,      0.0]), _V_DIMS),  # top-right
-    "c": (np.array([ _SEG_HALF,  -_SEG_HALF,      0.0]), _V_DIMS),  # bottom-right
-    "d": (np.array([0.0,         -_SEG_HALF * 2,  0.0]), _H_DIMS),  # bottom
-    "e": (np.array([-_SEG_HALF,  -_SEG_HALF,      0.0]), _V_DIMS),  # bottom-left
-    "f": (np.array([-_SEG_HALF,   _SEG_HALF,      0.0]), _V_DIMS),  # top-left
-    "g": (np.array([0.0,          0.0,             0.0]), _H_DIMS),  # middle
-}
-
-
-def _create_gate_label(
-    position: np.ndarray,
-    orientation: np.ndarray,
-    gate_index: int,
-    gate_size: float,
-) -> list[trimesh.Trimesh]:
-    """White 7-segment gate index number, lying flat and readable from the sky.
-
-    The digit frame is aligned with the gate's horizontal axes:
-      digit X = gate horizontal-right  (so digits read left-right along gate width)
-      digit Y = gate horizontal-forward (so orientation matches the gate's facing direction)
-      digit Z = world up               (depth direction, thin)
-
-    The label is placed gate_size/2 + 0.30 m above the gate centre so it floats
-    just above the top bar.  Multi-digit numbers (≥10) are centred on the gate axis.
-    """
-    quat_scipy = [orientation[1], orientation[2], orientation[3], orientation[0]]
-    rot_mat = tf.Rotation.from_quat(quat_scipy).as_matrix()
-
-    # Project gate X (right) and Y (forward) into the horizontal plane.
-    # This removes tilt so labels are always flat even if the gate were tilted.
-    right_h = rot_mat @ np.array([1.0, 0.0, 0.0])
-    right_h[2] = 0.0
-    right_h /= np.linalg.norm(right_h) + 1e-8
-
-    fwd_h = rot_mat @ np.array([0.0, 1.0, 0.0])
-    fwd_h[2] = 0.0
-    fwd_h /= np.linalg.norm(fwd_h) + 1e-8
-
-    # digit-local → world transform.  Columns = [right_h, fwd_h, world_up].
-    digit_transform = np.eye(4)
-    digit_transform[:3, 0] = right_h
-    digit_transform[:3, 1] = fwd_h
-    digit_transform[:3, 2] = np.array([0.0, 0.0, 1.0])
-    digit_transform[:3, 3] = position + np.array([0.0, 0.0, gate_size / 2.0 + 0.30])
-
-    char_spacing = 0.13  # metres between digit centres (≈ _SEG_SL + gap)
-    digit_str = str(gate_index)
-    n_chars = len(digit_str)
-    color = [255, 255, 255, 255]  # white, full opacity
-
-    result = []
-    for char_idx, ch in enumerate(digit_str):
-        # Offset each character along digit-X so multi-digit numbers are centred.
-        x_offset = (char_idx - (n_chars - 1) / 2.0) * char_spacing
-        active = _SEVEN_SEG.get(ch, "")
-        for seg_id, (center, dims) in _SEG_CENTERS.items():
-            if seg_id not in active:
-                continue
-            bar = trimesh.creation.box(dims)
-            bar.apply_translation(center + np.array([x_offset, 0.0, 0.0]))
-            bar.apply_transform(digit_transform)
-            bar.visual.face_colors = color  # must be set after apply_transform
-            result.append(bar)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Direction indicator
-# ---------------------------------------------------------------------------
-
-def _create_direction_indicator(
-    position: np.ndarray,
-    orientation: np.ndarray,
-    length: float = 1.0,
-    thickness: float = 0.04,
-) -> list[trimesh.Trimesh]:
-    """Cyan box extending 1 m in the gate's forward (+Y) direction.
-
-    The box is centred at (gate_centre + length/2 * forward) so it starts flush
-    with the gate plane and extends through-and-past the opening.  This makes the
-    approach direction immediately visible from the viewer.
-
-    Color is set after apply_transform to ensure ColorVisuals are applied correctly.
-    """
-    quat_scipy = [orientation[1], orientation[2], orientation[3], orientation[0]]
-    rot_mat = tf.Rotation.from_quat(quat_scipy).as_matrix()
-
-    # In gate-local frame the box centre is at (0, length/2, 0) — offset forward by half
-    # the box length so the box starts at the gate plane and points outward.
-    local_center = np.array([0.0, length / 2.0, 0.0])
-    transform = np.eye(4)
-    transform[:3, :3] = rot_mat
-    transform[:3, 3] = position + rot_mat @ local_center
-
-    shaft = trimesh.creation.box([thickness, length, thickness])
-    shaft.apply_transform(transform)
-    shaft.visual.face_colors = [0, 220, 255, 255]  # cyan, set after transform
-    return [shaft]

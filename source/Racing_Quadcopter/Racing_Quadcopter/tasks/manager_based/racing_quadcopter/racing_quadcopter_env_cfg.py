@@ -223,6 +223,9 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     collision_force_threshold: float = 0.001
 
     eval_mode: bool = False
+    draw_trajectory: bool = True        # green closed-loop polyline through all waypoints (USD, no collision)
+    draw_gate_indicators: bool = True   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
+    draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
 
     curriculum_min_gates_passed: int = 10
     curriculum_min_mean_velocity: float = 2.5

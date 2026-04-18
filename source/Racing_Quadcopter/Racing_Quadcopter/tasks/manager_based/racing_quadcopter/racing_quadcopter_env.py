@@ -23,6 +23,7 @@ from .mdp import rewards as racing_rewards
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.rewards import update_racing_state
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg
+from .vis.trajectory_vis import draw_gate_indicators_usd, draw_gate_labels_usd, draw_trajectory_usd
 
 
 class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
@@ -224,6 +225,32 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Previous-step drone position in world frame; required for line-crossing detection
         # and for the gate-progress reward (distance reduction over one step).
         self._prev_drone_pos = torch.zeros(self.num_envs, 3, device=self.device)
+
+        origins_np = terrain_origins.cpu().numpy()
+        if self.cfg.draw_trajectory:
+            draw_trajectory_usd(
+                gate_datas=gate_datas,
+                terrain_origins_np=origins_np,
+                centre_offset=centre_offset,
+                num_rows=num_rows,
+                num_cols=num_cols,
+            )
+        if self.cfg.draw_gate_indicators:
+            draw_gate_indicators_usd(
+                gate_datas=gate_datas,
+                terrain_origins_np=origins_np,
+                centre_offset=centre_offset,
+                num_rows=num_rows,
+                num_cols=num_cols,
+            )
+        if self.cfg.draw_gate_labels:
+            draw_gate_labels_usd(
+                gate_datas=gate_datas,
+                terrain_origins_np=origins_np,
+                centre_offset=centre_offset,
+                num_rows=num_rows,
+                num_cols=num_cols,
+            )
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
