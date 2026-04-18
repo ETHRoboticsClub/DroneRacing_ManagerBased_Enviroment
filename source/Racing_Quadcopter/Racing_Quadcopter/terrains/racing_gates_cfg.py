@@ -26,11 +26,7 @@ class MeshRacingGatesTerrainCfg(SubTerrainBaseCfg):
 
     seed: int | None = None
 
-    gate_spacing: float = 4.0
-
-    gate_spacing_range: tuple[float, float] | None = None
-
-    min_gates: int = 3
+    gate_spacing_range: tuple[float, float] = (3.0, 5.0)
 
     gate_size_range: tuple[float, float] = (0.4, 0.8)
 

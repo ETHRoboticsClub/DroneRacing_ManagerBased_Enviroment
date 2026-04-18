@@ -31,7 +31,6 @@ def _compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor
         ``[rel_x, rel_y, rel_z, fwd_x, fwd_y, fwd_z]`` for each gate.
     """
     k = env.cfg.observation.num_next_gates
-    num_gates = env._num_gates
     n = env.num_envs
     device = env.device
 
@@ -39,9 +38,14 @@ def _compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor
     drone_quat_w = env._robot.data.root_quat_w
     y_local = env._y_local
 
-    # [N, K] indices of the next K gates per env
+    # [N, K] raw indices of the next K gates per env
     step = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0).expand(n, -1)
-    gate_idx = (env._current_gate_idx.unsqueeze(1) + step) % num_gates
+    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + step
+    # Use per-env gate counts for safe wrapping (pad counts==0 to 1 to avoid div-by-zero)
+    gate_counts = env._gate_counts.unsqueeze(1)
+    safe_counts = gate_counts.clone()
+    safe_counts[safe_counts == 0] = 1
+    gate_idx = gate_idx_raw % safe_counts
 
     idx3 = gate_idx.unsqueeze(-1).expand(-1, -1, 3)
     idx4 = gate_idx.unsqueeze(-1).expand(-1, -1, 4)

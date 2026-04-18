@@ -117,30 +117,41 @@ def _apply_ground_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) 
 
 
 def _apply_uniform_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
-    """Uniform initialization in expanded per-env gate bounding box."""
+    """Uniform spawn in a small box on the approach side of gate 0.
+
+    Box is defined in the gate's own frame so it is always before the gate
+    regardless of world orientation:
+      - depth  [1.0, 4.0] m behind the gate (negative forward axis)
+      - right  ±1.5 m along gate right axis
+      - up     ±0.75 m around gate center height
+    """
     n = len(env_ids)
-    gate_pos = env._gate_positions[env_ids]  # [N, G, 3]
-    mins = gate_pos.amin(dim=1)
-    maxs = gate_pos.amax(dim=1)
+    env._current_gate_idx[env_ids] = 0
+    env._gates_passed[env_ids] = 0
 
-    # Expand borders by 5m in x/y and 3m in z.
-    x_min = mins[:, 0] - 2.0
-    x_max = maxs[:, 0] + 2.0
-    y_min = mins[:, 1] - 2.0
-    y_max = maxs[:, 1] + 2.0
-    z_min = 0.0
-    z_max = 4.0
-    rx = torch.rand(n, device=env.device)
-    ry = torch.rand(n, device=env.device)
-    rz = torch.rand(n, device=env.device)
-    x = x_min + rx * (x_max - x_min)
-    y = y_min + ry * (y_max - y_min)
-    z = z_min + rz * (z_max - z_min)
-    start_pos = torch.stack([x, y, z], dim=-1)
+    gate_pos = env._gate_positions[env_ids, 0]    # [N, 3]
+    gate_ori = env._gate_orientations[env_ids, 0]  # [N, 4]
 
-    roll = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
+    fwd   = quat_apply(gate_ori, env._y_local.expand(n, -1))
+    right = quat_apply(gate_ori, env._x_local.expand(n, -1))
+    up    = quat_apply(gate_ori, env._z_local.expand(n, -1))
+
+    depth   = 1.0 + torch.rand(n, device=env.device) * 3.0          # [1, 4] m before gate
+    lateral = 1.5 * (2.0 * torch.rand(n, device=env.device) - 1.0)  # ±1.5 m right/left
+    vert    = 0.75 * (2.0 * torch.rand(n, device=env.device) - 1.0) # ±0.75 m up/down
+
+    start_pos = (
+        gate_pos
+        - depth.unsqueeze(-1)   * fwd
+        + lateral.unsqueeze(-1) * right
+        + vert.unsqueeze(-1)    * up
+    )
+    # Never go below ground.
+    start_pos[:, 2] = start_pos[:, 2].clamp(min=0.2)
+
+    roll  = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
     pitch = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
-    yaw = -torch.pi + torch.rand(n, device=env.device) * (2.0 * torch.pi)
+    yaw   = -torch.pi + torch.rand(n, device=env.device) * (2.0 * torch.pi)
     start_quat = _quat_from_euler_xyz(roll, pitch, yaw)
 
     lin_vel = -0.5 + torch.rand(n, 3, device=env.device) * 1.0
@@ -149,11 +160,6 @@ def _apply_uniform_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor)
 
     init_actions = -1.0 + torch.rand(n, 4, device=env.device) * 2.0
     _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel, init_actions=init_actions)
-
-    # Start from nearest gate for uniformly sampled starts.
-    dist = torch.norm(gate_pos - start_pos.unsqueeze(1), dim=-1)
-    env._current_gate_idx[env_ids] = torch.argmin(dist, dim=1)
-    env._gates_passed[env_ids] = 0
 
 
 def reset_racing_spawn(

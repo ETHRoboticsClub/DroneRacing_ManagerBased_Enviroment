@@ -57,4 +57,5 @@ def collision_termination(env: ManagerBasedRLEnv) -> torch.Tensor:
 def lap_complete(env: ManagerBasedRLEnv) -> torch.Tensor:
     if not env.cfg.eval_mode:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    return env._gates_passed >= env._num_gates
+    # Compare against per-environment gate counts (supports padded gate arrays)
+    return env._gates_passed >= env._gate_counts

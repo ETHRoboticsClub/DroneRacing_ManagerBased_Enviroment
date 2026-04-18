@@ -73,7 +73,15 @@ def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torc
 
     if passed.any():
         env._gates_passed[passed] += 1
-        env._current_gate_idx[passed] = (env._current_gate_idx[passed] + 1) % env._num_gates
+        # Advance per-env gate index using the actual per-env gate counts
+        counts = env._gate_counts[passed]
+        new_idx = env._current_gate_idx[passed] + 1
+        # Safe modulo: avoid division by zero for any stray zero-count envs
+        mask_nz = counts > 0
+        res = torch.zeros_like(new_idx)
+        if mask_nz.any():
+            res[mask_nz] = new_idx[mask_nz] % counts[mask_nz]
+        env._current_gate_idx[passed] = res
 
     return passed.float()
 
@@ -109,15 +117,14 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
 # Scaling: manager applies an extra global factor on top of direct weights
 # ---------------------------------------------------------------------------
 
-MANAGER_SCALE = 0.01
+MANAGER_SCALE = 100.0
 
 # Defaults from ``RewardWeights`` in direct ``reward_manager.py`` (reward_scale=1.0).
-DIRECT_GATE_PASSAGE = 25.0
-DIRECT_GATE_PROGRESS = 2.0
+DIRECT_GATE_PASSAGE = 250.0
+DIRECT_GATE_PROGRESS = 20.0
 DIRECT_GATE_CENTERING = 0.5
 DIRECT_VELOCITY_TOWARD_GATE = 0.1
 DIRECT_VELOCITY_LIMIT = -0.05
-DIRECT_PERCEPTION = -0.01
 DIRECT_ORIENTATION = -0.005
 DIRECT_ANGULAR_VELOCITY = -0.001
 DIRECT_ACTION_SMOOTHNESS = -0.0001
@@ -131,7 +138,7 @@ WEIGHT_GATE_PROGRESS = MANAGER_SCALE * DIRECT_GATE_PROGRESS
 WEIGHT_GATE_CENTERING = MANAGER_SCALE * DIRECT_GATE_CENTERING
 WEIGHT_VELOCITY_TOWARD_GATE = MANAGER_SCALE * DIRECT_VELOCITY_TOWARD_GATE
 WEIGHT_VELOCITY_LIMIT = MANAGER_SCALE * DIRECT_VELOCITY_LIMIT
-WEIGHT_PERCEPTION = MANAGER_SCALE * DIRECT_PERCEPTION
+WEIGHT_PERCEPTION = MANAGER_SCALE * -0.01
 WEIGHT_ORIENTATION = MANAGER_SCALE * DIRECT_ORIENTATION
 WEIGHT_ANGULAR_VELOCITY = MANAGER_SCALE * DIRECT_ANGULAR_VELOCITY
 WEIGHT_ACTION_SMOOTHNESS = MANAGER_SCALE * DIRECT_ACTION_SMOOTHNESS
@@ -169,8 +176,8 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     lateral_up = ((-to_gate) * g_up).sum(dim=1)
     lateral_dist = torch.sqrt(lateral_right**2 + lateral_up**2)
 
-    proximity_factor = torch.exp(-0.5 * dist_to_plane.abs())
     centering_value = torch.exp(-3.0 * lateral_dist / gate_size)
+    proximity_factor = torch.exp(-0.5 * dist_to_plane.abs())
     return centering_value * proximity_factor * on_approach_side.float()
 
 def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi / 3.0) -> torch.Tensor:

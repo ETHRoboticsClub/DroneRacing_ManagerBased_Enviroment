@@ -26,6 +26,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from isaaclab.envs.mdp import *
+
 from isaaclab_assets import CRAZYFLIE_CFG
 
 from .mdp.actions import QuadcopterThrustActionCfg
@@ -81,7 +82,12 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         history_length: int = 3
-        # base_lin_vel = ObsTerm(func=base_lin_vel, params={"asset_cfg": SceneEntityCfg("robot")}, history_length=history_length)
+        base_lin_vel = ObsTerm(
+            func=base_lin_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=history_length,
+        )
         
         #IMU 
         base_ang_vel = ObsTerm(
@@ -126,7 +132,7 @@ class ObservationsCfg:
 class RewardsCfg:
     """Same terms as direct ``GateRewardManager``; each callable returns unweighted factors in ``mdp.rewards``.
 
-    Weights are ``MANAGER_SCALE *`` the default coefficients from the direct task (``0.01`` by default).
+    Weights are ``MANAGER_SCALE *`` the default coefficients from the direct task.
     """
 
     gate_passage = RewTerm(func=racing_rewards.reward_gate_passage, weight=racing_rewards.WEIGHT_GATE_PASSAGE)
@@ -136,8 +142,8 @@ class RewardsCfg:
         func=racing_rewards.reward_velocity_toward_gate, weight=racing_rewards.WEIGHT_VELOCITY_TOWARD_GATE
     )
     velocity_limit = RewTerm(func=racing_rewards.penalty_velocity_limit, weight=racing_rewards.WEIGHT_VELOCITY_LIMIT)
-    perception = RewTerm(func=racing_rewards.penalty_perception, weight=racing_rewards.WEIGHT_PERCEPTION)
-    # orientation = RewTerm(func=racing_rewards.penalty_orientation, weight=racing_rewards.WEIGHT_ORIENTATION)
+    # perception = RewTerm(func=racing_rewards.penalty_perception, weight=racing_rewards.WEIGHT_PERCEPTION)
+    orientation = RewTerm(func=racing_rewards.penalty_orientation, weight=racing_rewards.WEIGHT_ORIENTATION)
     angular_velocity = RewTerm(
         func=racing_rewards.penalty_angular_velocity, weight=racing_rewards.WEIGHT_ANGULAR_VELOCITY
     )

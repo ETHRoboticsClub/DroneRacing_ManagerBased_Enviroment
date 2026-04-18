@@ -110,10 +110,8 @@ def racing_gates_terrain(
     gate_positions, gate_orientations = _place_gates_along_trajectory(
         waypoints=waypoints,
         tangents=tangents,
-        gate_spacing=cfg.gate_spacing,
-        size=cfg.size,
         gate_spacing_range=cfg.gate_spacing_range,
-        min_gates=cfg.min_gates,
+        size=cfg.size,
         rng=placement_rng,
     )
 
@@ -127,7 +125,7 @@ def racing_gates_terrain(
     )
 
     # Create gate meshes
-    for pos, quat in zip(gate_positions, gate_orientations):
+    for i, (pos, quat) in enumerate(zip(gate_positions, gate_orientations)):
         gate_meshes = _create_gate_frame(
             position=pos,
             orientation=quat,
@@ -136,6 +134,8 @@ def racing_gates_terrain(
             color=cfg.gate_color,
         )
         meshes_list.extend(gate_meshes)
+        meshes_list.extend(_create_gate_label(pos, quat, i, gate_size))
+        meshes_list.extend(_create_direction_indicator(pos, quat))
 
     # Origin is at the centre of the terrain at ground level
     origin = np.array([cfg.size[0] / 2.0, cfg.size[1] / 2.0, 0.0])
@@ -340,22 +340,18 @@ def _generate_random_track(
 def _place_gates_along_trajectory(
     waypoints: np.ndarray,
     tangents: np.ndarray,
-    gate_spacing: float,
+    gate_spacing_range: tuple[float, float],
     size: tuple[float, float],
-    gate_spacing_range: tuple[float, float] | None = None,
-    min_gates: int = 3,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Place gates at intervals along the trajectory.
-    
+
     Args:
         waypoints: [N, 3] trajectory waypoints
         tangents: [N, 3] trajectory tangents
-        gate_spacing: Base distance between gates (used if gate_spacing_range is None)
+        gate_spacing_range: Randomize spacing uniformly between (min, max). Use (n, n) for fixed spacing.
         size: Terrain size for bounds checking
-        gate_spacing_range: If provided, randomize spacing between (min, max)
-        min_gates: Minimum number of gates to place
-        
+
     Returns:
         gate_positions: [M, 3] gate center positions
         gate_orientations: [M, 4] gate orientations as quaternions (w, x, y, z)
@@ -369,26 +365,17 @@ def _place_gates_along_trajectory(
     cumulative_arc = np.zeros(n + 1)
     cumulative_arc[1:] = np.cumsum(segment_lengths)
     total_arc = cumulative_arc[-1]
-    
-    # Determine number of gates
-    if gate_spacing_range is not None:
-        avg_spacing = (gate_spacing_range[0] + gate_spacing_range[1]) / 2.0
-        num_gates = max(min_gates, int(total_arc / avg_spacing))
-    else:
-        num_gates = max(min_gates, int(total_arc / gate_spacing))
-    
+
+    avg_spacing = (gate_spacing_range[0] + gate_spacing_range[1]) / 2.0
+    num_gates = int(total_arc / avg_spacing)
+
     gate_positions = []
     gate_orientations = []
-    
-    # Use provided RNG or create default one
+
     if rng is None:
         rng = np.random.default_rng()
-    
-    # Generate random spacings if range is provided
-    if gate_spacing_range is not None:
-        spacings = rng.uniform(gate_spacing_range[0], gate_spacing_range[1], num_gates)
-    else:
-        spacings = np.full(num_gates, gate_spacing)
+
+    spacings = rng.uniform(gate_spacing_range[0], gate_spacing_range[1], num_gates)
     
     current_arc = 0.0
     for i in range(num_gates):
@@ -503,5 +490,108 @@ def _create_gate_frame(
             bar_mesh.visual.face_colors = [int(c * 255) for c in color] + [255]
         
         meshes.append(bar_mesh)
-    
+
     return meshes
+
+
+# 7-segment encoding: a=top, b=top-right, c=bottom-right, d=bottom, e=bottom-left, f=top-left, g=middle
+_SEVEN_SEG: dict[str, str] = {
+    "0": "abcdef",
+    "1": "bc",
+    "2": "abdeg",
+    "3": "abcdg",
+    "4": "bcfg",
+    "5": "acdfg",
+    "6": "acdefg",
+    "7": "abc",
+    "8": "abcdefg",
+    "9": "abcdfg",
+}
+
+# Segment geometry in local digit space (X=right, Y=forward/up-of-digit, Z=thin depth).
+_SEG_SL = 0.08   # segment length
+_SEG_SW = 0.02   # segment width
+_SEG_DEPTH = 0.02
+_SEG_HALF = _SEG_SL / 2.0 + _SEG_SW / 2.0
+_H_DIMS = np.array([_SEG_SL, _SEG_SW, _SEG_DEPTH])  # horizontal bar: wide X, thin Y, thin Z
+_V_DIMS = np.array([_SEG_SW, _SEG_SL, _SEG_DEPTH])  # vertical bar:   thin X, tall Y, thin Z
+_SEG_CENTERS: dict[str, tuple[np.ndarray, np.ndarray]] = {
+    "a": (np.array([0.0,          _SEG_HALF * 2, 0.0]), _H_DIMS),
+    "b": (np.array([ _SEG_HALF,   _SEG_HALF,     0.0]), _V_DIMS),
+    "c": (np.array([ _SEG_HALF,  -_SEG_HALF,     0.0]), _V_DIMS),
+    "d": (np.array([0.0,         -_SEG_HALF * 2, 0.0]), _H_DIMS),
+    "e": (np.array([-_SEG_HALF,  -_SEG_HALF,     0.0]), _V_DIMS),
+    "f": (np.array([-_SEG_HALF,   _SEG_HALF,     0.0]), _V_DIMS),
+    "g": (np.array([0.0,          0.0,            0.0]), _H_DIMS),
+}
+
+
+def _create_gate_label(
+    position: np.ndarray,
+    orientation: np.ndarray,
+    gate_index: int,
+    gate_size: float,
+) -> list[trimesh.Trimesh]:
+    """White 7-segment number lying flat above the gate, readable from the sky.
+
+    Digit X axis = gate horizontal-right, digit Y axis = gate horizontal-forward,
+    so the number reads in the same direction as the gate faces when viewed from above.
+    """
+    quat_scipy = [orientation[1], orientation[2], orientation[3], orientation[0]]
+    rot_mat = tf.Rotation.from_quat(quat_scipy).as_matrix()
+
+    # Project gate axes onto the horizontal plane for a flat (sky-facing) digit frame.
+    right_h = rot_mat @ np.array([1.0, 0.0, 0.0])
+    right_h[2] = 0.0
+    right_h /= np.linalg.norm(right_h) + 1e-8
+
+    fwd_h = rot_mat @ np.array([0.0, 1.0, 0.0])
+    fwd_h[2] = 0.0
+    fwd_h /= np.linalg.norm(fwd_h) + 1e-8
+
+    # 4×4 transform: digit-local → world.  Digits live in XY; Z is world up (thin depth).
+    digit_transform = np.eye(4)
+    digit_transform[:3, 0] = right_h
+    digit_transform[:3, 1] = fwd_h
+    digit_transform[:3, 2] = np.array([0.0, 0.0, 1.0])
+    digit_transform[:3, 3] = position + np.array([0.0, 0.0, gate_size / 2.0 + 0.30])
+
+    char_spacing = 0.13
+    digit_str = str(gate_index)
+    n_chars = len(digit_str)
+    color = [255, 255, 255, 255]
+
+    result = []
+    for char_idx, ch in enumerate(digit_str):
+        x_offset = (char_idx - (n_chars - 1) / 2.0) * char_spacing
+        active = _SEVEN_SEG.get(ch, "")
+        for seg_id, (center, dims) in _SEG_CENTERS.items():
+            if seg_id not in active:
+                continue
+            bar = trimesh.creation.box(dims)
+            bar.apply_translation(center + np.array([x_offset, 0.0, 0.0]))
+            bar.apply_transform(digit_transform)
+            bar.visual.face_colors = color  # set after transform, same as gate bars
+            result.append(bar)
+    return result
+
+
+def _create_direction_indicator(
+    position: np.ndarray,
+    orientation: np.ndarray,
+    length: float = 1.0,
+    thickness: float = 0.04,
+) -> list[trimesh.Trimesh]:
+    """Cyan stick pointing 1 m in the gate's forward (+Y) direction."""
+    quat_scipy = [orientation[1], orientation[2], orientation[3], orientation[0]]
+    rot_mat = tf.Rotation.from_quat(quat_scipy).as_matrix()
+
+    local_center = np.array([0.0, length / 2.0, 0.0])
+    transform = np.eye(4)
+    transform[:3, :3] = rot_mat
+    transform[:3, 3] = position + rot_mat @ local_center
+
+    shaft = trimesh.creation.box([thickness, length, thickness])
+    shaft.apply_transform(transform)
+    shaft.visual.face_colors = [0, 220, 255, 255]  # set after transform
+    return [shaft]
