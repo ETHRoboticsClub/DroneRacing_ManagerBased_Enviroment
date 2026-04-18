@@ -16,5 +16,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.racing_quadcopter_env_cfg:RacingQuadcopterEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
