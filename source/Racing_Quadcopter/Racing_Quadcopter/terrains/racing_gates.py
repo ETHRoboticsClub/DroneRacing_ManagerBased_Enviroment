@@ -69,6 +69,7 @@ class GateData:
     positions: np.ndarray       # [num_gates, 3]  gate centre positions, local frame
     orientations: np.ndarray    # [num_gates, 4]  quaternions (w, x, y, z), local frame
     gate_size: float            # aperture side length in metres (square gate)
+    bar_thickness: float        # frame bar thickness in metres
     start_position: np.ndarray  # [3]  first waypoint — informational, not currently used
     start_tangent: np.ndarray   # [3]  tangent at first waypoint — informational
     waypoints: np.ndarray       # [num_waypoints, 3]  full trajectory sample points, local frame
@@ -157,6 +158,7 @@ def racing_gates_terrain(
         positions=gate_positions.copy(),
         orientations=gate_orientations.copy(),
         gate_size=gate_size,
+        bar_thickness=cfg.bar_thickness,
         start_position=waypoints[0].copy(),
         start_tangent=tangents[0].copy(),
         waypoints=waypoints.copy(),

@@ -227,6 +227,17 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     draw_gate_indicators: bool = True   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
     draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
 
+    # Demo mode: dark scene + OmniPBR emissive glow on all vis prims and drones (RTX only).
+    demo_mode: bool = False
+    demo_emissive_intensity: float = 30.0        # emissive intensity for trajectory/label/indicator vis prims
+    demo_gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)   # orange, matching gate mesh color
+    demo_gate_outline_emissive: float = 20.0     # emissive intensity for gate outline overlay curves
+    demo_gate_outline_width: float = 0.06        # tube width of gate outline BasisCurves in metres
+    demo_gate_light_intensity: float = 3000.0    # UsdLux.SphereLight intensity in nits
+    demo_gate_light_radius: float = 1.5          # sphere light radius in metres — controls glow spread
+    demo_drone_glow_color: tuple[float, float, float] = (1.0, 0.5, 0.0)  # orange drone glow
+    demo_drone_glow_intensity: float = 5.0
+
     curriculum_min_gates_passed: int = 10
     curriculum_min_mean_velocity: float = 2.5
     curriculum_max_center_offset: float = 0.25
