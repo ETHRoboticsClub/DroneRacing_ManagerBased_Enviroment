@@ -10,7 +10,7 @@ import gymnasium as gym
 from . import agents
 
 gym.register(
-    id="Racing-Quadcopter-Manager-v0",
+    id="Isaac-Racing-Quadcopter-Manager-v0",
     entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
     disable_env_checker=True,
     kwargs={

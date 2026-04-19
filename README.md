@@ -24,10 +24,10 @@ pip install -e source/Racing_Quadcopter
 
 ```bash
 # SKRL (recommended)
-python scripts/skrl/train.py --task Racing-Quadcopter-Manager-v0
+python scripts/skrl/train.py --task Isaac-Racing-Quadcopter-Manager-v0
 
 # RSL-RL
-python scripts/rsl_rl/train.py --task Racing-Quadcopter-Manager-v0
+python scripts/rsl_rl/train.py --task Isaac-Racing-Quadcopter-Manager-v0
 ```
 
 ---
@@ -36,10 +36,10 @@ python scripts/rsl_rl/train.py --task Racing-Quadcopter-Manager-v0
 
 ```bash
 # SKRL (recommended)
-python scripts/skrl/play.py --task Racing-Quadcopter-Manager-v0
+python scripts/skrl/play.py --task Isaac-Racing-Quadcopter-Manager-v0
 
 # RSL-RL
-python scripts/rsl_rl/play.py --task Racing-Quadcopter-Manager-v0
+python scripts/rsl_rl/play.py --task Isaac-Racing-Quadcopter-Manager-v0
 ```
 
 ---
