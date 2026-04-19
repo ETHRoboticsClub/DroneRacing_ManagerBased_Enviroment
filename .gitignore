@@ -1,3 +1,5 @@
+
+
 # C++
 **/cmake-build*/
 **/build*/
@@ -38,6 +40,7 @@ docker/.container.cfg
 **/output/*
 **/outputs/*
 **/videos/*
+!docs/videos/*
 **/wandb/*
 **/.neptune/*
 docker/artifacts/
