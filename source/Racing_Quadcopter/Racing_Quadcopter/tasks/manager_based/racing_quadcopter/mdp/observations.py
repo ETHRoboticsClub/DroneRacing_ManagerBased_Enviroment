@@ -16,6 +16,8 @@ from functools import lru_cache
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs.mdp.observations import *
+from isaaclab.envs.mdp.observations import base_ang_vel, base_lin_vel, last_action, projected_gravity
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 # Lightweight wrappers which add configurable observation corruption (state-estimation noise)
@@ -25,6 +27,24 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 # Divide world-frame gate offsets (metres) by this before feeding to the network.
 # Keeps inputs in roughly [-1, 1] for gates up to ~10 m away.
 _REL_POSITION_SCALE: float = 10.0
+
+_OBS_NOISE_BIAS_ATTR_MAP = {
+    "base_lin_vel": "_obs_noise_bias_base_lin_vel",
+    "base_ang_vel": "_obs_noise_bias_base_ang_vel",
+    "projected_gravity": "_obs_noise_bias_projected_gravity",
+    "obs_gates": "_obs_noise_bias_obs_gates",
+    "velocity_limit": "_obs_noise_bias_velocity_limit",
+    "last_action": "_obs_noise_bias_last_action",
+}
+
+_OBS_NOISE_STD_ATTR_MAP = {
+    "base_lin_vel": "gaussian_std_base_lin_vel",
+    "base_ang_vel": "gaussian_std_base_ang_vel",
+    "projected_gravity": "gaussian_std_projected_gravity",
+    "obs_gates": "gaussian_std_obs_gates",
+    "velocity_limit": "gaussian_std_velocity_limit",
+    "last_action": "gaussian_std_last_action",
+}
 
 
 def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -46,8 +66,7 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     y_local = env._y_local  # gate +Y = forward in gate local frame
 
     # Build [N, K] gate index table: current_gate + {0,1,...,K-1} mod gate_count.
-    step = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0).expand(n, -1)  # [N, K]
-    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + step  # [N, K]
+    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + env._gate_step_indices  # [N, K]
     gate_counts = env._gate_counts.unsqueeze(1)  # [N, 1]
     safe_counts = gate_counts.clone()
     safe_counts[safe_counts == 0] = 1  # guard: envs with 0 gates would cause div-by-zero
@@ -84,6 +103,29 @@ def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     return _apply_obs_noise(env, env._velocity_limit.unsqueeze(-1), "velocity_limit")
 
 
+def _get_obs_noise_runtime(env: ManagerBasedRLEnv, cfg) -> dict:
+    """Lazily initialize/cache observation-noise lookup data on env."""
+    runtime = getattr(env, "_obs_noise_runtime", None)
+    cfg_identity = id(cfg)
+    if runtime is not None and runtime.get("cfg_identity") == cfg_identity:
+        return runtime
+
+    std_default = float(getattr(cfg, "gaussian_std_default", 0.0))
+    std_by_term = {
+        term_key: float(getattr(cfg, std_attr_name, std_default))
+        for term_key, std_attr_name in _OBS_NOISE_STD_ATTR_MAP.items()
+    }
+
+    runtime = {
+        "cfg_identity": cfg_identity,
+        "std_default": std_default,
+        "std_by_term": std_by_term,
+        "dropout_prob": float(getattr(cfg, "dropout_prob", 0.0)),
+    }
+    env._obs_noise_runtime = runtime
+    return runtime
+
+
 # ---------------------------- Observation corruption ----------------------------
 def _apply_obs_noise(env: ManagerBasedRLEnv, tensor: torch.Tensor, term_key: str) -> torch.Tensor:
     """Apply configurable state-estimation corruption to a term tensor.
@@ -100,20 +142,14 @@ def _apply_obs_noise(env: ManagerBasedRLEnv, tensor: torch.Tensor, term_key: str
     if cfg is None or not getattr(cfg, "enable", False):
         return tensor
 
+    runtime = _get_obs_noise_runtime(env, cfg)
+
     device = tensor.device
 
     # Add stored per-episode bias if present on env
-    bias_attr_map = {
-        "base_lin_vel": "_obs_noise_bias_base_lin_vel",
-        "base_ang_vel": "_obs_noise_bias_base_ang_vel",
-        "projected_gravity": "_obs_noise_bias_projected_gravity",
-        "obs_gates": "_obs_noise_bias_obs_gates",
-        "velocity_limit": "_obs_noise_bias_velocity_limit",
-        "last_action": "_obs_noise_bias_last_action",
-    }
-    bias_attr = bias_attr_map.get(term_key)
-    if bias_attr and hasattr(env, bias_attr):
-        b = getattr(env, bias_attr)
+    bias_attr = _OBS_NOISE_BIAS_ATTR_MAP.get(term_key)
+    b = getattr(env, bias_attr, None) if bias_attr is not None else None
+    if b is not None:
         try:
             tensor = tensor + b
         except Exception:
@@ -121,86 +157,36 @@ def _apply_obs_noise(env: ManagerBasedRLEnv, tensor: torch.Tensor, term_key: str
             pass
 
     # Per-step Gaussian noise
-    std_name_map = {
-        "base_lin_vel": "gaussian_std_base_lin_vel",
-        "base_ang_vel": "gaussian_std_base_ang_vel",
-        "projected_gravity": "gaussian_std_projected_gravity",
-        "obs_gates": "gaussian_std_obs_gates",
-        "velocity_limit": "gaussian_std_velocity_limit",
-        "last_action": "gaussian_std_last_action",
-    }
-    std = getattr(cfg, std_name_map.get(term_key, "gaussian_std_default"), getattr(cfg, "gaussian_std_default", 0.0))
-    if std and float(std) > 0.0:
-        tensor = tensor + torch.randn_like(tensor, device=device) * float(std)
+    std = runtime["std_by_term"].get(term_key, runtime["std_default"])
+    if std > 0.0:
+        tensor = tensor + torch.randn_like(tensor, device=device) * std
 
     # Dropout (per-env, per-step)
-    dp = getattr(cfg, "dropout_prob", 0.0)
-    if dp and float(dp) > 0.0:
+    dp = runtime["dropout_prob"]
+    if dp > 0.0:
         mask_shape = [tensor.shape[0]] + [1] * (tensor.dim() - 1)
-        mask = (torch.rand(tensor.shape[0], device=device) > float(dp)).view(*mask_shape)
+        mask = (torch.rand(tensor.shape[0], device=device) > dp).view(*mask_shape)
         tensor = tensor * mask
 
     return tensor
 
 
-# ---------------------------- Wrappers for external terms ----------------------------
-def _lookup_mdp_term(name: str):
-    """Late import helper: get term from isaaclab.envs.mdp or None."""
-    try:
-        import importlib
-
-        mdp = importlib.import_module("isaaclab.envs.mdp")
-        return getattr(mdp, name)
-    except Exception:
-        return None
-
-
 def wrap_base_lin_vel(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-    fn = _lookup_mdp_term("base_lin_vel")
-    if fn is None:
-        raise RuntimeError("isaaclab.envs.mdp.base_lin_vel not available")
-    if asset_cfg is None:
-        out = fn(env)
-    else:
-        try:
-            out = fn(env, asset_cfg=asset_cfg)
-        except TypeError:
-            out = fn(env, asset_cfg)
+    out = base_lin_vel(env, asset_cfg=asset_cfg)
     return _apply_obs_noise(env, out, "base_lin_vel")
 
 
 def wrap_base_ang_vel(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-    fn = _lookup_mdp_term("base_ang_vel")
-    if fn is None:
-        raise RuntimeError("isaaclab.envs.mdp.base_ang_vel not available")
-    if asset_cfg is None:
-        out = fn(env)
-    else:
-        try:
-            out = fn(env, asset_cfg=asset_cfg)
-        except TypeError:
-            out = fn(env, asset_cfg)
+    out = base_ang_vel(env, asset_cfg=asset_cfg)
     return _apply_obs_noise(env, out, "base_ang_vel")
 
 
 def wrap_projected_gravity(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-    fn = _lookup_mdp_term("projected_gravity")
-    if fn is None:
-        raise RuntimeError("isaaclab.envs.mdp.projected_gravity not available")
-    if asset_cfg is None:
-        out = fn(env)
-    else:
-        try:
-            out = fn(env, asset_cfg=asset_cfg)
-        except TypeError:
-            out = fn(env, asset_cfg)
+
+    out = projected_gravity(env, asset_cfg=asset_cfg)
     return _apply_obs_noise(env, out, "projected_gravity")
 
 
 def wrap_last_action(env: ManagerBasedRLEnv) -> torch.Tensor:
-    fn = _lookup_mdp_term("last_action")
-    if fn is None:
-        raise RuntimeError("isaaclab.envs.mdp.last_action not available")
-    out = fn(env)
+    out = last_action(env)
     return _apply_obs_noise(env, out, "last_action")
-

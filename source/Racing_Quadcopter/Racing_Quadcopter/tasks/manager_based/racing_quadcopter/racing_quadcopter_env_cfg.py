@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -27,23 +29,29 @@ from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-from isaaclab.envs.mdp import *
-
 from isaaclab_assets import CRAZYFLIE_CFG
 
+from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
 from .mdp.actions import QuadcopterThrustActionCfg
 from .mdp.curriculums import apply_staged_curriculum
-from .mdp.events import reset_racing_spawn
-from .mdp.observations import (
-    compute_next_gates_rel_and_fwd_body,
-    velocity_limit_obs,
-    wrap_base_lin_vel,
-    wrap_base_ang_vel,
-    wrap_projected_gravity,
-    wrap_last_action,
-)
-from .mdp import rewards as racing_rewards
-from .mdp.terminations import below_height_threshold, collision_termination, lap_complete, runaway_velocity, upside_down
+
+
+# SKRL additionally applies rewards_shaper_scale=0.01 on top.
+@scale_dataclass_attributes(100.0)
+@dataclass
+class RewardWeights:
+    GATE_PASSAGE: float = 250.0
+    GATE_PROGRESS: float = 20.0
+    GATE_CENTERING: float = 0.5
+    VELOCITY_TOWARD_GATE: float = 2.0
+    VELOCITY_LIMIT: float = -0.05
+    PERCEPTION: float = -0.01
+    ORIENTATION: float = -0.005
+    ANGULAR_VELOCITY: float = -0.001
+    ACTION_SMOOTHNESS: float = -0.0001
+    ACTION_MAGNITUDE: float = -0.001
+    CRASH: float = -50.0
+    WRONG_SIDE: float = -0.1
 
 
 
@@ -134,7 +142,14 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Thrust + moments on the quadcopter base."""
 
-    thrust = QuadcopterThrustActionCfg(asset_name="robot", thrust_to_weight=1.9, moment_scale=0.01, action_dim=4)
+    thrust = QuadcopterThrustActionCfg(
+        asset_name="robot",
+        thrust_to_weight=1.9,
+        moment_scale=0.01,
+        action_dim=4,
+        min_delay=0,
+        max_delay=0,
+    )
 
 
 @configclass
@@ -145,7 +160,7 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         history_length: int = 3
         base_lin_vel = ObsTerm(
-            func=wrap_base_lin_vel,
+            func=observations.wrap_base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.05, n_max=0.05),
             history_length=history_length,
@@ -153,13 +168,13 @@ class ObservationsCfg:
         
         #IMU 
         base_ang_vel = ObsTerm(
-            func=wrap_base_ang_vel,
+            func=observations.wrap_base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
         )
         projected_gravity = ObsTerm(
-            func=wrap_projected_gravity,
+            func=observations.wrap_projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
@@ -169,16 +184,16 @@ class ObservationsCfg:
         #TODO: Add motors speeds
 
         #ACTION
-        last_action = ObsTerm(func=wrap_last_action, history_length=history_length)
+        last_action = ObsTerm(func=observations.wrap_last_action, history_length=history_length)
 
 
         #Perception
         obs_gates = ObsTerm(
-            func=compute_next_gates_rel_and_fwd_body,
+            func=observations.compute_next_gates_rel_and_fwd_body,
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
         )
-        velocity_limit = ObsTerm(func=velocity_limit_obs, history_length=history_length)
+        velocity_limit = ObsTerm(func=observations.velocity_limit_obs, history_length=history_length)
         
 
 
@@ -197,26 +212,26 @@ class RewardsCfg:
     Weights are ``MANAGER_SCALE *`` the default coefficients from the direct task.
     """
 
-    gate_passage = RewTerm(func=racing_rewards.reward_gate_passage, weight=racing_rewards.WEIGHT_GATE_PASSAGE)
-    gate_progress = RewTerm(func=racing_rewards.reward_gate_progress, weight=racing_rewards.WEIGHT_GATE_PROGRESS)
-    gate_centering = RewTerm(func=racing_rewards.reward_gate_centering, weight=racing_rewards.WEIGHT_GATE_CENTERING)
+    gate_passage = RewTerm(func=rewards.reward_gate_passage, weight=RewardWeights.GATE_PASSAGE)
+    gate_progress = RewTerm(func=rewards.reward_gate_progress, weight=RewardWeights.GATE_PROGRESS)
+    gate_centering = RewTerm(func=rewards.reward_gate_centering, weight=RewardWeights.GATE_CENTERING)
     velocity_toward_gate = RewTerm(
-        func=racing_rewards.reward_velocity_toward_gate, weight=racing_rewards.WEIGHT_VELOCITY_TOWARD_GATE
+        func=rewards.reward_velocity_toward_gate, weight=RewardWeights.VELOCITY_TOWARD_GATE
     )
-    velocity_limit = RewTerm(func=racing_rewards.penalty_velocity_limit, weight=racing_rewards.WEIGHT_VELOCITY_LIMIT)
-    # perception = RewTerm(func=racing_rewards.penalty_perception, weight=racing_rewards.WEIGHT_PERCEPTION)
-    orientation = RewTerm(func=racing_rewards.penalty_orientation, weight=racing_rewards.WEIGHT_ORIENTATION)
+    velocity_limit = RewTerm(func=rewards.penalty_velocity_limit, weight=RewardWeights.VELOCITY_LIMIT)
+    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+    orientation = RewTerm(func=rewards.penalty_orientation, weight=RewardWeights.ORIENTATION)
     angular_velocity = RewTerm(
-        func=racing_rewards.penalty_angular_velocity, weight=racing_rewards.WEIGHT_ANGULAR_VELOCITY
+        func=rewards.penalty_angular_velocity, weight=RewardWeights.ANGULAR_VELOCITY
     )
     action_smoothness = RewTerm(
-        func=racing_rewards.penalty_action_smoothness, weight=racing_rewards.WEIGHT_ACTION_SMOOTHNESS
+        func=rewards.penalty_action_smoothness, weight=RewardWeights.ACTION_SMOOTHNESS
     )
     action_magnitude = RewTerm(
-        func=racing_rewards.penalty_action_magnitude, weight=racing_rewards.WEIGHT_ACTION_MAGNITUDE
+        func=rewards.penalty_action_magnitude, weight=RewardWeights.ACTION_MAGNITUDE
     )
-    crash = RewTerm(func=racing_rewards.penalty_crash, weight=racing_rewards.WEIGHT_CRASH)
-    wrong_side = RewTerm(func=racing_rewards.penalty_wrong_side, weight=racing_rewards.WEIGHT_WRONG_SIDE)
+    crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
+    wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)
 
 
 @configclass
@@ -224,7 +239,7 @@ class EventsCfg:
     """Reset pipeline: Isaac scene defaults, then racing start pose and buffers."""
 
     randomize_robot_mass = EventTerm(
-        func=randomize_rigid_body_mass,
+        func=events.randomize_rigid_body_mass,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
@@ -234,8 +249,16 @@ class EventsCfg:
             "recompute_inertia": True,
         },
     )
+    randomize_base_com = EventTerm(
+        func=events.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="body"),
+            "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
+        },
+    )
     randomize_robot_actuator_gains = EventTerm(
-        func=randomize_actuator_gains,
+        func=events.randomize_actuator_gains,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
@@ -245,8 +268,24 @@ class EventsCfg:
             "distribution": "uniform",
         },
     )
-    reset_scene_to_default = EventTerm(func=reset_scene_to_default, mode="reset")
-    reset_racing_spawn = EventTerm(func=reset_racing_spawn, mode="reset", params={"method": "uniform"})
+    base_external_force_torque = EventTerm(
+        func=events.apply_external_force_torque,
+        mode="interval",
+        interval_range_s=(3.0, 10.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="body"),
+            "force_range": (-0.02, 0.02),
+            "torque_range": (-0.02, 0.02),
+        },
+    )
+    push_robot = EventTerm(
+        func=events.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(3.0, 10.0),
+        params={"velocity_range": {"x": (-0.3, 0.3), "y": (-0.3, 0.3), "z": (-0.3, 0.3)}},
+    )
+    reset_scene_to_default = EventTerm(func=events.reset_scene_to_default, mode="reset")
+    reset_racing_spawn = EventTerm(func=events.reset_racing_spawn, mode="reset", params={"method": "uniform"})
 
 
 @configclass
@@ -258,12 +297,12 @@ class CurriculumCfg:
 
 @configclass
 class TerminationsCfg:
-    time_out = DoneTerm(func=time_out, time_out=True)
-    upside_down = DoneTerm(func=upside_down, time_out=False)
-    below_height = DoneTerm(func=below_height_threshold, time_out=False)
-    runaway = DoneTerm(func=runaway_velocity, time_out=False)
-    collision = DoneTerm(func=collision_termination, time_out=False)
-    lap_complete = DoneTerm(func=lap_complete, time_out=True)
+    time_out = DoneTerm(func=terminations.time_out, time_out=True)
+    upside_down = DoneTerm(func=terminations.upside_down, time_out=False)
+    below_height = DoneTerm(func=terminations.below_height_threshold, time_out=False)
+    runaway = DoneTerm(func=terminations.runaway_velocity, time_out=False)
+    collision = DoneTerm(func=terminations.collision_termination, time_out=False)
+    lap_complete = DoneTerm(func=terminations.lap_complete, time_out=True)
 
 
 @configclass

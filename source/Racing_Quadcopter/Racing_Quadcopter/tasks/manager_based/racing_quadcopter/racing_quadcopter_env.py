@@ -19,12 +19,11 @@ from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
 
 from Racing_Quadcopter.terrains import get_gate_registry
-from .mdp import rewards as racing_rewards
 from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.gate_utils import update_racing_state
 from .mdp.stats import init_stats, step_stats
-from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg
+from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, RewardWeights
 from .vis.trajectory_vis import (
     add_gate_sphere_lights_usd,
     apply_emissive_to_robots,
@@ -90,6 +89,11 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._y_local = torch.tensor([0.0, 1.0, 0.0], device=self.device)
         self._x_local = torch.tensor([1.0, 0.0, 0.0], device=self.device)
         self._z_local = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        self._gate_step_indices = torch.arange(
+            self.cfg.observation.num_next_gates,
+            device=self.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(self.num_envs, -1)
 
         # All body IDs monitored for contact; ".*" captures every link.
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*")
@@ -360,43 +364,21 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         if os.getenv("DEBUG_REWARDS") == "1":
             with torch.no_grad():
-                terms = {
-                    "gate_passage": racing_rewards.reward_gate_passage(self),
-                    "gate_progress": racing_rewards.reward_gate_progress(self),
-                    "gate_centering": racing_rewards.reward_gate_centering(self),
-                    "velocity_toward_gate": racing_rewards.reward_velocity_toward_gate(self),
-                    "velocity_limit": racing_rewards.penalty_velocity_limit(self),
-                    "orientation": racing_rewards.penalty_orientation(self),
-                    "angular_velocity": racing_rewards.penalty_angular_velocity(self),
-                    "action_smoothness": racing_rewards.penalty_action_smoothness(self),
-                    "action_magnitude": racing_rewards.penalty_action_magnitude(self),
-                    "crash": racing_rewards.penalty_crash(self),
-                    "wrong_side": racing_rewards.penalty_wrong_side(self),
-                }
-                weights = {
-                    "gate_passage": racing_rewards.WEIGHT_GATE_PASSAGE,
-                    "gate_progress": racing_rewards.WEIGHT_GATE_PROGRESS,
-                    "gate_centering": racing_rewards.WEIGHT_GATE_CENTERING,
-                    "velocity_toward_gate": racing_rewards.WEIGHT_VELOCITY_TOWARD_GATE,
-                    "velocity_limit": racing_rewards.WEIGHT_VELOCITY_LIMIT,
-                    "orientation": racing_rewards.WEIGHT_ORIENTATION,
-                    "angular_velocity": racing_rewards.WEIGHT_ANGULAR_VELOCITY,
-                    "action_smoothness": racing_rewards.WEIGHT_ACTION_SMOOTHNESS,
-                    "action_magnitude": racing_rewards.WEIGHT_ACTION_MAGNITUDE,
-                    "crash": racing_rewards.WEIGHT_CRASH,
-                    "wrong_side": racing_rewards.WEIGHT_WRONG_SIDE,
-                }
-                per_term_weighted = {}
-                for k, v in terms.items():
-                    w = weights.get(k, 1.0)
-                    per_term_weighted[k] = (v * float(w))
+                cfg : RacingQuadcopterEnvCfg = self.cfg # for type hints
+                per_term_weighted : dict[str, torch.Tensor] = {}
+                for reward_term_cfg_name in cfg.rewards.__annotations__:
+                    reward_term_cfg = getattr(cfg.rewards, reward_term_cfg_name, None)
+                    fn = reward_term_cfg.func
+                    w = reward_term_cfg.weight
+                    per_term_weighted[reward_term_cfg_name] = fn(self) * w
                 stacked = torch.stack(list(per_term_weighted.values()), dim=0)
                 summed = stacked.sum(dim=0)
                 print("DEBUG_REWARDS: dt=", float(self.step_dt), "reward_buf_sample=", self.reward_buf[:5].cpu().numpy())
                 print("DEBUG_REWARDS: summed_unscaled_sample=", summed[:5].cpu().numpy())
-                for k, v in terms.items():
+                for k, v in per_term_weighted.items():
                     try:
-                        print(f"DEBUG_REWARDS: term={k} mean={v.mean().item():.6e} weight={weights[k]:.6e} weighted_mean={(v*float(weights[k])).mean().item():.6e}")
+                        w = getattr(cfg.rewards, k).weight
+                        print(f"DEBUG_REWARDS: term={k} mean={v.mean().item():.6e} weight={w:.6e} weighted_mean={(v*float(w)).mean().item():.6e}")
                     except Exception:
                         pass
 

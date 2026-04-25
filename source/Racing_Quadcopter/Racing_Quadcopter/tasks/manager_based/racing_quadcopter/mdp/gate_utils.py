@@ -71,8 +71,8 @@ def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torc
     Returns:
         Float [N] tensor: 1.0 where a valid passage occurred this step, else 0.0.
     """
-    gate_pos, gate_ori = gather_current_gate(env)
-    fwd = gate_forward(env, gate_ori)  # gate plane normal in world frame [N, 3]
+    gate_pos = env._curr_gate_pos
+    fwd = env._curr_gate_forward
 
     # Signed distance along gate forward axis: negative = approach side, positive = exit.
     to_prev = env._prev_drone_pos - gate_pos  # [N, 3]
@@ -89,8 +89,8 @@ def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torc
     crossing = env._prev_drone_pos + t.unsqueeze(-1) * (drone_pos - env._prev_drone_pos)
     to_cross = crossing - gate_pos  # offset from gate centre at crossing point
 
-    right = gate_right(env, gate_ori)
-    up = gate_up(env, gate_ori)
+    right = env._curr_gate_right
+    up = env._curr_gate_up
     lat  = (to_cross * right).sum(dim=1).abs()  # lateral offset at crossing [N]
     vert = (to_cross * up).sum(dim=1).abs()     # vertical offset at crossing [N]
 
@@ -181,23 +181,35 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
     drone_pos = env._robot.data.root_pos_w    # world frame [N, 3]
     drone_vel = env._robot.data.root_lin_vel_w  # world frame [N, 3]
 
-    # Compute lateral offset from gate centre (used for passage centering stats).
-    gate_pos, gate_ori = gather_current_gate(env)
-    to_gate = gate_pos - drone_pos
-    g_right = gate_right(env, gate_ori)
-    g_up = gate_up(env, gate_ori)
-    lateral_right = ((-to_gate) * g_right).sum(dim=1)
-    lateral_up = ((-to_gate) * g_up).sum(dim=1)
-    lateral_dist = torch.sqrt(lateral_right**2 + lateral_up**2)  # [N] metres from gate axis
+    def _refresh_current_gate_cache() -> None:
+        gate_pos, gate_ori = gather_current_gate(env)
+        env._curr_gate_pos = gate_pos
+        env._curr_gate_ori = gate_ori
+        env._curr_gate_forward = gate_forward(env, gate_ori)
+        env._curr_gate_right = gate_right(env, gate_ori)
+        env._curr_gate_up = gate_up(env, gate_ori)
+
+        env._curr_dist_to_gate_vector = gate_pos - drone_pos
+        env._curr_dist_to_gate_vector_normalized = env._curr_dist_to_gate_vector / (
+            torch.norm(env._curr_dist_to_gate_vector, dim=1, keepdim=True) + 1e-8
+        )
+        env._curr_dist_to_gate_right = ((-env._curr_dist_to_gate_vector) * env._curr_gate_right).sum(dim=1)
+        env._curr_dist_to_gate_up = ((-env._curr_dist_to_gate_vector) * env._curr_gate_up).sum(dim=1)
+        env._curr_dist_to_gate_lateral = torch.sqrt(env._curr_dist_to_gate_right**2 + env._curr_dist_to_gate_up**2)
+        env._curr_dist_to_gate_forward = -(env._curr_dist_to_gate_vector * env._curr_gate_forward).sum(dim=1)
+        env._on_approach_gate_side = env._curr_dist_to_gate_forward <= 0.0
+
+    _refresh_current_gate_cache()
     speed = torch.norm(drone_vel, dim=1)  # [N] m/s
 
     # Detect gate crossings and update _current_gate_idx / _gates_passed.
     env._gate_passed_buf = check_gate_passages(env, drone_pos)
+    _refresh_current_gate_cache()
     passed_mask = env._gate_passed_buf > 0.5
     if passed_mask.any():
         # Accumulate passage-quality stats (velocity + lateral offset) for curriculum.
         env._passage_velocity_sum[passed_mask] += speed[passed_mask]
-        env._passage_centering_sum[passed_mask] += lateral_dist[passed_mask]
+        env._passage_centering_sum[passed_mask] += env._curr_dist_to_gate_lateral[passed_mask]
         env._passage_count[passed_mask] += 1.0
 
         # Detect lap completions: gates_passed divisible by gate_counts means a full circuit done.

@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs.mdp.terminations import *
 
 
 def upside_down(env: ManagerBasedRLEnv) -> torch.Tensor:

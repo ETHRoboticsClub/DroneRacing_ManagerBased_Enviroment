@@ -15,3 +15,14 @@ from .observations import *  # noqa: F401, F403
 from .rewards import *       # noqa: F401, F403
 from .stats import *         # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403
+
+
+def scale_dataclass_attributes(scaling_factor: float):
+    def decorator(cls):
+        for field_name in cls.__annotations__:
+            value = getattr(cls, field_name, None)
+            if isinstance(value, (int, float)):
+                setattr(cls, field_name, scaling_factor * value)
+        return cls
+
+    return decorator

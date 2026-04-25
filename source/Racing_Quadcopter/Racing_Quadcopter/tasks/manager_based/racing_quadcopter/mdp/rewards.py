@@ -21,47 +21,9 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs.mdp.rewards import *
 
-from .gate_utils import gather_current_gate, gate_forward, gate_right, gate_up
-
-
-# ---------------------------------------------------------------------------
-# Reward weight scaling
-#
-# The manager framework computes: reward = term_output * weight.
-# The direct env applied weights internally, so to match direct-env magnitudes
-# we set weight = MANAGER_SCALE * direct_weight.
-# SKRL additionally applies rewards_shaper_scale=0.01 on top.
-# ---------------------------------------------------------------------------
-
-MANAGER_SCALE = 100.0
-
-# Direct-env default weights (from RewardWeights in reward_manager.py).
-DIRECT_GATE_PASSAGE = 250.0
-DIRECT_GATE_PROGRESS = 20.0
-DIRECT_GATE_CENTERING = 0.5
-DIRECT_VELOCITY_TOWARD_GATE = 2.0
-DIRECT_VELOCITY_LIMIT = -0.05
-DIRECT_ORIENTATION = -0.005
-DIRECT_ANGULAR_VELOCITY = -0.001
-DIRECT_ACTION_SMOOTHNESS = -0.0001
-DIRECT_ACTION_MAGNITUDE = -0.001
-DIRECT_CRASH = -50.0
-DIRECT_WRONG_SIDE = -0.1
-
-# Use these in RewTerm(weight=...) — effective reward matches direct * MANAGER_SCALE per term.
-WEIGHT_GATE_PASSAGE = MANAGER_SCALE * DIRECT_GATE_PASSAGE
-WEIGHT_GATE_PROGRESS = MANAGER_SCALE * DIRECT_GATE_PROGRESS
-WEIGHT_GATE_CENTERING = MANAGER_SCALE * DIRECT_GATE_CENTERING
-WEIGHT_VELOCITY_TOWARD_GATE = MANAGER_SCALE * DIRECT_VELOCITY_TOWARD_GATE
-WEIGHT_VELOCITY_LIMIT = MANAGER_SCALE * DIRECT_VELOCITY_LIMIT
-WEIGHT_PERCEPTION = MANAGER_SCALE * -0.01
-WEIGHT_ORIENTATION = MANAGER_SCALE * DIRECT_ORIENTATION
-WEIGHT_ANGULAR_VELOCITY = MANAGER_SCALE * DIRECT_ANGULAR_VELOCITY
-WEIGHT_ACTION_SMOOTHNESS = MANAGER_SCALE * DIRECT_ACTION_SMOOTHNESS
-WEIGHT_ACTION_MAGNITUDE = MANAGER_SCALE * DIRECT_ACTION_MAGNITUDE
-WEIGHT_CRASH = MANAGER_SCALE * DIRECT_CRASH
-WEIGHT_WRONG_SIDE = MANAGER_SCALE * DIRECT_WRONG_SIDE
+from isaaclab.utils.math import quat_apply
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +40,7 @@ def reward_gate_passage(env: ManagerBasedRLEnv) -> torch.Tensor:
 def reward_gate_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Distance reduction toward current gate this step, clamped to [-1, 1] m."""
     drone_pos = env._robot.data.root_pos_w
-    gate_pos, _ = gather_current_gate(env)
+    gate_pos = env._curr_gate_pos
     dist_to_gate = torch.norm(gate_pos - drone_pos, dim=1)
     prev_dist = torch.norm(env._prev_drone_pos - gate_pos, dim=1)
     # Positive when drone moves closer; clamped to prevent large single-step spikes.
@@ -92,26 +54,10 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     alignment from behind the gate after it has been passed.
     Formula: exp(-3 * lateral / size) * exp(-0.5 * |plane_dist|)
     """
-    drone_pos = env._robot.data.root_pos_w
-    gate_pos, gate_ori = gather_current_gate(env)
     gate_size = env._gate_sizes  # [N] per-env aperture in metres
-
-    to_gate = gate_pos - drone_pos
-    gate_fwd = gate_forward(env, gate_ori)
-    g_right = gate_right(env, gate_ori)
-    g_up = gate_up(env, gate_ori)
-
-    # Signed distance to gate plane: negative = approach side.
-    dist_to_plane = -(to_gate * gate_fwd).sum(dim=1)
-    on_approach_side = dist_to_plane <= 0.0  # only reward while approaching
-
-    lateral_right = ((-to_gate) * g_right).sum(dim=1)
-    lateral_up = ((-to_gate) * g_up).sum(dim=1)
-    lateral_dist = torch.sqrt(lateral_right**2 + lateral_up**2)
-
-    centering_value = torch.exp(-3.0 * lateral_dist / gate_size)   # falls off with lateral offset
-    proximity_factor = torch.exp(-0.5 * dist_to_plane.abs())        # falls off with distance to plane
-    return centering_value * proximity_factor * on_approach_side.float()
+    centering_value = torch.exp(-3.0 * env._curr_dist_to_gate_lateral / gate_size)   # falls off with lateral offset
+    proximity_factor = torch.exp(-0.5 * env._curr_dist_to_gate_forward.abs())         # falls off with distance to plane
+    return centering_value * proximity_factor * env._on_approach_gate_side.float()
 
 
 def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi / 3.0) -> torch.Tensor:
@@ -119,27 +65,16 @@ def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi
 
     p_perc = lambda_perc * theta_cam if theta_cam > theta_threshold else 0
     """
-    from isaaclab.utils.math import quat_apply
-
-    drone_pos = env._robot.data.root_pos_w
     drone_quat = env._robot.data.root_quat_w
-    gate_pos, gate_ori = gather_current_gate(env)
-
-    to_gate = gate_pos - drone_pos
-    to_gate_norm = to_gate / (torch.norm(to_gate, dim=1, keepdim=True) + 1e-8)
 
     # Drone +Y is forward (Crazyflie body convention).
     drone_forward = quat_apply(drone_quat, env._y_local.expand(env.num_envs, -1))
     drone_forward_norm = drone_forward / (torch.norm(drone_forward, dim=1, keepdim=True) + 1e-8)
 
-    gate_fwd = gate_forward(env, gate_ori)
-    dist_to_plane = -(to_gate * gate_fwd).sum(dim=1)
-    on_approach_side = dist_to_plane <= 0.0
-
-    cos_theta = torch.sum(drone_forward_norm * to_gate_norm, dim=1).clamp(-1.0, 1.0)
+    cos_theta = torch.sum(drone_forward_norm * env._curr_dist_to_gate_vector_normalized, dim=1).clamp(-1.0, 1.0)
     theta_cam = torch.acos(cos_theta)  # angle between drone forward and gate direction [N]
 
-    penalty = theta_cam * on_approach_side.float()
+    penalty = theta_cam * env._on_approach_gate_side.float()
     return torch.where(theta_cam > theta_threshold, penalty, torch.zeros_like(theta_cam))
 
 
@@ -148,20 +83,9 @@ def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     Clamped to >= 0 so backing away from the gate gives zero reward, not negative.
     """
-    drone_pos = env._robot.data.root_pos_w
     drone_vel = env._robot.data.root_lin_vel_w
-    gate_pos, gate_ori = gather_current_gate(env)
-
-    to_gate = gate_pos - drone_pos
-    dist_to_gate = torch.norm(to_gate, dim=1)
-    to_gate_normalized = to_gate / (dist_to_gate.unsqueeze(-1) + 1e-8)
-
-    gate_fwd = gate_forward(env, gate_ori)
-    dist_to_plane = -(to_gate * gate_fwd).sum(dim=1)
-    on_approach_side = dist_to_plane <= 0.0
-
-    vel_toward_gate = (drone_vel * to_gate_normalized).sum(dim=1).clamp(min=0.0)
-    return vel_toward_gate * on_approach_side.float()
+    vel_toward_gate = (drone_vel * env._curr_dist_to_gate_vector_normalized).sum(dim=1).clamp(min=0.0)
+    return vel_toward_gate * env._on_approach_gate_side.float()
 
 
 def penalty_velocity_limit(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -214,10 +138,4 @@ def penalty_wrong_side(env: ManagerBasedRLEnv) -> torch.Tensor:
     Suppressed on gate-passage frames (_gate_passed_buf=1) to avoid a spurious
     penalty on the step the drone legitimately crosses through.
     """
-    drone_pos = env._robot.data.root_pos_w
-    gate_pos, gate_ori = gather_current_gate(env)
-    to_gate = gate_pos - drone_pos
-    gate_fwd = gate_forward(env, gate_ori)
-    dist_to_plane = -(to_gate * gate_fwd).sum(dim=1)
-    on_approach_side = dist_to_plane <= 0.0
-    return (~on_approach_side).float() * (1.0 - env._gate_passed_buf)
+    return (~env._on_approach_gate_side).float() * (1.0 - env._gate_passed_buf)
