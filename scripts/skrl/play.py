@@ -75,6 +75,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import inspect
 import os
 import random
 import time
@@ -105,11 +106,16 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+try:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ModuleNotFoundError:
+    def get_published_pretrained_checkpoint(*args, **kwargs):
+        return None
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
+import Racing_Quadcopter.tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -206,8 +212,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
     runner.agent.load(resume_path)
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    # set agent to evaluation mode (API changed across SKRL versions)
+    if hasattr(runner.agent, "set_running_mode"):
+        runner.agent.set_running_mode("eval")
+    elif hasattr(runner.agent, "set_mode"):
+        runner.agent.set_mode("eval")
+    else:
+        runner.agent.enable_training_mode(enabled=False, apply_to_models=True)
 
     # reset environment
     obs, _ = env.reset()
@@ -218,8 +229,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            # agent stepping (SKRL 2.0.0 added a required `states` positional arg)
+            _act_sig = inspect.signature(runner.agent.act).parameters
+            if "states" in _act_sig:
+                outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
+            else:
+                outputs = runner.agent.act(obs, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
