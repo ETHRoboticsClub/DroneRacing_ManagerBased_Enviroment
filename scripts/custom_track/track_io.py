@@ -40,17 +40,39 @@ The ``Gate`` ordering in the list is the order the drone visits them in
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
 SCHEMA_VERSION = 1
 
-DEFAULTS: dict = {
-    "gate_size": 0.7,
-    "bar_thickness": 0.05,
-    "loop_closed": True,
-}
+CONFIG_FILE_PATH = 'scripts/custom_track/config.json'
+
+def load_json_to_dict(file_path):
+    # Check if file exists
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist.")
+        return None
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data
+
+    except json.JSONDecodeError:
+        print(f"Error: File '{file_path}' is not valid JSON.")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+
+    return None
+
+
+DEFAULTS = load_json_to_dict(CONFIG_FILE_PATH)
+
+if DEFAULTS is not None:
+    print("Default JSON config file loaded successfully:")
+    print(DEFAULTS)
 
 
 # ---------------------------------------------------------------------------
