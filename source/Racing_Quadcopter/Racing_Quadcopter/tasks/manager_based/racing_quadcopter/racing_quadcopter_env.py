@@ -18,10 +18,12 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
 
-from Racing_Quadcopter.terrains.racing_gates import get_gate_registry
+from Racing_Quadcopter.terrains import get_gate_registry
 from .mdp import rewards as racing_rewards
+from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
-from .mdp.rewards import update_racing_state
+from .mdp.gate_utils import update_racing_state
+from .mdp.stats import init_stats, step_stats
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg
 from .vis.trajectory_vis import (
     add_gate_sphere_lights_usd,
@@ -51,6 +53,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # _actions_buf) at manager construction time to infer output shapes.
         self._prepare_racing_task()
         super().load_managers()
+        init_two_stage_curriculum(self)
         # filter_collisions is only supported on CPU; GPU broad-phase handles it automatically.
         if str(self.device) == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.scene.terrain.prim_path])
@@ -64,9 +67,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Per-env speed cap; re-sampled each episode if cfg.randomize_velocity_limit.
         self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
 
+        init_stats(self)
+
         # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
+        # Action-noise per-env bias (sampled at reset if enabled)
+        self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
 
         # Float 0/1 per env: set by check_gate_passages each step.
         self._gate_passed_buf = torch.zeros(self.num_envs, device=self.device)
@@ -92,6 +99,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._episode_step_count = torch.zeros(self.num_envs, device=self.device)
         self._episode_collision_count = torch.zeros(self.num_envs, device=self.device)
 
+        # Lap completion stats: accumulated time and count for completed laps this episode.
+        # _last_lap_step tracks the step count when the previous lap ended (or episode start),
+        # so each lap's duration is delta steps × step_dt — not cumulative time from episode start.
+        self._episode_lap_time_sum = torch.zeros(self.num_envs, device=self.device)
+        self._episode_lap_count = torch.zeros(self.num_envs, device=self.device)
+        self._last_lap_step = torch.zeros(self.num_envs, device=self.device)
+
         # Per-passage quality stats accumulated each gate crossing.
         self._passage_velocity_sum = torch.zeros(self.num_envs, device=self.device)
         self._passage_centering_sum = torch.zeros(self.num_envs, device=self.device)
@@ -101,11 +115,28 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Starts False so early training always runs to timeout regardless of crashes.
         self._collision_detection_enabled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+
+        # Two-stage curriculum stage index (0 = stay-alive, 1 = full racing objective).
+        # In eval mode curriculum never advances; use a large sentinel (1000) so that
+        # all stage gates are satisfied:  upside_down (== 0) stays OFF, collision
+        # termination (>= 2) stays ON — matching fully-trained stage-3 behaviour.
+        self._curriculum_stage: int = 1000 if getattr(self.cfg, "eval_mode", False) else 0
+
         # Snapshots of last episode metrics; used by curriculum check every step.
         # Kept separate from live accumulators because those are zeroed at episode start.
         self._last_episode_gates_passed = torch.zeros(self.num_envs, device=self.device)
         self._last_episode_mean_velocity = torch.zeros(self.num_envs, device=self.device)
         self._last_episode_center_offset = torch.zeros(self.num_envs, device=self.device)
+
+        # Observation-noise per-env biases (sampled at reset if enabled).
+        # Gate lookahead K used to size gate-term biases.
+        k = int(self.cfg.observation.num_next_gates)
+        self._obs_noise_bias_base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self._obs_noise_bias_base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self._obs_noise_bias_projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
+        self._obs_noise_bias_obs_gates = torch.zeros(self.num_envs, k * 6, device=self.device)
+        self._obs_noise_bias_velocity_limit = torch.zeros(self.num_envs, 1, device=self.device)
+        self._obs_noise_bias_last_action = torch.zeros(self.num_envs, 4, device=self.device)
 
     def _setup_gate_tracking(self) -> None:
         """Build world-frame gate position/orientation tables for all envs.
@@ -145,17 +176,16 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         per_cell_base_pos = []
         per_cell_base_ori = []
-        gate_size = None
         for gd in gate_datas:
             local_gate_pos = gd.positions + centre_offset  # numpy [G, 3], centre-origin frame
             per_cell_base_pos.append(torch.from_numpy(local_gate_pos).float().to(self.device))
             per_cell_base_ori.append(torch.from_numpy(gd.orientations).float().to(self.device))
-            gate_size = gd.gate_size if gate_size is None else gate_size
 
         per_cell_counts = [p.shape[0] for p in per_cell_base_pos]
+        per_cell_sizes  = [gd.gate_size for gd in gate_datas]
         max_gates = max(per_cell_counts)
-        self._num_gates = max_gates  # padded dimension; use _gate_counts for true count per env
-        self._gate_size = gate_size  # aperture side length in metres (scalar)
+        self._num_gates  = max_gates
+        self._gate_sizes = torch.zeros(self.num_envs, device=self.device)  # [N] per-env gate aperture
 
         terrain_origins = terrain.terrain_origins
         if terrain_origins is None:
@@ -205,6 +235,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             self._gate_positions[env_id, :n] = cell_base_pos + origin  # → world frame
             self._gate_orientations[env_id, :n] = cell_base_ori.clone()
             self._gate_counts[env_id] = int(n)
+            self._gate_sizes[env_id] = per_cell_sizes[cell_idx]
             if n < max_gates:  # zero-pad remaining slots to prevent NaN contamination
                 self._gate_positions[env_id, n:] = 0.0
                 self._gate_orientations[env_id, n:] = 0.0
@@ -228,6 +259,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         # Wraps modulo _gate_counts[env_id] on each passage; never reads padding slots.
         self._current_gate_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Gate index the drone spawned in front of this episode; needed to detect lap completion
+        # when spawning mid-circuit (a lap = passing _gate_counts gates from any start gate).
+        self._spawn_gate_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # Cumulative passages this episode; used for lap_complete and logging.
         self._gates_passed = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # Previous-step drone position in world frame; required for line-crossing detection
@@ -312,6 +346,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Step 3: gate passage detection, crash buffer refresh, episode velocity stats.
         # Must run after the final scene.update() so all sensor data is current.
         update_racing_state(self)
+
+        step_stats(self)
 
         self.episode_length_buf += 1
         self.common_step_counter += 1
@@ -422,6 +458,40 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 print("DEBUG_TERRAIN: first_gate_pos_after_reset_sample=", first_pos[:5])
             except Exception as e:
                 print("DEBUG_TERRAIN: reset debug error", e)
+
+        # Sample per-episode biases for observation and action noise (if enabled).
+        # These buffers were pre-allocated in _prepare_racing_task.
+        n = env_ids_tensor.shape[0]
+        obs_noise_cfg = getattr(self.cfg, "observation_noise", None)
+        if obs_noise_cfg and getattr(obs_noise_cfg, "enable", False) and getattr(obs_noise_cfg, "per_episode_bias", False):
+            on = obs_noise_cfg
+            a, b = on.bias_range_base_lin_vel
+            self._obs_noise_bias_base_lin_vel[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
+            a, b = on.bias_range_base_ang_vel
+            self._obs_noise_bias_base_ang_vel[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
+            a, b = on.bias_range_projected_gravity
+            self._obs_noise_bias_projected_gravity[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
+            a, b = on.bias_range_obs_gates
+            k = int(self.cfg.observation.num_next_gates)
+            self._obs_noise_bias_obs_gates[env_ids_tensor] = torch.rand(n, k * 6, device=self.device) * (b - a) + a
+            a, b = on.bias_range_velocity_limit
+            self._obs_noise_bias_velocity_limit[env_ids_tensor] = torch.rand(n, 1, device=self.device) * (b - a) + a
+            a, b = on.bias_range_last_action
+            self._obs_noise_bias_last_action[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
+        else:
+            self._obs_noise_bias_base_lin_vel[env_ids_tensor] = 0.0
+            self._obs_noise_bias_base_ang_vel[env_ids_tensor] = 0.0
+            self._obs_noise_bias_projected_gravity[env_ids_tensor] = 0.0
+            self._obs_noise_bias_obs_gates[env_ids_tensor] = 0.0
+            self._obs_noise_bias_velocity_limit[env_ids_tensor] = 0.0
+            self._obs_noise_bias_last_action[env_ids_tensor] = 0.0
+
+        action_noise_cfg = getattr(self.cfg, "action_noise", None)
+        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_bias", False):
+            a, b = action_noise_cfg.bias_range
+            self._action_noise_bias[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
+        else:
+            self._action_noise_bias[env_ids_tensor] = 0.0
 
         if gate_log:
             self.extras["log"].update(gate_log)

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Racing quadcopter rewards (manager-based).
+"""Racing quadcopter reward and penalty functions (manager-based).
 
 Each public function returns the **unweighted** factor for that term.
 :class:`~isaaclab.managers.RewardManager` multiplies by the configured ``weight``
@@ -11,7 +11,7 @@ Each public function returns the **unweighted** factor for that term.
 SKRL's ``rewards_shaper_scale=0.01`` then divides by 100, so the final effective
 reward per term matches the direct-env magnitudes: factor × weight × 0.01 = factor × direct_weight.
 
-Gate frame helpers, passage detection, and :func:`update_racing_state` live here (shared with the env).
+Gate geometry and per-step state updates live in :mod:`.gate_utils`.
 
 See module-level ``WEIGHT_*`` constants for use in :class:`RewardsCfg`.
 """
@@ -21,128 +21,8 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.utils.math import quat_apply
 
-from .terminations import refresh_crash_buffers_for_step
-
-
-# ---------------------------------------------------------------------------
-# Gate frame helpers
-# All world-frame gate axes are derived by rotating the gate's local basis
-# vectors through the stored wxyz quaternion. Gate local convention:
-#   +Y = forward (passage direction), +X = right, +Z = up.
-# ---------------------------------------------------------------------------
-
-def gather_current_gate(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return world-frame position [N,3] and orientation [N,4] of each env's target gate."""
-    idx = env._current_gate_idx  # [N] long
-    env_arange = torch.arange(env.num_envs, device=env.device)
-    pos = env._gate_positions[env_arange, idx]    # [N, 3] world frame
-    ori = env._gate_orientations[env_arange, idx]  # [N, 4] wxyz
-    return pos, ori
-
-
-def gate_forward(env: ManagerBasedRLEnv, gate_ori: torch.Tensor) -> torch.Tensor:
-    """Gate +Y axis in world frame (passage direction). Shape [N, 3]."""
-    return quat_apply(gate_ori, env._y_local.expand(gate_ori.shape[0], -1))
-
-
-def gate_right(env: ManagerBasedRLEnv, gate_ori: torch.Tensor) -> torch.Tensor:
-    """Gate +X axis in world frame (lateral). Shape [N, 3]."""
-    return quat_apply(gate_ori, env._x_local.expand(gate_ori.shape[0], -1))
-
-
-def gate_up(env: ManagerBasedRLEnv, gate_ori: torch.Tensor) -> torch.Tensor:
-    """Gate +Z axis in world frame (vertical). Shape [N, 3]."""
-    return quat_apply(gate_ori, env._z_local.expand(gate_ori.shape[0], -1))
-
-
-def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torch.Tensor:
-    """Detect line-crossing through the current gate plane and update gate indices.
-
-    Uses the signed distance from the gate plane: a passage is registered when the
-    drone transitions from the approach side (dist <= 0) to the exit side (dist > 0)
-    AND the interpolated crossing point lies within the gate aperture (square test).
-
-    Returns:
-        Float [N] tensor: 1.0 where a valid passage occurred this step, else 0.0.
-    """
-    gate_pos, gate_ori = gather_current_gate(env)
-    fwd = gate_forward(env, gate_ori)  # gate plane normal in world frame [N, 3]
-
-    # Signed distance along gate forward axis: negative = approach side, positive = exit.
-    to_prev = env._prev_drone_pos - gate_pos  # [N, 3]
-    to_curr = drone_pos - gate_pos             # [N, 3]
-    dist_prev = (to_prev * fwd).sum(dim=1)  # [N]
-    dist_curr = (to_curr * fwd).sum(dim=1)  # [N]
-
-    # Plane crossing: was behind, now in front.
-    crossed = (dist_prev <= 0) & (dist_curr > 0)
-
-    # Interpolate to find the exact point where the trajectory crossed the gate plane.
-    # t=0 → previous position, t=1 → current position.
-    t = (-dist_prev / (dist_curr - dist_prev + 1e-8)).clamp(0.0, 1.0)
-    crossing = env._prev_drone_pos + t.unsqueeze(-1) * (drone_pos - env._prev_drone_pos)
-    to_cross = crossing - gate_pos  # offset from gate centre at crossing point
-
-    right = gate_right(env, gate_ori)
-    up = gate_up(env, gate_ori)
-    lat  = (to_cross * right).sum(dim=1).abs()  # lateral offset at crossing [N]
-    vert = (to_cross * up).sum(dim=1).abs()     # vertical offset at crossing [N]
-
-    # Aperture check: crossing must be within the square gate opening.
-    half = env._gate_size / 2.0
-    within = (lat < half) & (vert < half)
-
-    passed = crossed & within  # [N] bool
-
-    if passed.any():
-        env._gates_passed[passed] += 1
-        # Advance per-env gate index using the actual per-env gate counts
-        counts = env._gate_counts[passed]
-        new_idx = env._current_gate_idx[passed] + 1
-        # Safe modulo: avoid division by zero for any stray zero-count envs
-        mask_nz = counts > 0
-        res = torch.zeros_like(new_idx)
-        if mask_nz.any():
-            res[mask_nz] = new_idx[mask_nz] % counts[mask_nz]
-        env._current_gate_idx[passed] = res
-
-    return passed.float()
-
-
-def update_racing_state(env: ManagerBasedRLEnv) -> None:
-    """After physics: gate passages, crash buffers, episode speed stats.
-
-    Called once per RL step after the final decimation sub-step so all sensor
-    data (contact forces, root state) is fully refreshed before reads.
-    """
-    drone_pos = env._robot.data.root_pos_w   # world frame [N, 3]
-    drone_vel = env._robot.data.root_lin_vel_w  # world frame [N, 3]
-
-    # Compute lateral offset from gate centre (used for passage centering stats).
-    gate_pos, gate_ori = gather_current_gate(env)
-    to_gate = gate_pos - drone_pos
-    g_right = gate_right(env, gate_ori)
-    g_up = gate_up(env, gate_ori)
-    lateral_right = ((-to_gate) * g_right).sum(dim=1)
-    lateral_up = ((-to_gate) * g_up).sum(dim=1)
-    lateral_dist = torch.sqrt(lateral_right**2 + lateral_up**2)  # [N] metres from gate axis
-    speed = torch.norm(drone_vel, dim=1)  # [N] m/s
-
-    # Detect gate crossings and update _current_gate_idx / _gates_passed.
-    env._gate_passed_buf = check_gate_passages(env, drone_pos)
-    passed_mask = env._gate_passed_buf > 0.5
-    if passed_mask.any():
-        # Accumulate passage-quality stats (velocity + lateral offset) for curriculum.
-        env._passage_velocity_sum[passed_mask] += speed[passed_mask]
-        env._passage_centering_sum[passed_mask] += lateral_dist[passed_mask]
-        env._passage_count[passed_mask] += 1.0
-
-    refresh_crash_buffers_for_step(env)  # updates _crashed_buf and _collision_termination_buf
-
-    env._episode_velocity_sum += speed
-    env._episode_step_count += 1.0
+from .gate_utils import gather_current_gate, gate_forward, gate_right, gate_up
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +40,7 @@ MANAGER_SCALE = 100.0
 DIRECT_GATE_PASSAGE = 250.0
 DIRECT_GATE_PROGRESS = 20.0
 DIRECT_GATE_CENTERING = 0.5
-DIRECT_VELOCITY_TOWARD_GATE = 0.1
+DIRECT_VELOCITY_TOWARD_GATE = 2.0
 DIRECT_VELOCITY_LIMIT = -0.05
 DIRECT_ORIENTATION = -0.005
 DIRECT_ANGULAR_VELOCITY = -0.001
@@ -214,7 +94,7 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
     drone_pos = env._robot.data.root_pos_w
     gate_pos, gate_ori = gather_current_gate(env)
-    gate_size = float(env._gate_size)
+    gate_size = env._gate_sizes  # [N] per-env aperture in metres
 
     to_gate = gate_pos - drone_pos
     gate_fwd = gate_forward(env, gate_ori)
@@ -233,11 +113,14 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     proximity_factor = torch.exp(-0.5 * dist_to_plane.abs())        # falls off with distance to plane
     return centering_value * proximity_factor * on_approach_side.float()
 
+
 def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi / 3.0) -> torch.Tensor:
     """Penalty when next gate leaves the forward camera cone.
 
     p_perc = lambda_perc * theta_cam if theta_cam > theta_threshold else 0
     """
+    from isaaclab.utils.math import quat_apply
+
     drone_pos = env._robot.data.root_pos_w
     drone_quat = env._robot.data.root_quat_w
     gate_pos, gate_ori = gather_current_gate(env)
@@ -258,6 +141,7 @@ def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi
 
     penalty = theta_cam * on_approach_side.float()
     return torch.where(theta_cam > theta_threshold, penalty, torch.zeros_like(theta_cam))
+
 
 def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Dot product of world-frame velocity with normalized gate direction, approach side only.
@@ -298,8 +182,6 @@ def penalty_orientation(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
     projected_gravity = env._robot.data.projected_gravity_b  # body frame [N, 3]
     upright = torch.tensor([0.0, 0.0, -1.0], device=projected_gravity.device)
-    # .sum(dim=1) = dot product = cos(tilt_angle). Using torch.norm here would give
-    # |g_z| = cos(|tilt|), which is correct for tilt < 90° but gives ZERO for upside-down.
     orientation_error_angle = torch.acos(torch.clamp((projected_gravity * upright).sum(dim=1), -0.98, 0.98))
     return torch.square(orientation_error_angle)
 

@@ -49,9 +49,33 @@ class QuadcopterThrustAction(ActionTerm):
         return self._processed_actions
 
     def process_actions(self, actions: torch.Tensor):
+        # Keep a copy of previous command for smoothness penalties and actuator-lag filtering.
+        prev_cmd = self._raw_actions.clone()
+
+        cmd = actions.clamp(-1.0, 1.0)
+
+        # Conventional action-space domain randomization: additive noise, bias, and lag.
+        noise_cfg = getattr(self._env.cfg, "action_noise", None)
+        if noise_cfg is not None and getattr(noise_cfg, "enable", False):
+            std = float(getattr(noise_cfg, "gaussian_std", 0.0))
+            if std > 0.0:
+                cmd = cmd + torch.randn_like(cmd, device=self.device) * std
+
+            if getattr(noise_cfg, "per_episode_bias", False) and hasattr(self._env, "_action_noise_bias"):
+                cmd = cmd + self._env._action_noise_bias
+
+            alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
+            if alpha < 1.0:
+                cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
+
+            if getattr(noise_cfg, "clip_actions", True):
+                cmd = cmd.clamp(-1.0, 1.0)
+
         if hasattr(self._env, "_prev_actions"):
-            self._env._prev_actions[:] = self._raw_actions
-        self._raw_actions[:] = actions.clamp(-1.0, 1.0)
+            self._env._prev_actions[:] = prev_cmd
+
+        self._raw_actions[:] = cmd
+
         if hasattr(self._env, "_actions_buf"):
             self._env._actions_buf[:] = self._raw_actions
         thrust_cmd = (self._raw_actions[:, 0] + 1.0) * 0.5 # normalize the thrust command to be between 0 and 1

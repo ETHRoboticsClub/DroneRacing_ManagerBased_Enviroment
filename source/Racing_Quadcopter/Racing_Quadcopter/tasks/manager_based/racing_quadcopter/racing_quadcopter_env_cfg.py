@@ -11,6 +11,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.envs.common import ViewerCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -21,7 +22,8 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
-from Racing_Quadcopter.terrains.racing_terrain import create_racing_gates_terrain
+from Racing_Quadcopter.terrains import GateSpec
+from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain, create_racing_gates_terrain
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
@@ -30,10 +32,18 @@ from isaaclab.envs.mdp import *
 from isaaclab_assets import CRAZYFLIE_CFG
 
 from .mdp.actions import QuadcopterThrustActionCfg
+from .mdp.curriculums import apply_staged_curriculum
 from .mdp.events import reset_racing_spawn
-from .mdp.observations import _compute_next_gates_rel_and_fwd_body, velocity_limit_obs
+from .mdp.observations import (
+    compute_next_gates_rel_and_fwd_body,
+    velocity_limit_obs,
+    wrap_base_lin_vel,
+    wrap_base_ang_vel,
+    wrap_projected_gravity,
+    wrap_last_action,
+)
 from .mdp import rewards as racing_rewards
-from .mdp.terminations import collision_termination, lap_complete, runaway_velocity, upside_down
+from .mdp.terminations import below_height_threshold, collision_termination, lap_complete, runaway_velocity, upside_down
 
 
 
@@ -43,6 +53,58 @@ class GateObservationConfig:
 
     num_next_gates: int = 3
     include_velocity_limit: bool = True
+
+
+@configclass
+class ObservationNoiseCfg:
+    """Config for corrupting ground-truth observations to simulate state estimation.
+
+    Keep defaults off; enable selectively in experiments. The wrappers in
+    `mdp/observations.py` read this config to apply per-step Gaussian noise,
+    optional per-episode bias, and dropout.
+    """
+
+    # Conservative training defaults: enabled in training, disabled in *_PLAY configs.
+    enable: bool = True
+    per_episode_bias: bool = True
+
+    # default std if term-specific not set
+    gaussian_std_default: float = 0.0
+    gaussian_std_base_lin_vel: float = 0.0
+    gaussian_std_base_ang_vel: float = 0.0
+    gaussian_std_projected_gravity: float = 0.0
+    gaussian_std_obs_gates: float = 0.0
+    gaussian_std_velocity_limit: float = 0.0
+    gaussian_std_last_action: float = 0.0
+
+    # per-episode bias ranges (uniform sampling [min, max])
+    bias_range_base_lin_vel: tuple[float, float] = (-0.0, 0.0)
+    bias_range_base_ang_vel: tuple[float, float] = (-0.0, 0.0)
+    bias_range_projected_gravity: tuple[float, float] = (-0.0, 0.0)
+    bias_range_obs_gates: tuple[float, float] = (-0.0, 0.0)
+    bias_range_velocity_limit: tuple[float, float] = (-0.0, 0.0)
+    bias_range_last_action: tuple[float, float] = (-0.0, 0.0)
+
+    # dropout probability (per-term, per-step)
+    dropout_prob: float = 0.0
+
+
+@configclass
+class ActionNoiseCfg:
+    """Config for corrupting actions / simulating actuator noise/lag.
+
+    - gaussian_std: per-step additive noise on actions
+    - per_episode_bias: sampled bias added to actions each episode
+    - lpf_alpha: first-order low-pass applied to actions (1.0=no smoothing)
+    """
+
+    # Conservative training defaults: enabled in training, disabled in *_PLAY configs.
+    enable: bool = True
+    per_episode_bias: bool = True
+    gaussian_std: float = 0.0
+    bias_range: tuple[float, float] = (-0.0, 0.0)
+    lpf_alpha: float = 1.0 # No lag; set <1.0 to simulate actuator lag.
+    clip_actions: bool = True
 
 
 @configclass
@@ -83,7 +145,7 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         history_length: int = 3
         base_lin_vel = ObsTerm(
-            func=base_lin_vel,
+            func=wrap_base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.05, n_max=0.05),
             history_length=history_length,
@@ -91,13 +153,13 @@ class ObservationsCfg:
         
         #IMU 
         base_ang_vel = ObsTerm(
-            func=base_ang_vel,
+            func=wrap_base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
         )
         projected_gravity = ObsTerm(
-            func=projected_gravity,
+            func=wrap_projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
@@ -107,12 +169,12 @@ class ObservationsCfg:
         #TODO: Add motors speeds
 
         #ACTION
-        last_action = ObsTerm(func=last_action, history_length=history_length)
+        last_action = ObsTerm(func=wrap_last_action, history_length=history_length)
 
 
         #Perception
         obs_gates = ObsTerm(
-            func=_compute_next_gates_rel_and_fwd_body,
+            func=compute_next_gates_rel_and_fwd_body,
             noise=Unoise(n_min=-0.02, n_max=0.02),
             history_length=history_length,
         )
@@ -188,9 +250,17 @@ class EventsCfg:
 
 
 @configclass
+class CurriculumCfg:
+    """Staged curriculum: stay-alive → full racing → recovery spawns."""
+
+    staged = CurrTerm(func=apply_staged_curriculum)
+
+
+@configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=time_out, time_out=True)
     upside_down = DoneTerm(func=upside_down, time_out=False)
+    below_height = DoneTerm(func=below_height_threshold, time_out=False)
     runaway = DoneTerm(func=runaway_velocity, time_out=False)
     collision = DoneTerm(func=collision_termination, time_out=False)
     lap_complete = DoneTerm(func=lap_complete, time_out=True)
@@ -202,14 +272,17 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     seed: int = 42
 
-    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=1024, env_spacing=5.0, replicate_physics=True)
+    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=True)
 
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     rewards: RewardsCfg = RewardsCfg()
     events: EventsCfg = EventsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
     observation: GateObservationConfig = GateObservationConfig()
+    observation_noise: ObservationNoiseCfg = ObservationNoiseCfg()
+    action_noise: ActionNoiseCfg = ActionNoiseCfg()
 
     decimation: int = 2
     episode_length_s: float = 20.0
@@ -219,10 +292,16 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     velocity_limit_range: tuple[float, float] = (8.0, 15.0)
 
     upside_down_threshold: float = 0.7
+    min_height: float = 0.2
     max_velocity: float = 50.0
     collision_force_threshold: float = 0.001
 
     eval_mode: bool = False
+    crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
+    fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
+    recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
+    speed_log_interval_s: float = 10.0
+    stats_warmup_s: float = 0.0    # skip stats accumulation for this many simulation seconds at episode start
     draw_trajectory: bool = True        # green closed-loop polyline through all waypoints (USD, no collision)
     draw_gate_indicators: bool = True   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
     draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
@@ -238,6 +317,8 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     demo_drone_glow_color: tuple[float, float, float] = (1.0, 0.5, 0.0)  # orange drone glow
     demo_drone_glow_intensity: float = 5.0
 
+    curriculum_stage1_steps: int = 10000
+    curriculum_stage2_steps: int = 10000
     curriculum_min_gates_passed: int = 10
     curriculum_min_mean_velocity: float = 2.5
     curriculum_max_center_offset: float = 0.25
@@ -273,3 +354,108 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             debug_vis=True,
         )
         self.sim.render_interval = self.decimation
+
+
+@configclass
+class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
+    """Evaluation config: eval_mode on, fixed spawn at gate 0, no randomisation."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 1024
+        self.eval_mode = True
+        self.fixed_spawn = True
+        self.observation_noise.enable = False
+        self.action_noise.enable = False
+        self.events.randomize_robot_mass = None
+        self.events.randomize_robot_actuator_gains = None
+        self.stats_warmup_s = 30.0
+        print("[INFO] Evaluation mode is ON.")
+
+
+# ---------------------------------------------------------------------------
+# Fixed-track variants
+# ---------------------------------------------------------------------------
+# Replace FIXED_GATES with your own circuit.  Positions are in the sub-terrain's
+# corner-origin local frame (a 15×15 m tile runs from (0,0) to (15,15) in XY).
+# yaw_deg is clockwise from +Y: 0° → drone passes in +Y, 90° → in +X.
+
+FIXED_GATES: list[GateSpec] = [
+    # 0 — low start, heading north
+    GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
+
+    # 1-3 — climbing right sweep toward the top of the tile
+    GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
+    GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
+    GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
+
+    # 4-5 — SPLIT-S
+    # Gate 4: enter heading south at 4.2 m altitude.
+    # Drone rolls inverted, dives, and exits gate 5 heading north at 1.5 m
+    # (2.7 m altitude drop, ~1.5 m forward — extremely tight).
+    GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # entry
+    GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # exit
+
+    # 6-7 — left-side swoop
+    GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
+    GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
+
+    # 8-9 — CHICANE (offset gates, tight lateral snap)
+    GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
+    GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
+]
+
+FIXED_GATES_: list[GateSpec] = [
+    # 0 — low start, heading north
+    #GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
+
+    # 1-3 — climbing right sweep toward the top of the tile
+    GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
+    GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
+    GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
+    GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
+]
+
+
+@configclass
+class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
+    """Training config with a fixed, deterministic racing circuit.
+
+    Override ``FIXED_GATES`` at the top of this file (or subclass and replace
+    ``__post_init__``) to define your own track layout.
+    """
+
+    def __post_init__(self) -> None:
+        terrain_generator = create_fixed_track_terrain(FIXED_GATES, seed=self.seed)
+        self.scene.terrain = TerrainImporterCfg(
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=terrain_generator,
+            max_init_terrain_level=0,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            debug_vis=True,
+        )
+        self.sim.render_interval = self.decimation
+
+
+@configclass
+class RacingQuadcopterEnvCfg_FIXED_PLAY(RacingQuadcopterEnvCfg_FIXED):
+    """Evaluation config for the fixed circuit: eval_mode on, fixed spawn at gate 0, no randomisation."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 1024
+        self.eval_mode = True
+        self.fixed_spawn = True
+        self.observation_noise.enable = False
+        self.action_noise.enable = False
+        self.events.randomize_robot_mass = None
+        self.events.randomize_robot_actuator_gains = None
+        self.stats_warmup_s = 30.0
+        print("[INFO] Fixed-track evaluation mode is ON.")

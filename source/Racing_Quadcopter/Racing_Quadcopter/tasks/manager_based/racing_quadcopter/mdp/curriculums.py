@@ -3,11 +3,79 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Curriculum helpers for collision detection gating."""
+"""Curriculum helpers for collision detection gating and staged training."""
 
 from __future__ import annotations
 
 import torch
+
+from collections.abc import Sequence
+
+_STAGE1_BOOST = 1.0  # multiplier applied to crash and angular_velocity in stage 1
+
+
+def init_two_stage_curriculum(env: object) -> None:
+    """Boost stage-1 weights immediately after managers are built.
+
+    Reads the original weights from the reward manager via the public API and stores
+    them on the env for restoration when advancing to stage 2.
+    Call once from load_managers, after super().load_managers().
+    """
+    if env._curriculum_stage != 0:
+        return
+    env._stage2_crash_weight = env.reward_manager.get_term_cfg("crash").weight
+    env._stage2_ang_vel_weight = env.reward_manager.get_term_cfg("angular_velocity").weight
+
+    crash_cfg = env.reward_manager.get_term_cfg("crash")
+    crash_cfg.weight = env._stage2_crash_weight * _STAGE1_BOOST
+    env.reward_manager.set_term_cfg("crash", crash_cfg)
+
+    ang_cfg = env.reward_manager.get_term_cfg("angular_velocity")
+    ang_cfg.weight = env._stage2_ang_vel_weight * _STAGE1_BOOST
+    env.reward_manager.set_term_cfg("angular_velocity", ang_cfg)
+
+
+def apply_staged_curriculum(
+    env: object, _env_ids: Sequence[int]
+) -> dict[str, float] | None:
+    """Curriculum term: advance through up to three training stages.
+
+    Stage 0 → 1  (after curriculum_stage1_steps):
+        Restore crash and angular_velocity reward weights; upside-down termination
+        is disabled automatically because it checks _curriculum_stage == 0.
+
+    Stage 1 → 2  (after curriculum_stage2_steps, only when > 0):
+        Enable recovery spawns — a fraction of envs each episode spawn with a
+        random orientation and initial velocity (cfg.recovery_spawn_prob).
+    """
+    if getattr(env.cfg, "eval_mode", False):
+        return {"Curriculum/stage": float(env._curriculum_stage)}
+
+    stage = env._curriculum_stage
+
+    if stage == 0 and env.common_step_counter >= env.cfg.curriculum_stage1_steps:
+        env._curriculum_stage = 1
+
+        crash_cfg = env.reward_manager.get_term_cfg("crash")
+        crash_cfg.weight = env._stage2_crash_weight
+        env.reward_manager.set_term_cfg("crash", crash_cfg)
+
+        ang_cfg = env.reward_manager.get_term_cfg("angular_velocity")
+        ang_cfg.weight = env._stage2_ang_vel_weight
+        env.reward_manager.set_term_cfg("angular_velocity", ang_cfg)
+
+        print(f"[Curriculum] Advanced to stage 1 (full racing) at step {env.common_step_counter}")
+
+    elif stage == 1:
+        stage2_steps = getattr(env.cfg, "curriculum_stage2_steps", 0)
+        if stage2_steps > 0 and env.common_step_counter >= stage2_steps:
+            env._curriculum_stage = 2
+            print(
+                f"[Curriculum] Advanced to stage 2 (recovery spawns, "
+                f"prob={env.cfg.recovery_spawn_prob:.2f}) at step {env.common_step_counter}"
+            )
+
+    return {"Curriculum/stage": float(env._curriculum_stage)}
 
 
 def check_collision_curriculum_enabled(

@@ -1,0 +1,81 @@
+# Sequential sweep (index-aligned combinations).
+# Usage:
+#   python3 scripts/sweep.py --config configs/sweeps/sequential/example.yaml
+#
+# Run 0 takes index 0 from every list; run 1 takes index 1 from every list.
+# In sequential mode, all param_grid lists must have identical length.
+
+task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
+task_play: Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
+
+sweep_mode: sequential
+
+train_iterations: 834
+eval_steps: 3000
+num_envs: 8192
+
+extra_train_args:
+  - --headless
+
+extra_play_args:
+  - --headless
+
+param_grid:
+  recovery_spawn_prob:
+    - 0.2
+    - 0.3
+  curriculum_stage1_steps:
+    - 10000
+    - 10000
+  curriculum_stage2_steps:
+    - 10000
+    - 10000
+  episode_length_s:
+    - 30.0
+    - 30.0
+
+  randomize_velocity_limit:
+    - true
+    - true
+  velocity_limit_range:
+    - "(8.0, 15.0)"
+    - "(7.0, 16.0)"
+
+  observation_noise.enable:
+    - true
+    - true
+  observation_noise.gaussian_std_base_lin_vel:
+    - 0.015
+    - 0.03
+  observation_noise.gaussian_std_base_ang_vel:
+    - 0.015
+    - 0.03
+  observation_noise.gaussian_std_obs_gates:
+    - 0.02
+    - 0.04
+  observation_noise.bias_range_obs_gates:
+    - "(-0.08, 0.08)"
+    - "(-0.15, 0.15)"
+  observation_noise.dropout_prob:
+    - 0.0
+    - 0.0
+
+  action_noise.enable:
+    - true
+    - true
+  action_noise.gaussian_std:
+    - 0.02
+    - 0.04
+  action_noise.bias_range:
+    - "(-0.03, 0.03)"
+    - "(-0.06, 0.06)"
+  action_noise.lpf_alpha:
+    - 0.85
+    - 0.90
+
+  rewards.gate_progress.weight:
+    - 20.0
+    - 25.0
+  DIRECT_VELOCITY_TOWARD_GATE:
+    - 0.1
+    - 0.12

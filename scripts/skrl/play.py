@@ -57,6 +57,19 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--override",
+    action="append",
+    default=[],
+    metavar="KEY=VAL",
+    help="Override an env_cfg attribute, e.g. --override velocity_limit=10.0. Repeatable.",
+)
+parser.add_argument(
+    "--eval-steps",
+    type=int,
+    default=0,
+    help="Stop evaluation after this many environment steps (0 = run until window closes).",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -75,6 +88,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import inspect
 import os
 import random
 import time
@@ -105,13 +119,19 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+try:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ModuleNotFoundError:
+    def get_published_pretrained_checkpoint(*args, **kwargs):
+        return None
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
+import Racing_Quadcopter.tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from override_utils import apply_overrides
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -148,6 +168,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     experiment_cfg["seed"] = args_cli.seed if args_cli.seed is not None else experiment_cfg["seed"]
     env_cfg.seed = experiment_cfg["seed"]
 
+    # apply sweep overrides to env_cfg
+    if args_cli.override:
+        apply_overrides(env_cfg, args_cli.override)
+
     # specify directory for logging experiments (load checkpoint)
     log_root_path = os.path.join("logs", "skrl", experiment_cfg["agent"]["experiment"]["directory"])
     log_root_path = os.path.abspath(log_root_path)
@@ -168,6 +192,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    # Set explicit mode label so environment stats are tagged as EVAL.
+    os.environ["RACING_RUN_MODE"] = "EVAL"
+    print(f"[MODE] EVAL  | task={args_cli.task} | num_envs={env_cfg.scene.num_envs}")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -206,8 +234,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
     runner.agent.load(resume_path)
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    # set agent to evaluation mode (API changed across SKRL versions)
+    if hasattr(runner.agent, "set_running_mode"):
+        runner.agent.set_running_mode("eval")
+    elif hasattr(runner.agent, "set_mode"):
+        runner.agent.set_mode("eval")
+    else:
+        runner.agent.enable_training_mode(enabled=False, apply_to_models=True)
 
     # reset environment
     obs, _ = env.reset()
@@ -218,8 +251,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            # agent stepping (SKRL 2.0.0 added a required `states` positional arg)
+            _act_sig = inspect.signature(runner.agent.act).parameters
+            if "states" in _act_sig:
+                outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
+            else:
+                outputs = runner.agent.act(obs, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
@@ -228,16 +265,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+        timestep += 1
+        if args_cli.video and timestep == args_cli.video_length:
+            break
+        if args_cli.eval_steps > 0 and timestep >= args_cli.eval_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    # print sweep result line so sweep.py can parse it
+    if args_cli.eval_steps > 0:
+        _e = env
+        for _ in range(8):
+            if hasattr(_e, "_speed_window"):
+                break
+            _nxt = getattr(_e, "env", None) or getattr(_e, "unwrapped", None)
+            if _nxt is None or _nxt is _e:
+                break
+            _e = _nxt
+        if hasattr(_e, "_speed_window"):
+            sw, rw, gw = _e._speed_window, _e._run_window, _e._gates_window
+            laps = _e._total_lap_count
+            lap_t = _e._total_lap_time_sum
+            speed_kmh  = sum(sw) / len(sw) * 3.6 if sw else 0.0
+            lap_pct    = sum(rw) / len(rw) * 100  if rw else 0.0
+            mean_gates = sum(gw) / len(gw)         if gw else 0.0
+            lap_time_s = lap_t / laps               if laps > 0 else 0.0
+            import sys as _sys
+            print(
+                f"[SWEEP_RESULT] Speed={speed_kmh:.2f} Lap={lap_pct:.2f}"
+                f" Gates={mean_gates:.2f} LapTime={lap_time_s:.2f}",
+                flush=True,
+            )
+            _sys.stdout.flush()
 
     # close the simulator
     env.close()

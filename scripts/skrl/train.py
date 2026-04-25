@@ -41,6 +41,19 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to model 
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--override",
+    action="append",
+    default=[],
+    metavar="KEY=VAL",
+    help="Override an env_cfg attribute, e.g. --override velocity_limit=10.0. Repeatable.",
+)
+parser.add_argument(
+    "--exp-name",
+    type=str,
+    default=None,
+    help="Override the experiment directory name (used by sweep.py to organise runs).",
+)
+parser.add_argument(
     "--ml_framework",
     type=str,
     default="torch",
@@ -115,6 +128,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Racing_Quadcopter.tasks  # noqa: F401
+from override_utils import apply_overrides
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -164,6 +178,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
     env_cfg.seed = agent_cfg["seed"]
 
+    # apply sweep overrides to env_cfg
+    if args_cli.override:
+        apply_overrides(env_cfg, args_cli.override)
+
+    # redirect experiment directory when running under sweep
+    if args_cli.exp_name is not None:
+        agent_cfg["agent"]["experiment"]["directory"] = f"sweep/{args_cli.exp_name}"
+
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
     log_root_path = os.path.abspath(log_root_path)
@@ -197,6 +219,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    # Set explicit mode label so environment stats are tagged as TRAIN.
+    os.environ["RACING_RUN_MODE"] = "TRAIN"
+    print(f"[MODE] TRAIN | task={args_cli.task} | num_envs={env_cfg.scene.num_envs}")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
