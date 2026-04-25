@@ -241,7 +241,9 @@ class TopDownCanvas(FigureCanvas):
             "x": float(x),
             "y": float(y),
             "z": float(z),
-            "yaw": 0.0,
+            "yaw":   0.0,
+            "pitch": 0.0,
+            "roll":  0.0,
             "auto_yaw": True,
         }
         gates.append(gate)
@@ -295,35 +297,42 @@ class TopDownCanvas(FigureCanvas):
                 ext = np.vstack([positions, positions[:1]]) if closed else positions
                 ax.plot(ext[:, 0], ext[:, 1], color="#4a90e2", lw=1.0, alpha=0.5, ls="--")
 
-        # Resolved yaws: re-derive from quaternions so auto-yaw gates show their
-        # spline-tangent orientation rather than the stale stored yaw.
+        # World-frame gate axes from the resolved quaternion (handles auto-yaw
+        # AND non-zero pitch/roll). The 2D bar is the projection of the
+        # right axis onto XY: tilted gates appear shorter because some of the
+        # length is consumed by the vertical component, which is correct.
         try:
             _, quats, _ = track_io.track_to_arrays(self._track)
-            yaws = 2.0 * np.arctan2(quats[:, 3], quats[:, 0])
+            right_axes, forward_axes, _ = track_io.quat_axes_wxyz(quats)
         except Exception:
             yaws = np.array([float(g.get("yaw", 0.0)) for g in gates])
+            cy, sy = np.cos(yaws), np.sin(yaws)
+            right_axes   = np.stack([cy, sy, np.zeros_like(cy)], axis=1)
+            forward_axes = np.stack([-sy, cy, np.zeros_like(cy)], axis=1)
 
+        half = gate_size / 2.0
         for i, g in enumerate(gates):
-            yaw = float(yaws[i])
-            cosy, siny = np.cos(yaw), np.sin(yaw)
-            half = gate_size / 2.0
-            # Bar from above is a line of length ``gate_size`` in gate +X (right).
-            rx, ry = cosy * half, siny * half
-            x0, y0 = g["x"] - rx, g["y"] - ry
-            x1, y1 = g["x"] + rx, g["y"] + ry
+            rx, ry = right_axes[i, 0], right_axes[i, 1]
+            x0, y0 = g["x"] - rx * half, g["y"] - ry * half
+            x1, y1 = g["x"] + rx * half, g["y"] + ry * half
             color = "#ff6a00" if i == self._selected else "#222222"
             lw = 3.0 if i == self._selected else 1.8
             ax.plot([x0, x1], [y0, y1], color=color, lw=lw, solid_capstyle="round")
 
-            # Forward arrow along gate +Y (passage direction).
-            fx, fy = -siny, cosy
-            arrow_len = max(0.4, gate_size * 0.6)
-            ax.annotate(
-                "",
-                xy=(g["x"] + fx * arrow_len, g["y"] + fy * arrow_len),
-                xytext=(g["x"], g["y"]),
-                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
-            )
+            # Forward arrow along the horizontal projection of gate +Y.
+            # Skip when the gate is nose-up/nose-down enough to lose XY
+            # projection (the arrow would degenerate to a dot).
+            fx, fy = forward_axes[i, 0], forward_axes[i, 1]
+            fnorm = float(np.hypot(fx, fy))
+            if fnorm > 1e-3:
+                fx, fy = fx / fnorm, fy / fnorm
+                arrow_len = max(0.4, gate_size * 0.6)
+                ax.annotate(
+                    "",
+                    xy=(g["x"] + fx * arrow_len, g["y"] + fy * arrow_len),
+                    xytext=(g["x"], g["y"]),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
+                )
 
             ax.text(
                 g["x"] + 0.15, g["y"] + 0.15, str(i),
@@ -379,25 +388,30 @@ class PreviewCanvas3D(FigureCanvas):
             except Exception:
                 pass
 
+        # Right and up axes from the resolved quaternion. With pitch/roll
+        # both axes tilt out of the world XY/Z planes, so the aperture is
+        # drawn correctly as a rotated square.
         try:
             _, quats, _ = track_io.track_to_arrays(self._track)
-            yaws = 2.0 * np.arctan2(quats[:, 3], quats[:, 0])
+            right_axes, _, up_axes = track_io.quat_axes_wxyz(quats)
         except Exception:
             yaws = np.array([float(g.get("yaw", 0.0)) for g in gates])
+            cy_, sy_ = np.cos(yaws), np.sin(yaws)
+            right_axes = np.stack([cy_, sy_, np.zeros_like(cy_)], axis=1)
+            up_axes    = np.tile(np.array([0.0, 0.0, 1.0]), (len(gates), 1))
 
         half = gate_size / 2.0
         for i, g in enumerate(gates):
-            yaw = float(yaws[i])
-            c, s = np.cos(yaw), np.sin(yaw)
-            cx, cy, cz = g["x"], g["y"], g["z"]
-            # Aperture rectangle: 4 corners closed back to first.
-            corners = np.array([
-                [cx - half * c, cy - half * s, cz - half],
-                [cx + half * c, cy + half * s, cz - half],
-                [cx + half * c, cy + half * s, cz + half],
-                [cx - half * c, cy - half * s, cz + half],
-                [cx - half * c, cy - half * s, cz - half],
-            ])
+            right = right_axes[i]
+            up    = up_axes[i]
+            centre = np.array([g["x"], g["y"], g["z"]])
+            corners = np.stack([
+                centre + half * (-right - up),
+                centre + half * ( right - up),
+                centre + half * ( right + up),
+                centre + half * (-right + up),
+                centre + half * (-right - up),  # close back to first
+            ], axis=0)
             ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], color="#ff6a00", lw=1.5)
 
         # Equal-aspect bbox around the gates (with padding).
@@ -456,18 +470,22 @@ class PropertyPanel(QtWidgets.QWidget):
         # ---- Selected gate ----
         sel_box = QtWidgets.QGroupBox("Selected gate")
         f2 = QtWidgets.QFormLayout(sel_box)
-        self._gx = self._spin(-1000, 1000, 0.1, 3)
-        self._gy = self._spin(-1000, 1000, 0.1, 3)
-        self._gz = self._spin(0.0, 50.0, 0.1, 3)
-        self._gyaw = self._spin(-360.0, 360.0, 1.0, 1)
-        self._gauto = QtWidgets.QCheckBox("Auto-yaw (use spline tangent)")
-        f2.addRow("X (m)", self._gx)
-        f2.addRow("Y (m)", self._gy)
-        f2.addRow("Z (m)", self._gz)
-        f2.addRow("Yaw (deg)", self._gyaw)
-        f2.addRow("", self._gauto)
+        self._gx     = self._spin(-1000, 1000, 0.1, 3)
+        self._gy     = self._spin(-1000, 1000, 0.1, 3)
+        self._gz     = self._spin(0.0, 50.0, 0.1, 3)
+        self._gyaw   = self._spin(-360.0, 360.0, 1.0, 1)
+        self._gpitch = self._spin(-180.0, 180.0, 1.0, 1)
+        self._groll  = self._spin(-180.0, 180.0, 1.0, 1)
+        self._gauto  = QtWidgets.QCheckBox("Auto-yaw (use spline tangent)")
+        f2.addRow("X (m)",       self._gx)
+        f2.addRow("Y (m)",       self._gy)
+        f2.addRow("Z (m)",       self._gz)
+        f2.addRow("Yaw (deg)",   self._gyaw)
+        f2.addRow("Pitch (deg)", self._gpitch)
+        f2.addRow("Roll (deg)",  self._groll)
+        f2.addRow("",            self._gauto)
         layout.addWidget(sel_box)
-        for w in (self._gx, self._gy, self._gz, self._gyaw):
+        for w in (self._gx, self._gy, self._gz, self._gyaw, self._gpitch, self._groll):
             w.valueChanged.connect(self._emit_gate)
         self._gauto.toggled.connect(self._emit_gate)
 
@@ -539,7 +557,8 @@ class PropertyPanel(QtWidgets.QWidget):
         gates = self._track.get("gates", [])
         idx = self._selected
         enabled = idx is not None and 0 <= idx < len(gates)
-        for w in (self._gx, self._gy, self._gz, self._gyaw, self._gauto):
+        for w in (self._gx, self._gy, self._gz, self._gyaw,
+                  self._gpitch, self._groll, self._gauto):
             w.setEnabled(enabled)
         if not enabled:
             return
@@ -549,8 +568,11 @@ class PropertyPanel(QtWidgets.QWidget):
         self._gy.setValue(float(g["y"]))
         self._gz.setValue(float(g["z"]))
         self._gyaw.setValue(float(np.degrees(g.get("yaw", 0.0))))
+        self._gpitch.setValue(float(np.degrees(g.get("pitch", 0.0))))
+        self._groll.setValue(float(np.degrees(g.get("roll", 0.0))))
         self._gauto.setChecked(bool(g.get("auto_yaw", True)))
-        # Yaw spinbox is informational while auto-yaw is on.
+        # Yaw spinbox is informational while auto-yaw is on; pitch and roll
+        # are always user-controlled.
         self._gyaw.setEnabled(not self._gauto.isChecked())
         self._block = False
 
@@ -590,7 +612,9 @@ class PropertyPanel(QtWidgets.QWidget):
             "x": self._gx.value(),
             "y": self._gy.value(),
             "z": self._gz.value(),
-            "yaw": float(np.radians(self._gyaw.value())),
+            "yaw":   float(np.radians(self._gyaw.value())),
+            "pitch": float(np.radians(self._gpitch.value())),
+            "roll":  float(np.radians(self._groll.value())),
             "auto_yaw": self._gauto.isChecked(),
         })
 

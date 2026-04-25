@@ -12,7 +12,8 @@ Disk format (JSON, ``schema_version == 1``)::
       "bar_thickness": 0.05,
       "loop_closed":   true,
       "gates": [
-        {"x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0, "auto_yaw": true},
+        {"x": 0.0, "y": 0.0, "z": 1.5,
+         "yaw": 0.0, "pitch": 0.0, "roll": 0.0, "auto_yaw": true},
         ...
       ]
     }
@@ -20,13 +21,18 @@ Disk format (JSON, ``schema_version == 1``)::
 Conventions
 -----------
 - World frame, metres. ``x``/``y``/``z`` are the gate centre coordinates.
-- ``yaw`` is rotation about world ``+Z`` in **radians**. ``yaw = 0`` means the
-  gate's passage direction (``+Y`` in gate-local frame) coincides with world
-  ``+Y``. This matches racing_gates._place_gates_along_trajectory.
-- Gates are always upright (no roll/pitch).
+- ``yaw``, ``pitch``, ``roll`` are intrinsic Z-X-Y Euler angles in **radians**:
+    1. yaw rotates about world ``+Z``,
+    2. pitch about gate-local ``+X`` (right) after yaw,
+    3. roll about gate-local ``+Y`` (passage direction) after yaw + pitch.
+  With ``pitch=roll=0`` the gate is upright and ``yaw=0`` means the passage
+  direction (gate-local ``+Y``) coincides with world ``+Y`` — matching
+  ``racing_gates._place_gates_along_trajectory``.
+- ``pitch`` and ``roll`` default to 0 on disk and on load; old tracks without
+  these fields are upgraded transparently.
 - ``auto_yaw=True`` overrides the stored yaw with the closed-loop spline
   tangent direction at that gate when the track is exported via
-  ``track_to_arrays``.
+  ``track_to_arrays``. It does **not** touch pitch or roll.
 
 The ``Gate`` ordering in the list is the order the drone visits them in
 (matches ``RacingQuadcopterEnv._gate_positions`` insertion order).
@@ -74,7 +80,9 @@ def save_track(path: str | Path, track: dict) -> None:
                 "x": float(g["x"]),
                 "y": float(g["y"]),
                 "z": float(g["z"]),
-                "yaw": float(g.get("yaw", 0.0)),
+                "yaw":   float(g.get("yaw",   0.0)),
+                "pitch": float(g.get("pitch", 0.0)),
+                "roll":  float(g.get("roll",  0.0)),
                 "auto_yaw": bool(g.get("auto_yaw", True)),
             }
             for g in track.get("gates", [])
@@ -95,7 +103,9 @@ def load_track(path: str | Path) -> dict:
         data.setdefault(k, v)
     for g in data.get("gates", []):
         g.setdefault("auto_yaw", True)
-        g.setdefault("yaw", 0.0)
+        g.setdefault("yaw",   0.0)
+        g.setdefault("pitch", 0.0)  # added — old tracks default to upright
+        g.setdefault("roll",  0.0)
     return data
 
 
@@ -188,15 +198,34 @@ def gate_tangents_from_spline(
 
 
 # ---------------------------------------------------------------------------
-# Yaw / quaternion conversion
+# Euler / quaternion conversion
 # ---------------------------------------------------------------------------
-# Convention recap: an upright gate with yaw ψ has its passage direction
-# (gate-local +Y) mapped to world (-sin ψ, cos ψ, 0).  Inverting:
-#     ψ = atan2(-tx, ty)
-# where (tx, ty) is the desired horizontal forward direction.
+# Convention: intrinsic Z-X-Y Euler with angles [yaw, pitch, roll]
+#   1. yaw   — rotation about world +Z
+#   2. pitch — rotation about gate-local +X (right) AFTER yaw
+#   3. roll  — rotation about gate-local +Y (passage direction) AFTER yaw + pitch
+#
+# Why this order?
+#   - yaw spins the gate around the vertical axis (the racing-natural DoF)
+#   - pitch tips the gate forward/back (top moves toward/away from the drone)
+#   - roll banks the gate left/right around the line the drone flies through
+#
+# With pitch=roll=0 this reduces to (cos(yaw/2), 0, 0, sin(yaw/2)) — the
+# upright-gate quaternion that the simulator's procedural generator produces,
+# so existing tracks keep their semantics.
+#
+# Auto-yaw still resolves only the yaw component; pitch and roll are always
+# whatever the user set in the editor.
+
+def euler_to_quat_wxyz(yaw: float, pitch: float = 0.0, roll: float = 0.0) -> np.ndarray:
+    """IsaacLab-order ``(w, x, y, z)`` quaternion for intrinsic ZXY Euler."""
+    from scipy.spatial.transform import Rotation as R
+    qx, qy, qz, qw = R.from_euler("ZXY", [float(yaw), float(pitch), float(roll)]).as_quat()
+    return np.array([qw, qx, qy, qz])
+
 
 def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
-    """IsaacLab-order (w, x, y, z) quaternion for an upright gate."""
+    """Upright-gate quaternion. Kept for backward compat; equals euler_to_quat_wxyz(yaw, 0, 0)."""
     half = 0.5 * float(yaw)
     return np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
 
@@ -204,6 +233,27 @@ def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
 def yaw_from_horizontal_tangent(tx: float, ty: float) -> float:
     """Yaw angle such that gate-local +Y aligns with horizontal direction (tx, ty)."""
     return float(np.arctan2(-tx, ty))
+
+
+def quat_axes_wxyz(quats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply each ``(w,x,y,z)`` quaternion to the canonical basis.
+
+    Returns ``(right, forward, up)`` — three ``[N, 3]`` arrays of the world-
+    frame directions corresponding to gate-local ``+X``, ``+Y``, ``+Z``.
+    Useful for renderers that want to draw a tilted aperture without
+    re-implementing quaternion rotation.
+    """
+    from scipy.spatial.transform import Rotation as R
+    if quats.shape[0] == 0:
+        z = np.zeros((0, 3))
+        return z, z, z
+    sci = quats[:, [1, 2, 3, 0]]  # wxyz → xyzw
+    rot = R.from_quat(sci)
+    return (
+        rot.apply(np.array([1.0, 0.0, 0.0])),
+        rot.apply(np.array([0.0, 1.0, 0.0])),
+        rot.apply(np.array([0.0, 0.0, 1.0])),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +276,14 @@ def track_to_arrays(track: dict) -> tuple[np.ndarray, np.ndarray, dict]:
         return np.zeros((0, 3)), np.zeros((0, 4)), meta
 
     positions = np.array([[g["x"], g["y"], g["z"]] for g in gates], dtype=float)
-    yaws = np.array([float(g.get("yaw", 0.0)) for g in gates])
+    yaws    = np.array([float(g.get("yaw",   0.0)) for g in gates])
+    pitches = np.array([float(g.get("pitch", 0.0)) for g in gates])
+    rolls   = np.array([float(g.get("roll",  0.0)) for g in gates])
     auto_mask = np.array([bool(g.get("auto_yaw", True)) for g in gates])
 
     # Resolve auto-yaw against the spline tangent (horizontal projection).
+    # Pitch and roll are always whatever the user set — auto-yaw only ever
+    # touches the yaw component.
     if auto_mask.any() and len(gates) >= 2:
         closed = bool(meta["loop_closed"])
         tangents = gate_tangents_from_spline(positions, closed=closed)
@@ -241,7 +295,9 @@ def track_to_arrays(track: dict) -> tuple[np.ndarray, np.ndarray, dict]:
         auto_yaws = np.arctan2(-th[:, 0], th[:, 1])
         yaws = np.where(auto_mask, auto_yaws, yaws)
 
-    quats = np.stack([yaw_to_quat_wxyz(y) for y in yaws], axis=0)
+    quats = np.stack([
+        euler_to_quat_wxyz(y, p, r) for y, p, r in zip(yaws, pitches, rolls)
+    ], axis=0)
     return positions, quats, meta
 
 
@@ -253,7 +309,9 @@ __all__ = [
     "load_track",
     "interpolate_loop",
     "gate_tangents_from_spline",
+    "euler_to_quat_wxyz",
     "yaw_to_quat_wxyz",
     "yaw_from_horizontal_tangent",
+    "quat_axes_wxyz",
     "track_to_arrays",
 ]
