@@ -132,15 +132,6 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._last_episode_mean_velocity = torch.zeros(self.num_envs, device=self.device)
         self._last_episode_center_offset = torch.zeros(self.num_envs, device=self.device)
 
-        # Observation-noise per-env biases (sampled at reset if enabled).
-        # Gate lookahead K used to size gate-term biases.
-        k = int(self.cfg.observation.num_next_gates)
-        self._obs_noise_bias_base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
-        self._obs_noise_bias_base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
-        self._obs_noise_bias_projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
-        self._obs_noise_bias_obs_gates = torch.zeros(self.num_envs, k * 6, device=self.device)
-        self._obs_noise_bias_velocity_limit = torch.zeros(self.num_envs, 1, device=self.device)
-        self._obs_noise_bias_last_action = torch.zeros(self.num_envs, 4, device=self.device)
 
     def _setup_gate_tracking(self) -> None:
         """Build world-frame gate position/orientation tables for all envs.
@@ -441,32 +432,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             except Exception as e:
                 print("DEBUG_TERRAIN: reset debug error", e)
 
-        # Sample per-episode biases for observation and action noise (if enabled).
+        # Sample per-episode biases for action noise (if enabled).
         # These buffers were pre-allocated in _prepare_racing_task.
         n = env_ids_tensor.shape[0]
-        obs_noise_cfg = getattr(self.cfg, "observation_noise", None)
-        if obs_noise_cfg and getattr(obs_noise_cfg, "enable", False) and getattr(obs_noise_cfg, "per_episode_bias", False):
-            on = obs_noise_cfg
-            a, b = on.bias_range_base_lin_vel
-            self._obs_noise_bias_base_lin_vel[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
-            a, b = on.bias_range_base_ang_vel
-            self._obs_noise_bias_base_ang_vel[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
-            a, b = on.bias_range_projected_gravity
-            self._obs_noise_bias_projected_gravity[env_ids_tensor] = torch.rand(n, 3, device=self.device) * (b - a) + a
-            a, b = on.bias_range_obs_gates
-            k = int(self.cfg.observation.num_next_gates)
-            self._obs_noise_bias_obs_gates[env_ids_tensor] = torch.rand(n, k * 6, device=self.device) * (b - a) + a
-            a, b = on.bias_range_velocity_limit
-            self._obs_noise_bias_velocity_limit[env_ids_tensor] = torch.rand(n, 1, device=self.device) * (b - a) + a
-            a, b = on.bias_range_last_action
-            self._obs_noise_bias_last_action[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
-        else:
-            self._obs_noise_bias_base_lin_vel[env_ids_tensor] = 0.0
-            self._obs_noise_bias_base_ang_vel[env_ids_tensor] = 0.0
-            self._obs_noise_bias_projected_gravity[env_ids_tensor] = 0.0
-            self._obs_noise_bias_obs_gates[env_ids_tensor] = 0.0
-            self._obs_noise_bias_velocity_limit[env_ids_tensor] = 0.0
-            self._obs_noise_bias_last_action[env_ids_tensor] = 0.0
 
         action_noise_cfg = getattr(self.cfg, "action_noise", None)
         if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_bias", False):

@@ -24,16 +24,17 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils.noise import GaussianNoiseCfg
 from Racing_Quadcopter.terrains import GateSpec
 from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain, create_racing_gates_terrain
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from isaaclab_assets import CRAZYFLIE_CFG
 
 from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
 from .mdp.actions import QuadcopterThrustActionCfg
 from .mdp.curriculums import apply_staged_curriculum
+from .mdp.noise import drone_noise_model_factory
 
 
 # SKRL additionally applies rewards_shaper_scale=0.01 on top.
@@ -61,40 +62,6 @@ class GateObservationConfig:
 
     num_next_gates: int = 3
     include_velocity_limit: bool = True
-
-
-@configclass
-class ObservationNoiseCfg:
-    """Config for corrupting ground-truth observations to simulate state estimation.
-
-    Keep defaults off; enable selectively in experiments. The wrappers in
-    `mdp/observations.py` read this config to apply per-step Gaussian noise,
-    optional per-episode bias, and dropout.
-    """
-
-    # Conservative training defaults: enabled in training, disabled in *_PLAY configs.
-    enable: bool = True
-    per_episode_bias: bool = True
-
-    # default std if term-specific not set
-    gaussian_std_default: float = 0.0
-    gaussian_std_base_lin_vel: float = 0.0
-    gaussian_std_base_ang_vel: float = 0.0
-    gaussian_std_projected_gravity: float = 0.0
-    gaussian_std_obs_gates: float = 0.0
-    gaussian_std_velocity_limit: float = 0.0
-    gaussian_std_last_action: float = 0.0
-
-    # per-episode bias ranges (uniform sampling [min, max])
-    bias_range_base_lin_vel: tuple[float, float] = (-0.0, 0.0)
-    bias_range_base_ang_vel: tuple[float, float] = (-0.0, 0.0)
-    bias_range_projected_gravity: tuple[float, float] = (-0.0, 0.0)
-    bias_range_obs_gates: tuple[float, float] = (-0.0, 0.0)
-    bias_range_velocity_limit: tuple[float, float] = (-0.0, 0.0)
-    bias_range_last_action: tuple[float, float] = (-0.0, 0.0)
-
-    # dropout probability (per-term, per-step)
-    dropout_prob: float = 0.0
 
 
 @configclass
@@ -158,25 +125,29 @@ class ObservationsCfg:
     
     @configclass
     class PolicyCfg(ObsGroup):
+        enable_corruption: bool = True
+        concatenate_terms: bool = True
+        
         history_length: int = 3
+        
         base_lin_vel = ObsTerm(
-            func=observations.wrap_base_lin_vel,
+            func=observations.base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=Unoise(n_min=-0.05, n_max=0.05),
+            noise=drone_noise_model_factory(std_noise=0.05, std_bias=0.01, dropout=0.0),
             history_length=history_length,
         )
         
         #IMU 
         base_ang_vel = ObsTerm(
-            func=observations.wrap_base_ang_vel,
+            func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=Unoise(n_min=-0.02, n_max=0.02),
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
             history_length=history_length,
         )
         projected_gravity = ObsTerm(
-            func=observations.wrap_projected_gravity,
+            func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=Unoise(n_min=-0.02, n_max=0.02),
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
             history_length=history_length,
         )
 
@@ -184,23 +155,23 @@ class ObservationsCfg:
         #TODO: Add motors speeds
 
         #ACTION
-        last_action = ObsTerm(func=observations.wrap_last_action, history_length=history_length)
+        last_action = ObsTerm(
+            func=observations.last_action,
+            history_length=history_length,
+        )
 
 
         #Perception
         obs_gates = ObsTerm(
             func=observations.compute_next_gates_rel_and_fwd_body,
-            noise=Unoise(n_min=-0.02, n_max=0.02),
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
             history_length=history_length,
         )
-        velocity_limit = ObsTerm(func=observations.velocity_limit_obs, history_length=history_length)
         
-
-
-
-        def __post_init__(self) -> None:
-            self.enable_corruption = False
-            self.concatenate_terms = True
+        velocity_limit = ObsTerm(
+            func=observations.velocity_limit_obs,
+            history_length=history_length,
+        )
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -320,7 +291,6 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
     observation: GateObservationConfig = GateObservationConfig()
-    observation_noise: ObservationNoiseCfg = ObservationNoiseCfg()
     action_noise: ActionNoiseCfg = ActionNoiseCfg()
 
     decimation: int = 2
@@ -404,7 +374,7 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observation_noise.enable = False
+        self.observations.policy.enable_corruption = False
         self.action_noise.enable = False
         self.events.randomize_robot_mass = None
         self.events.randomize_robot_actuator_gains = None
@@ -492,7 +462,7 @@ class RacingQuadcopterEnvCfg_FIXED_PLAY(RacingQuadcopterEnvCfg_FIXED):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observation_noise.enable = False
+        self.observations.policy.enable_corruption = False
         self.action_noise.enable = False
         self.events.randomize_robot_mass = None
         self.events.randomize_robot_actuator_gains = None

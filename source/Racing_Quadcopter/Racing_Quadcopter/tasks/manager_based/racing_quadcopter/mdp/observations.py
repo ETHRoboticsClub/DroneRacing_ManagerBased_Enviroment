@@ -11,41 +11,15 @@ All gate-related math lives in this module. The env only exposes state
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import *
-from isaaclab.envs.mdp.observations import base_ang_vel, base_lin_vel, last_action, projected_gravity
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
-
-# Lightweight wrappers which add configurable observation corruption (state-estimation noise)
-# to the ground-truth observation terms. The configuration lives in
-# RacingQuadcopterEnvCfg.observation_noise (defined in the env cfg file).
 
 # Divide world-frame gate offsets (metres) by this before feeding to the network.
 # Keeps inputs in roughly [-1, 1] for gates up to ~10 m away.
 _REL_POSITION_SCALE: float = 10.0
-
-_OBS_NOISE_BIAS_ATTR_MAP = {
-    "base_lin_vel": "_obs_noise_bias_base_lin_vel",
-    "base_ang_vel": "_obs_noise_bias_base_ang_vel",
-    "projected_gravity": "_obs_noise_bias_projected_gravity",
-    "obs_gates": "_obs_noise_bias_obs_gates",
-    "velocity_limit": "_obs_noise_bias_velocity_limit",
-    "last_action": "_obs_noise_bias_last_action",
-}
-
-_OBS_NOISE_STD_ATTR_MAP = {
-    "base_lin_vel": "gaussian_std_base_lin_vel",
-    "base_ang_vel": "gaussian_std_base_ang_vel",
-    "projected_gravity": "gaussian_std_projected_gravity",
-    "obs_gates": "gaussian_std_obs_gates",
-    "velocity_limit": "gaussian_std_velocity_limit",
-    "last_action": "gaussian_std_last_action",
-}
-
 
 def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Next-K gates observation: body-frame relative position + forward per gate.
@@ -59,7 +33,6 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
     k = env.cfg.observation.num_next_gates  # lookahead count
     n = env.num_envs
-    device = env.device
 
     drone_pos_w = env._robot.data.root_pos_w   # world frame [N, 3]
     drone_quat_w = env._robot.data.root_quat_w  # wxyz [N, 4]
@@ -91,7 +64,7 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     gate_obs = torch.cat([offset_b_scaled, forward_b], dim=-1)  # [N, K, 6]
     gate_obs = gate_obs.reshape(n, k * 6)
-    return _apply_obs_noise(env, gate_obs, "obs_gates")
+    return gate_obs
 
 
 def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -100,93 +73,4 @@ def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     Exposes the per-env speed cap to the policy so it can adapt its behaviour
     when the cap is randomised across episodes (curriculum).
     """
-    return _apply_obs_noise(env, env._velocity_limit.unsqueeze(-1), "velocity_limit")
-
-
-def _get_obs_noise_runtime(env: ManagerBasedRLEnv, cfg) -> dict:
-    """Lazily initialize/cache observation-noise lookup data on env."""
-    runtime = getattr(env, "_obs_noise_runtime", None)
-    cfg_identity = id(cfg)
-    if runtime is not None and runtime.get("cfg_identity") == cfg_identity:
-        return runtime
-
-    std_default = float(getattr(cfg, "gaussian_std_default", 0.0))
-    std_by_term = {
-        term_key: float(getattr(cfg, std_attr_name, std_default))
-        for term_key, std_attr_name in _OBS_NOISE_STD_ATTR_MAP.items()
-    }
-
-    runtime = {
-        "cfg_identity": cfg_identity,
-        "std_default": std_default,
-        "std_by_term": std_by_term,
-        "dropout_prob": float(getattr(cfg, "dropout_prob", 0.0)),
-    }
-    env._obs_noise_runtime = runtime
-    return runtime
-
-
-# ---------------------------- Observation corruption ----------------------------
-def _apply_obs_noise(env: ManagerBasedRLEnv, tensor: torch.Tensor, term_key: str) -> torch.Tensor:
-    """Apply configurable state-estimation corruption to a term tensor.
-
-    Supported corruptions (controlled by ``env.cfg.observation_noise``):
-    - per-step additive Gaussian noise (term-specific std)
-    - optional per-episode bias (sampled and stored on the env)
-    - dropout (zero-out entire term with probability p per-step)
-
-    The function is defensive: if the configuration is not present or disabled
-    it returns the tensor unchanged.
-    """
-    cfg = getattr(env.cfg, "observation_noise", None)
-    if cfg is None or not getattr(cfg, "enable", False):
-        return tensor
-
-    runtime = _get_obs_noise_runtime(env, cfg)
-
-    device = tensor.device
-
-    # Add stored per-episode bias if present on env
-    bias_attr = _OBS_NOISE_BIAS_ATTR_MAP.get(term_key)
-    b = getattr(env, bias_attr, None) if bias_attr is not None else None
-    if b is not None:
-        try:
-            tensor = tensor + b
-        except Exception:
-            # shape mismatch → ignore per-episode bias for safety
-            pass
-
-    # Per-step Gaussian noise
-    std = runtime["std_by_term"].get(term_key, runtime["std_default"])
-    if std > 0.0:
-        tensor = tensor + torch.randn_like(tensor, device=device) * std
-
-    # Dropout (per-env, per-step)
-    dp = runtime["dropout_prob"]
-    if dp > 0.0:
-        mask_shape = [tensor.shape[0]] + [1] * (tensor.dim() - 1)
-        mask = (torch.rand(tensor.shape[0], device=device) > dp).view(*mask_shape)
-        tensor = tensor * mask
-
-    return tensor
-
-
-def wrap_base_lin_vel(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-    out = base_lin_vel(env, asset_cfg=asset_cfg)
-    return _apply_obs_noise(env, out, "base_lin_vel")
-
-
-def wrap_base_ang_vel(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-    out = base_ang_vel(env, asset_cfg=asset_cfg)
-    return _apply_obs_noise(env, out, "base_ang_vel")
-
-
-def wrap_projected_gravity(env: ManagerBasedRLEnv, asset_cfg=None) -> torch.Tensor:
-
-    out = projected_gravity(env, asset_cfg=asset_cfg)
-    return _apply_obs_noise(env, out, "projected_gravity")
-
-
-def wrap_last_action(env: ManagerBasedRLEnv) -> torch.Tensor:
-    out = last_action(env)
-    return _apply_obs_noise(env, out, "last_action")
+    return env._velocity_limit.unsqueeze(-1)
