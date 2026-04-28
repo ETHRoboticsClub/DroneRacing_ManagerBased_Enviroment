@@ -14,14 +14,14 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs.mdp.observations import *
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 # Divide world-frame gate offsets (metres) by this before feeding to the network.
 # Keeps inputs in roughly [-1, 1] for gates up to ~10 m away.
 _REL_POSITION_SCALE: float = 10.0
 
-
-def _compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
+def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Next-K gates observation: body-frame relative position + forward per gate.
 
     Gate forward is +Y in gate local frame, mapped to world then to body.
@@ -33,15 +33,13 @@ def _compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor
     """
     k = env.cfg.observation.num_next_gates  # lookahead count
     n = env.num_envs
-    device = env.device
 
     drone_pos_w = env._robot.data.root_pos_w   # world frame [N, 3]
     drone_quat_w = env._robot.data.root_quat_w  # wxyz [N, 4]
     y_local = env._y_local  # gate +Y = forward in gate local frame
 
     # Build [N, K] gate index table: current_gate + {0,1,...,K-1} mod gate_count.
-    step = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0).expand(n, -1)  # [N, K]
-    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + step  # [N, K]
+    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + env._gate_step_indices  # [N, K]
     gate_counts = env._gate_counts.unsqueeze(1)  # [N, 1]
     safe_counts = gate_counts.clone()
     safe_counts[safe_counts == 0] = 1  # guard: envs with 0 gates would cause div-by-zero
@@ -65,7 +63,8 @@ def _compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor
     forward_b = quat_apply_inverse(q_drone, forward_w)  # [N, K, 3] body frame
 
     gate_obs = torch.cat([offset_b_scaled, forward_b], dim=-1)  # [N, K, 6]
-    return gate_obs.reshape(n, k * 6)
+    gate_obs = gate_obs.reshape(n, k * 6)
+    return gate_obs
 
 
 def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:

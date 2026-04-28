@@ -12,34 +12,19 @@ once per terrain cell.  It builds:
   1. A flat ground-plane mesh.
   2. A procedural closed-loop trajectory (figure-8, oval, or random spline).
   3. Gate frames placed at arc-length intervals along that trajectory.
-  4. Visual extras: a 7-segment gate-index label and a forward-direction indicator.
 
 Registry pattern
 ----------------
 TerrainGenerator **copies** the cfg dataclass before calling the terrain function,
 so any attribute written to cfg inside the function is silently discarded. Gate data
-(positions, orientations, size) therefore cannot be returned via cfg.  Instead they
-are stored in the module-level ``_gate_registry`` dict, keyed by
-``(round(difficulty, 6), seed)``, and retrieved by the env after all terrain cells
-have been generated.
+is stored in ``gate_base.gate_registry``, keyed by ``(round(difficulty, 6), seed)``,
+and retrieved by the env after all terrain cells have been generated.
 
 Seed per cell
 -------------
 TerrainGenerator differentiates the seed for every cell before invoking the terrain
 function.  In a 4-row × 4-col grid this yields 16 unique (difficulty, seed) registry
-keys — every cell has a distinct random gate layout.  Difficulty is assigned per row
-(4 difficulty levels across 4 rows); columns within a row share the same difficulty
-but have different seeds, so their circuits still differ.
-
-Gate coordinate system
-----------------------
-  +X  right  (horizontal, along gate bar width)
-  +Y  forward (passage direction — the drone should fly through in +Y)
-  +Z  up     (vertical; gates are always upright, Z always = world up)
-
-All quaternions are stored in (w, x, y, z) order to match IsaacLab convention.
-scipy.spatial.transform uses (x, y, z, w); conversions are explicit at every
-call site.
+keys — every cell has a distinct random gate layout.
 """
 
 from __future__ import annotations
@@ -47,51 +32,14 @@ from __future__ import annotations
 import numpy as np
 import scipy.spatial.transform as tf
 import trimesh
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from isaaclab.terrains.trimesh.utils import make_plane
 
+from .gate_base import GateData, gate_registry, create_gate_frame
+
 if TYPE_CHECKING:
     from .racing_gates_cfg import MeshRacingGatesTerrainCfg
-
-
-@dataclass
-class GateData:
-    """Gate data produced by a single sub-terrain generation call.
-
-    All arrays are in the sub-terrain's **local corner-origin frame** — i.e. the
-    coordinate system where (0,0,0) is the corner of the terrain mesh as built by
-    make_plane.  The environment must add the TerrainGenerator's centre-offset
-    (−size/2 in X and Y) and then the per-cell terrain_origin to convert to world
-    frame (see _setup_gate_tracking in racing_quadcopter_env.py).
-    """
-    positions: np.ndarray       # [num_gates, 3]  gate centre positions, local frame
-    orientations: np.ndarray    # [num_gates, 4]  quaternions (w, x, y, z), local frame
-    gate_size: float            # aperture side length in metres (square gate)
-    bar_thickness: float        # frame bar thickness in metres
-    start_position: np.ndarray  # [3]  first waypoint — informational, not currently used
-    start_tangent: np.ndarray   # [3]  tangent at first waypoint — informational
-    waypoints: np.ndarray       # [num_waypoints, 3]  full trajectory sample points, local frame
-
-
-# ---------------------------------------------------------------------------
-# Module-level registry
-# ---------------------------------------------------------------------------
-# Dict from (difficulty, seed) → GateData for every cell generated in the
-# current run.  The env reads this after TerrainGenerator finishes.
-# Safe to clear between independent training runs if needed.
-_gate_registry: dict[tuple[float, int | None], GateData] = {}
-
-
-def get_gate_registry() -> dict[tuple[float, int | None], GateData]:
-    """Return a reference to the module-level gate data registry."""
-    return _gate_registry
-
-
-def clear_gate_registry() -> None:
-    """Clear all stored gate data (call between training runs if needed)."""
-    _gate_registry.clear()
 
 
 def racing_gates_terrain(
@@ -154,7 +102,7 @@ def racing_gates_terrain(
     # Write to module-level registry so the env can retrieve it after terrain gen.
     # round(difficulty, 6) guards against floating-point key collisions for cells
     # that are assigned the same nominal difficulty by the generator.
-    _gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
+    gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
         positions=gate_positions.copy(),
         orientations=gate_orientations.copy(),
         gate_size=gate_size,
@@ -168,7 +116,7 @@ def racing_gates_terrain(
     # Labels and direction indicators are drawn as collision-free USD BasisCurves
     # from the env (see trajectory_vis.py).
     for pos, quat in zip(gate_positions, gate_orientations):
-        meshes_list.extend(_create_gate_frame(
+        meshes_list.extend(create_gate_frame(
             position=pos,
             orientation=quat,
             gate_size=gate_size,
@@ -214,7 +162,11 @@ def _generate_racing_trajectory(
     elif trajectory_type == "oval":
         return _generate_oval(center_x, center_y, max_radius_x, max_radius_y,
                               num_waypoints, height_range, difficulty, rng)
-    else:  # "random" — cubic-spline through randomised control points
+    else:  # "random" — pick a sub-style per cell for visual variety
+        style = int(rng.integers(0, 3))   # 0,1 → spline variants; 2 → chicane
+        if style == 2:
+            return _generate_chicane_track(center_x, center_y, max_radius_x, max_radius_y,
+                                           num_waypoints, height_range, difficulty, rng)
         return _generate_random_track(center_x, center_y, max_radius_x, max_radius_y,
                                       num_waypoints, height_range, difficulty, rng)
 
@@ -283,84 +235,127 @@ def _generate_oval(
     return waypoints, tangents
 
 
+def _spline_track(
+    t_ctrl: np.ndarray,
+    ctrl_x: np.ndarray,
+    ctrl_y: np.ndarray,
+    ctrl_z: np.ndarray,
+    n: int,
+    height_range: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a periodic CubicSpline through control points and sample n waypoints."""
+    from scipy.interpolate import CubicSpline
+    t_ext = np.append(t_ctrl, 2 * np.pi)
+    cs_x = CubicSpline(t_ext, np.append(ctrl_x, ctrl_x[0]), bc_type="periodic")
+    cs_y = CubicSpline(t_ext, np.append(ctrl_y, ctrl_y[0]), bc_type="periodic")
+    cs_z = CubicSpline(t_ext, np.append(ctrl_z, ctrl_z[0]), bc_type="periodic")
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    waypoints = np.stack([cs_x(t), cs_y(t), np.clip(cs_z(t), *height_range)], axis=1)
+    tangents  = np.stack([cs_x(t, 1), cs_y(t, 1), cs_z(t, 1)], axis=1)
+    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-8
+    return waypoints, tangents
+
+
 def _generate_random_track(
     cx: float, cy: float, rx: float, ry: float,
     n: int, height_range: tuple[float, float], difficulty: float,
     rng: np.random.Generator
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Random smooth closed-loop track via cubic-spline through randomised control points.
-
-    The algorithm:
-      1. Place num_control points evenly around a circle in parameter space (0–2π).
-      2. Perturb their radial distance with layered noise (base + secondary oscillation).
-      3. Add a random spiral offset in XY for extra 3D complexity.
-      4. Assign heights from a uniform base + two superimposed sinusoids.
-      5. Fit a periodic CubicSpline through the closed control polygon.
-      6. Sample the spline at n evenly-spaced parameter values.
-      7. Compute tangents analytically from the spline's first derivative (exact, no FD error).
+    """Random closed-loop track — aggressive at high difficulty.
 
     Difficulty effects:
-      - num_control scales with difficulty (more control points = more corners/turns).
-      - Radius perturbation amplitude grows with difficulty.
-      - Height oscillation amplitude grows with difficulty.
+      - More control points → more corners and direction changes.
+      - Larger radius perturbation amplitude → sharper turns.
+      - Multiple stacked harmonic distortions for unique shapes per cell.
+      - Height amplitude scales to almost the full height range at difficulty=1.
     """
-    # More control points at higher difficulty → more complex, tighter circuits.
-    num_control = max(8, int(12 + difficulty * 8))
-
+    num_control = max(12, int(16 + difficulty * 14))  # 16 easy → 30 hard
     t_ctrl = np.linspace(0, 2 * np.pi, num_control, endpoint=False)
 
-    # Layered radius perturbation: base noise × secondary sinusoidal oscillation.
-    r_perturb_base = 1.0 + rng.uniform(-0.6, 0.6, num_control) * (0.5 + difficulty * 0.5)
-    secondary_freq = rng.uniform(1.5, 3.5)
-    secondary_amp  = rng.uniform(0.2, 0.4)
-    r_perturb = r_perturb_base * (1.0 + secondary_amp * np.sin(secondary_freq * t_ctrl))
+    # Base radius noise — large amplitude at high difficulty produces sharp corners.
+    perturb_amp = 0.3 + difficulty * 0.65
+    r_perturb = 1.0 + rng.uniform(-perturb_amp, perturb_amp, num_control)
 
-    # Control point positions: 85 % of available radius × perturbation.
-    ctrl_x = cx + rx * 0.85 * np.cos(t_ctrl) * r_perturb
-    ctrl_y = cy + ry * 0.85 * np.sin(t_ctrl) * r_perturb
+    # Stack 2–4 independent harmonic distortions so every cell looks different.
+    for _ in range(int(rng.integers(2, 5))):
+        freq = rng.uniform(1.5, max(2.0, num_control / 3.0))
+        amp  = rng.uniform(0.1, 0.35) * (0.3 + difficulty * 0.7)
+        r_perturb *= 1.0 + amp * np.sin(freq * t_ctrl + rng.uniform(0, 2 * np.pi))
 
-    # Random spiral adds non-circular XY distortion on top of the radius perturbation.
-    spiral_strength = rng.uniform(0.1, 0.3)
-    ctrl_x += spiral_strength * rx * np.sin(3 * t_ctrl)
-    ctrl_y += spiral_strength * ry * np.cos(3 * t_ctrl)
+    r_perturb = np.clip(r_perturb, 0.25, 2.2)
 
-    # Heights: random base values + two sinusoidal oscillations for roller-coaster effect.
-    base_heights = rng.uniform(height_range[0], height_range[1], num_control)
-    height_amp1 = (height_range[1] - height_range[0]) * 0.3
-    height_amp2 = (height_range[1] - height_range[0]) * 0.15
-    height_freq1 = rng.uniform(1.0, 3.0)
-    height_freq2 = rng.uniform(4.0, 6.0)
-    ctrl_z = np.clip(
-        base_heights
-        + height_amp1 * np.sin(height_freq1 * t_ctrl + rng.uniform(0, 2 * np.pi))
-        + height_amp2 * np.sin(height_freq2 * t_ctrl + rng.uniform(0, 2 * np.pi)),
+    ctrl_x = cx + rx * 0.88 * np.cos(t_ctrl) * r_perturb
+    ctrl_y = cy + ry * 0.88 * np.sin(t_ctrl) * r_perturb
+
+    # Multiple independent spiral distortions for asymmetry.
+    for _ in range(int(rng.integers(1, 4))):
+        freq  = rng.uniform(2.0, 6.0)
+        amp_x = rng.uniform(0.1, 0.4) * rx * (0.2 + difficulty * 0.8)
+        amp_y = rng.uniform(0.1, 0.4) * ry * (0.2 + difficulty * 0.8)
+        phase = rng.uniform(0, 2 * np.pi)
+        ctrl_x += amp_x * np.sin(freq * t_ctrl + phase)
+        ctrl_y += amp_y * np.cos(freq * t_ctrl + phase)
+
+    # Clamp to tile interior so no control point sits outside the terrain.
+    ctrl_x = np.clip(ctrl_x, 1.5, 2 * cx - 1.5)
+    ctrl_y = np.clip(ctrl_y, 1.5, 2 * cy - 1.5)
+
+    # Heights: 3–5 stacked sinusoids; at difficulty=1 amplitude spans ~90% of range.
+    h_span = height_range[1] - height_range[0]
+    ctrl_z = rng.uniform(height_range[0], height_range[1], num_control)
+    for _ in range(int(rng.integers(3, 6))):
+        freq = rng.uniform(0.5, num_control / 2.5)
+        amp  = h_span * rng.uniform(0.1, 0.3) * (0.3 + difficulty * 0.7)
+        ctrl_z += amp * np.sin(freq * t_ctrl + rng.uniform(0, 2 * np.pi))
+    ctrl_z = np.clip(ctrl_z, height_range[0], height_range[1])
+
+    return _spline_track(t_ctrl, ctrl_x, ctrl_y, ctrl_z, n, height_range)
+
+
+def _generate_chicane_track(
+    cx: float, cy: float, rx: float, ry: float,
+    n: int, height_range: tuple[float, float], difficulty: float,
+    rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
+    """Closed-loop track built around alternating lateral offsets (chicane sections).
+
+    Control points sit on an oval, then are displaced alternately inward/outward
+    along the local normal.  This produces a track with many rapid direction
+    reversals — at high difficulty the offsets are large and sections are short,
+    creating extremely tight S-curves.
+    """
+    # More sections at higher difficulty → more frequent direction changes.
+    num_sections = max(6, int(8 + difficulty * 10))  # 8 easy → 18 hard
+    t_ctrl = np.linspace(0, 2 * np.pi, num_sections, endpoint=False)
+
+    # Base oval, slightly inside the available radius.
+    base_x = cx + rx * 0.70 * np.cos(t_ctrl)
+    base_y = cy + ry * 0.70 * np.sin(t_ctrl)
+
+    # Inward normal of the oval at each control point: (-cos, -sin).
+    normal_x = -np.cos(t_ctrl)
+    normal_y = -np.sin(t_ctrl)
+
+    # Alternating sign creates chicane effect; amplitude grows with difficulty.
+    chicane_amp = rx * (0.20 + difficulty * 0.45)
+    signs = np.where(np.arange(num_sections) % 2 == 0, 1.0, -1.0)
+    # Add per-section random variation so consecutive chicanes aren't identical.
+    signs *= rng.uniform(0.6, 1.0, num_sections)
+
+    ctrl_x = np.clip(base_x + normal_x * chicane_amp * signs, 1.5, 2 * cx - 1.5)
+    ctrl_y = np.clip(base_y + normal_y * chicane_amp * signs, 1.5, 2 * cy - 1.5)
+
+    # Heights alternate up/down with each chicane to add 3-D difficulty.
+    h_span  = height_range[1] - height_range[0]
+    h_mid   = (height_range[0] + height_range[1]) / 2.0
+    h_amp   = h_span * (0.35 + difficulty * 0.55)
+    ctrl_z  = np.clip(
+        h_mid + h_amp * signs * rng.uniform(0.7, 1.0, num_sections)
+        + rng.uniform(-0.2, 0.2, num_sections) * h_span * 0.15,
         height_range[0], height_range[1],
     )
 
-    # Append first point to close the loop; bc_type='periodic' enforces C2 continuity
-    # at the seam so the track is smooth where the start and end meet.
-    from scipy.interpolate import CubicSpline
-    t_ext   = np.append(t_ctrl, 2 * np.pi)
-    ctrl_x  = np.append(ctrl_x,  ctrl_x[0])
-    ctrl_y  = np.append(ctrl_y,  ctrl_y[0])
-    ctrl_z  = np.append(ctrl_z,  ctrl_z[0])
-
-    cs_x = CubicSpline(t_ext, ctrl_x, bc_type='periodic')
-    cs_y = CubicSpline(t_ext, ctrl_y, bc_type='periodic')
-    cs_z = CubicSpline(t_ext, ctrl_z, bc_type='periodic')
-
-    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    x = cs_x(t)
-    y = cs_y(t)
-    z = np.clip(cs_z(t), height_range[0], height_range[1])
-
-    waypoints = np.stack([x, y, z], axis=1)
-
-    # Analytical first derivative → exact tangent direction (no finite-difference error).
-    tangents = np.stack([cs_x(t, 1), cs_y(t, 1), cs_z(t, 1)], axis=1)
-    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-8
-
-    return waypoints, tangents
+    return _spline_track(t_ctrl, ctrl_x, ctrl_y, ctrl_z, n, height_range)
 
 
 # ---------------------------------------------------------------------------
@@ -468,58 +463,9 @@ def _place_gates_along_trajectory(
         gate_orientations.append(quat_wxyz)
         current_arc += spacings[i]
 
+    if not gate_positions:
+        return np.empty((0, 3), dtype=float), np.empty((0, 4), dtype=float)
     return np.array(gate_positions), np.array(gate_orientations)
-
-
-# ---------------------------------------------------------------------------
-# Gate mesh construction
-# ---------------------------------------------------------------------------
-
-def _create_gate_frame(
-    position: np.ndarray,
-    orientation: np.ndarray,
-    gate_size: float,
-    bar_thickness: float,
-    color: tuple[float, float, float] | None = None,
-) -> list[trimesh.Trimesh]:
-    """Build a square gate frame from 4 axis-aligned box bars.
-
-    The gate opening is ``gate_size × gate_size`` in the gate's XZ plane (right × up).
-    Bars are extended by bar_thickness at each end so adjacent bars overlap at corners,
-    avoiding visible gaps.
-
-    Color is set AFTER apply_transform.  Setting face_colors before transform can be
-    silently ignored if trimesh is still using TextureVisuals internally.
-    """
-    half = gate_size / 2.0
-
-    # Convert (w, x, y, z) → scipy's (x, y, z, w) for Rotation.
-    quat_scipy = [orientation[1], orientation[2], orientation[3], orientation[0]]
-    rot_mat = tf.Rotation.from_quat(quat_scipy).as_matrix()
-
-    # Each bar: (local_centre_offset_in_gate_frame, box_dimensions_in_gate_frame)
-    # Horizontal bars (top/bottom) are wider in X; vertical bars (left/right) are taller in Z.
-    bar_specs = [
-        ("top",    np.array([0,    0, +half]), np.array([gate_size + bar_thickness, bar_thickness, bar_thickness])),
-        ("bottom", np.array([0,    0, -half]), np.array([gate_size + bar_thickness, bar_thickness, bar_thickness])),
-        ("left",   np.array([-half, 0, 0]),   np.array([bar_thickness, bar_thickness, gate_size + bar_thickness])),
-        ("right",  np.array([+half, 0, 0]),   np.array([bar_thickness, bar_thickness, gate_size + bar_thickness])),
-    ]
-
-    meshes = []
-    for _name, local_offset, dims in bar_specs:
-        bar = trimesh.creation.box(dims)
-        world_pos = position + rot_mat @ local_offset
-        transform = np.eye(4)
-        transform[:3, :3] = rot_mat
-        transform[:3, 3] = world_pos
-        bar.apply_transform(transform)
-        if color is not None:
-            # Assign after transform so ColorVisuals is set on the final mesh state.
-            bar.visual.face_colors = [int(c * 255) for c in color] + [255]
-        meshes.append(bar)
-
-    return meshes
 
 
 

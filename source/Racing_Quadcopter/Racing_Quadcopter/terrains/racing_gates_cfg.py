@@ -5,12 +5,28 @@
 
 """Configuration for racing-gate mesh sub-terrains (extension-local; not in stock Isaac Lab)."""
 
-from dataclasses import MISSING
+from dataclasses import MISSING, dataclass
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.utils import configclass
 
-from . import racing_gates
+from . import fixed_gates, racing_gates
+
+
+@dataclass
+class GateSpec:
+    """Specification for a single gate on a fixed-layout track.
+
+    Coordinates are in the sub-terrain's **corner-origin local frame**: (0, 0) is
+    the bottom-left corner of the tile; a 15×15 m tile runs to (size_x, size_y).
+
+    ``yaw_deg`` follows a **clockwise-from-+Y** convention when viewed from above:
+      0°  → drone passes through in the +Y direction (tile's forward axis)
+      90° → drone passes through in the +X direction (tile's right axis)
+    """
+
+    position: tuple[float, float, float]
+    yaw_deg: float = 0.0
 
 
 @configclass
@@ -46,5 +62,32 @@ class MeshRacingGatesTerrainCfg(SubTerrainBaseCfg):
     gate_spacing_range: tuple[float, float] = (3.0, 5.0)
     gate_size_range: tuple[float, float] = (0.4, 0.8)
     gate_height_range: tuple[float, float] = (1.0, 2.5)
+    bar_thickness: float = 0.05
+    gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)
+
+
+@configclass
+class MeshFixedGatesTerrainCfg(SubTerrainBaseCfg):
+    """Flat ground with racing gates at fixed, user-specified positions.
+
+    Unlike ``MeshRacingGatesTerrainCfg`` no trajectory is generated and no
+    randomisation is applied — every cell in the grid receives exactly the same
+    circuit defined by ``gates``.
+
+    Field reference
+    ---------------
+    gates        : List of ``GateSpec``.  Each entry sets one gate's position
+                   (in the sub-terrain's corner-origin local frame) and heading
+                   (yaw_deg, CW from +Y viewed from above; 0° → +Y, 90° → +X).
+    gate_size    : Square aperture side length in metres.
+    bar_thickness: Gate bar diameter in metres (visual only).
+    gate_color   : RGB in 0–1 range.
+    """
+
+    function = fixed_gates.fixed_gates_terrain
+
+    gates: list = MISSING        # list[GateSpec], provided by the caller
+    seed: int | None = None
+    gate_size: float = 0.8
     bar_thickness: float = 0.05
     gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)

@@ -5,11 +5,13 @@
 
 """Terrain generator presets for racing gates."""
 
+from __future__ import annotations
+
 from isaaclab.terrains import TerrainGeneratorCfg
 
-from .racing_gates_cfg import MeshRacingGatesTerrainCfg
+from .racing_gates_cfg import GateSpec, MeshFixedGatesTerrainCfg, MeshRacingGatesTerrainCfg
 
-__all__ = ["create_racing_gates_terrain"]
+__all__ = ["create_fixed_track_terrain", "create_racing_gates_terrain"]
 
 
 def create_racing_gates_terrain(seed: int = 42) -> TerrainGeneratorCfg:
@@ -64,17 +66,86 @@ def create_racing_gates_terrain(seed: int = 42) -> TerrainGeneratorCfg:
             "racing_gates": MeshRacingGatesTerrainCfg(
                 proportion=1.0,         # 100 % of cells use this terrain type
                 seed=seed,              # Overwritten to seed=42 by TerrainGenerator anyway
-                trajectory_type="random",  # Cubic-spline randomised circuit
-                num_waypoints=150,      # Fine arc-length resolution for 15×15 m tiles
-                # Spacing 2.5–10 m → avg 6.25 m → ~8–12 gates per circuit on a
-                # typical 15×15 m tile arc (~60–80 m total arc length).
-                gate_spacing_range=(2.5, 10.0),
-                gate_size_range=(0.7, 0.7001),
-                # Gates can appear anywhere from 0.8 m (low slalom) to 3.5 m (high
-                # climb). Difficulty controls oscillation amplitude within this range.
-                gate_height_range=(0.8, 3.5),
+                trajectory_type="random",  # randomly picks spline or chicane per cell
+                num_waypoints=200,      # finer resolution for tighter curves
+                # Spacing 1.0–7 m → avg 4.0 m → ~10–16 gates per circuit.
+                gate_spacing_range=(1.0, 7.0),
+                # Size 0.45–0.8 m: difficulty=0.7 → ~0.69 m (large), 1.0 → 0.45 m (tight).
+                gate_size_range=(0.45, 0.8),
+                # 0.7–4.5 m: meaningful height variation with dramatic climbs at high difficulty.
+                gate_height_range=(0.7, 4.5),
                 bar_thickness=0.05,
                 gate_color=(1.0, 0.3, 0.0),  # Orange, high-contrast against sky/ground
+            ),
+        },
+    )
+
+
+def create_fixed_track_terrain(
+    gates: list[GateSpec],
+    gate_size: float = 0.8,
+    bar_thickness: float = 0.05,
+    gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0),
+    terrain_size: tuple[float, float] = (15.0, 15.0),
+    num_rows: int = 4,
+    num_cols: int = 4,
+    seed: int = 42,
+) -> TerrainGeneratorCfg:
+    """Return a TerrainGeneratorCfg that tiles the same fixed circuit in a grid.
+
+    All cells in the grid receive an identical copy of the circuit — no
+    randomisation is applied.  Gate positions are in the sub-terrain's
+    corner-origin local frame (see ``GateSpec`` for full conventions).
+
+    Example usage::
+
+        from Racing_Quadcopter.terrains import GateSpec, create_fixed_track_terrain
+
+        terrain = create_fixed_track_terrain(
+            gates=[
+                GateSpec(position=(7.5, 4.0, 1.5), yaw_deg=0),
+                GateSpec(position=(11.0, 7.5, 2.0), yaw_deg=90),
+                GateSpec(position=(7.5, 11.0, 1.5), yaw_deg=180),
+                GateSpec(position=(4.0, 7.5, 2.0), yaw_deg=270),
+            ],
+            gate_size=0.8,
+        )
+
+    Args:
+        gates:         Ordered list of ``GateSpec`` — one entry per gate on the
+                       circuit.  The drone must pass them in order; the last gate
+                       connects back to the first to close the loop.
+        gate_size:     Square aperture side length in metres.
+        bar_thickness: Gate bar diameter in metres (visual only).
+        gate_color:    RGB in 0–1 range.
+        terrain_size:  (width, height) of each terrain cell in metres.
+        num_rows:      Terrain grid rows (all rows share the same fixed circuit).
+        num_cols:      Terrain grid columns.
+        seed:          Base seed passed to TerrainGenerator.
+
+    Returns:
+        ``TerrainGeneratorCfg`` ready to pass to ``TerrainImporterCfg``.
+    """
+    return TerrainGeneratorCfg(
+        seed=seed,
+        size=terrain_size,
+        difficulty_range=(0.0, 0.0),  # ignored by fixed_gates_terrain
+        border_width=0.5,
+        num_rows=num_rows,
+        num_cols=num_cols,
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        use_cache=False,
+        curriculum=False,
+        sub_terrains={
+            "racing_gates": MeshFixedGatesTerrainCfg(
+                proportion=1.0,
+                seed=seed,
+                gates=gates,
+                gate_size=gate_size,
+                bar_thickness=bar_thickness,
+                gate_color=gate_color,
             ),
         },
     )
