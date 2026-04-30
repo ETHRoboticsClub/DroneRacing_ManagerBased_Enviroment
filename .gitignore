@@ -1,4 +1,8 @@
+# AWS Batch job artifacts
+.aero-last*
 
+# USD build
+.asset_hash
 
 # C++
 **/cmake-build*/

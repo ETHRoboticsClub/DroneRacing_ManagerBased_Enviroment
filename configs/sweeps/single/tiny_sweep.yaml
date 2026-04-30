@@ -1,0 +1,15 @@
+task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
+task_play:  Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
+
+extra_train_args: ["--headless"]
+extra_play_args:  ["--headless"]
+
+sweep_mode: sequential
+
+num_envs: 8192
+
+train_iterations: 417
+eval_steps: 3000
+
+param_grid:
+  recovery_spawn_prob: [0.2]
