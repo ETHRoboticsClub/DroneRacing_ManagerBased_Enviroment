@@ -30,11 +30,48 @@ from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain
 from isaaclab.utils import configclass
 
 from isaaclab_assets import CRAZYFLIE_CFG
+from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF
 
 from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
 from .mdp.actions import QuadcopterThrustActionCfg
 from .mdp.curriculums import apply_staged_curriculum
 from .mdp.noise import drone_noise_model_factory
+
+@dataclass
+class DroneProfile:
+    """Bundle a robot config with the physics parameters tuned for it."""
+
+    robot_cfg: ArticulationCfg
+    body_name: str
+    thrust_to_weight: float
+    moment_scale: float
+
+
+def _make_profile(
+    cfg: ArticulationCfg, body_name: str, thrust_to_weight: float, moment_scale: float
+) -> DroneProfile:
+    return DroneProfile(
+        robot_cfg=cfg.replace(prim_path="{ENV_REGEX_NS}/Robot").replace(
+            spawn=cfg.spawn.replace(activate_contact_sensors=True)
+        ),
+        body_name=body_name,
+        thrust_to_weight=thrust_to_weight,
+        moment_scale=moment_scale,
+    )
+
+
+# Anemos: ~0.85 kg total (base_link 0.835 + 4 props), inertia ixx≈2.16e-3, iyy≈2.92e-3.
+# T/W ~4 is conservative for a 5" racing quad; moment_scale=0.1 gives ~35-45 rad/s² peak.
+DRONE_PROFILES: dict[str, DroneProfile] = {
+    "crazyflie":   _make_profile(CRAZYFLIE_CFG,         body_name="body",      thrust_to_weight=1.9, moment_scale=0.01),
+    "anemos_usd":  _make_profile(ANEMOS_DRONE_CFG_USD,  body_name="base_link", thrust_to_weight=4.0, moment_scale=0.1),
+    "anemos_urdf": _make_profile(ANEMOS_DRONE_CFG_URDF, body_name="base_link", thrust_to_weight=4.0, moment_scale=0.1),
+}
+
+# anemos_usd has to be generated using scripts/tools/generate_anemos_usd.py
+DRONE_MODEL = "crazyflie"
+assert DRONE_MODEL in DRONE_PROFILES, f"Invalid DRONE_MODEL: {DRONE_MODEL}"
+PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
 
 # SKRL additionally applies rewards_shaper_scale=0.01 on top.
@@ -88,9 +125,7 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
 
     terrain: TerrainImporterCfg | None = None
 
-    robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot").replace(
-        spawn=CRAZYFLIE_CFG.spawn.replace(activate_contact_sensors=True)
-    )
+    robot: ArticulationCfg = PROFILE.robot_cfg
 
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*",
@@ -103,6 +138,8 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)),
     )
+    replicate_physics: bool = False
+    clone_in_fabric: bool = False
 
 
 @configclass
@@ -111,11 +148,12 @@ class ActionsCfg:
 
     thrust = QuadcopterThrustActionCfg(
         asset_name="robot",
-        thrust_to_weight=1.9,
-        moment_scale=0.01,
+        thrust_to_weight=PROFILE.thrust_to_weight,
+        moment_scale=PROFILE.moment_scale,
         action_dim=4,
         min_delay=0,
         max_delay=0,
+        body_name=PROFILE.body_name,
     )
 
 
@@ -224,7 +262,7 @@ class EventsCfg:
         func=events.randomize_rigid_body_com,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="body"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
             "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
         },
     )
@@ -244,7 +282,7 @@ class EventsCfg:
         mode="interval",
         interval_range_s=(3.0, 10.0),
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="body"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
             "force_range": (-0.02, 0.02),
             "torque_range": (-0.02, 0.02),
         },
@@ -414,7 +452,7 @@ FIXED_GATES: list[GateSpec] = [
     GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
 ]
 
-FIXED_GATES_: list[GateSpec] = [
+FIXED_GATES_old: list[GateSpec] = [
     # 0 — low start, heading north
     #GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
 

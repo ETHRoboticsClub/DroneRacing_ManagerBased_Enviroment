@@ -34,7 +34,7 @@ class QuadcopterThrustAction(ActionTerm):
         self._delayed_actions = torch.zeros_like(self._raw_actions)
         self._thrust = torch.zeros(env.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(env.num_envs, 1, 3, device=self.device)
-        self._body_id = self._asset.find_bodies("body")[0]
+        self._body_id = self._asset.find_bodies(self.cfg.body_name)[0]
         masses = self._asset.root_physx_view.get_masses()[0].sum()
         self._gravity_mag = torch.tensor(env.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (masses * self._gravity_mag).item()
@@ -129,3 +129,4 @@ class QuadcopterThrustActionCfg(ActionTermCfg):
     action_dim: int = 4
     min_delay: int = 0
     max_delay: int = 0
+    body_name: str = "body"  # base_link for anemos (gets overridden by env cfg)
