@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "track_name": "Vertical Stack Slalom",
+  "description": "3D S-slalom where consecutive gate pairs share exact XY but differ in Z (1.0m vs 3.0m), forcing pure vertical climbs/drops. Sharp 90-degree corners close the loop.",
+  "elements_tested": [
+    "3d_slalom",
+    "vertical_stacking_colocated",
+    "sharp_90_corners"
+  ],
+  "gate_size": 0.7,
+  "bar_thickness": 0.05,
+  "loop_closed": true,
+  "gates": [
+    {
+      "x": -15.0,
+      "y": -5.57,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G1: Start"
+    },
+    {
+      "x": -9.0,
+      "y": -5.57,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G2: Approach"
+    },
+    {
+      "x": -3.0,
+      "y": -5.57,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G3: Stack A - LOW (same XY as G4)"
+    },
+    {
+      "x": -3.0,
+      "y": -5.57,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G4: Stack A - HIGH (pure vertical climb)"
+    },
+    {
+      "x": 3.0,
+      "y": -5.57,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G5: Transition high"
+    },
+    {
+      "x": 9.0,
+      "y": -5.57,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G6: Stack B - HIGH (same XY as G7)"
+    },
+    {
+      "x": 9.0,
+      "y": -5.57,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G7: Stack B - LOW (pure vertical drop)"
+    },
+    {
+      "x": 9.0,
+      "y": 0.43,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G8: Sharp 90 corner right\u2192up"
+    },
+    {
+      "x": 9.0,
+      "y": 6.43,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G9: Stack C - LOW (same XY as G10)"
+    },
+    {
+      "x": 9.0,
+      "y": 6.43,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G10: Stack C - HIGH (pure vertical climb)"
+    },
+    {
+      "x": 3.0,
+      "y": 6.43,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G11: Transition high"
+    },
+    {
+      "x": -3.0,
+      "y": 6.43,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G12: Stack D - HIGH (same XY as G13)"
+    },
+    {
+      "x": -3.0,
+      "y": 6.43,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G13: Stack D - LOW (pure vertical drop)"
+    },
+    {
+      "x": -15.0,
+      "y": 6.43,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G14: Sharp 90 corner left\u2192down back to start"
+    }
+  ]
+}

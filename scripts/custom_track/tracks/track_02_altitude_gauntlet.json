@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "track_name": "Altitude Gauntlet",
+  "description": "Tests Split-S (over top then drop through bottom), Reverse Split-S (bottom up), and Ladder (double-stack top/bottom gates with circle-around). Heavy altitude variation.",
+  "elements_tested": [
+    "split_s",
+    "reverse_split_s",
+    "ladder",
+    "simple_gate"
+  ],
+  "gate_size": 0.7,
+  "bar_thickness": 0.05,
+  "loop_closed": true,
+  "gates": [
+    {
+      "x": -9.0,
+      "y": -9.85,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G1: Start - straight"
+    },
+    {
+      "x": -2.0,
+      "y": -9.85,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G2: Approach straight"
+    },
+    {
+      "x": 5.0,
+      "y": -9.85,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G3: Split-S top gate (fly over/through high)"
+    },
+    {
+      "x": 9.0,
+      "y": -5.85,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G4: Split-S bottom gate (drop down, exit low)"
+    },
+    {
+      "x": 13.0,
+      "y": -1.85,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G5: Low recovery straight"
+    },
+    {
+      "x": 13.0,
+      "y": 4.15,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G6: Reverse Split-S bottom gate (enter low, throttle up)"
+    },
+    {
+      "x": 9.0,
+      "y": 8.15,
+      "z": 3.2,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G7: Reverse Split-S top gate (exit high)"
+    },
+    {
+      "x": 3.0,
+      "y": 10.15,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G8: Ladder top gate (double-stack top)"
+    },
+    {
+      "x": -1.0,
+      "y": 8.15,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G9: Ladder bottom gate (circle down and through)"
+    },
+    {
+      "x": -5.0,
+      "y": 4.15,
+      "z": 2.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G10: Transition at mid-height"
+    },
+    {
+      "x": -9.0,
+      "y": 4.15,
+      "z": 3.2,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G11: 2nd Ladder top gate"
+    },
+    {
+      "x": -13.0,
+      "y": 2.15,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G12: 2nd Ladder bottom gate"
+    },
+    {
+      "x": -13.0,
+      "y": -3.85,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G13: Return to start altitude"
+    }
+  ]
+}
