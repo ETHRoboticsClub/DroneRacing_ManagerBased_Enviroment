@@ -62,9 +62,13 @@ def fixed_gates_terrain(
     for spec in cfg.gates:
         pos = np.array(spec.position, dtype=float)
 
-        # CW-from-+Y convention: positive yaw rotates the gate CW viewed from above
-        # (0° faces +Y, 90° faces +X).  scipy uses CCW around Z, so negate.
-        rot = tf.Rotation.from_euler("z", -np.deg2rad(spec.yaw_deg))
+        # Extrinsic XYZ (= RPY) Euler. Yaw is CW-from-+Y by convention (0°→+Y,
+        # 90°→+X), while scipy uses CCW around Z — negate yaw to match.
+        rot = tf.Rotation.from_euler(
+            "xyz",
+            [spec.roll_deg, spec.pitch_deg, -spec.yaw_deg],
+            degrees=True,
+        )
         quat_xyzw = rot.as_quat()
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 

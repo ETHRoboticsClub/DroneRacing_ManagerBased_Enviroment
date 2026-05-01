@@ -256,6 +256,33 @@ def _normalize_param_grid(raw_param_grid: object) -> dict[str, list]:
     return normalized
 
 
+def _apply_gate_track(gate_track: object) -> None:
+    """Dump an inline ``gate_track`` list to a temp YAML and expose it via env var.
+
+    The env_cfg reads ``RACING_GATE_TRACK_YAML`` in __post_init__ before terrain
+    generation, which runs *before* ``--override`` is applied — so passing the
+    track via env var (inherited by subprocesses) is the only way to inject it.
+    """
+    import tempfile
+
+    if not isinstance(gate_track, list) or not gate_track:
+        raise ValueError("'gate_track' must be a non-empty list of gate entries.")
+
+    try:
+        import yaml
+    except ModuleNotFoundError as e:
+        raise RuntimeError("PyYAML is required to dump gate_track (pip install pyyaml).") from e
+
+    track_dir = RESULTS_DIR / "tracks"
+    track_dir.mkdir(parents=True, exist_ok=True)
+    fd, track_path = tempfile.mkstemp(prefix=f"track_{SWEEP_ID}_", suffix=".yaml", dir=str(track_dir))
+    with os.fdopen(fd, "w") as f:
+        yaml.safe_dump({"gate_track": gate_track}, f, sort_keys=False)
+
+    os.environ["RACING_GATE_TRACK_YAML"] = track_path
+    print(f"[Sweep] Inline gate_track dumped to {track_path} (RACING_GATE_TRACK_YAML set).")
+
+
 def _ensure_list(name: str, value: object) -> list:
     """Validate list-typed config fields."""
     if not isinstance(value, list):
@@ -296,6 +323,8 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
             PARAM_GRID = _normalize_param_grid(cfg["param_grid"])
         if "sweep_mode" in cfg:
             SWEEP_MODE = str(cfg["sweep_mode"])
+        if "gate_track" in cfg:
+            _apply_gate_track(cfg["gate_track"])
 
     SWEEP_MODE = SWEEP_MODE.strip().lower()
     if SWEEP_MODE not in {"grid", "sequential"}:

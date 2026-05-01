@@ -1,0 +1,12 @@
+# Simple 4-gate diamond loop for debugging.
+# rotation: [roll, pitch, yaw] in degrees.
+
+gate_track:
+  - position: [7.5, 5.0, 4.5]
+    rotation: [0, 0, 45]
+  - position: [7.5, 7.5, 4.5]
+    rotation: [0, 0, 315]
+  - position: [5.0, 7.5, 4.5]
+    rotation: [0, 0, 225]
+  - position: [5.0, 5.0, 4.5]
+    rotation: [0, 0, 135]

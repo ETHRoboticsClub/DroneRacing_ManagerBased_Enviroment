@@ -20,12 +20,17 @@ class GateSpec:
     Coordinates are in the sub-terrain's **corner-origin local frame**: (0, 0) is
     the bottom-left corner of the tile; a 15×15 m tile runs to (size_x, size_y).
 
-    ``yaw_deg`` follows a **clockwise-from-+Y** convention when viewed from above:
+    Orientation uses extrinsic ``[roll, pitch, yaw]`` Euler angles (RPY, degrees) —
+    the conventional ROS/URDF order. ``yaw_deg`` follows a **clockwise-from-+Y**
+    convention when viewed from above:
       0°  → drone passes through in the +Y direction (tile's forward axis)
       90° → drone passes through in the +X direction (tile's right axis)
+    Roll is rotation about the passage axis; pitch tilts the gate up/down.
     """
 
     position: tuple[float, float, float]
+    roll_deg: float = 0.0
+    pitch_deg: float = 0.0
     yaw_deg: float = 0.0
 
 

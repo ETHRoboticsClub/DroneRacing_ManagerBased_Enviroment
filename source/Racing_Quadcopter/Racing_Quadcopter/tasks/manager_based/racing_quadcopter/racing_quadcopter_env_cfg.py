@@ -25,7 +25,6 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils.noise import GaussianNoiseCfg
-from Racing_Quadcopter.terrains import GateSpec
 from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain, create_racing_gates_terrain
 from isaaclab.utils import configclass
 
@@ -68,9 +67,36 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
     "anemos_urdf": _make_profile(ANEMOS_DRONE_CFG_URDF, body_name="base_link", thrust_to_weight=4.0, moment_scale=0.1),
 }
 
-# anemos_usd has to be generated using scripts/tools/generate_anemos_usd.py
-DRONE_MODEL = "crazyflie"
-assert DRONE_MODEL in DRONE_PROFILES, f"Invalid DRONE_MODEL: {DRONE_MODEL}"
+# ---------------------------------------------------------------------------
+# Top-of-file experiment knobs — defaults below; each can be overridden by an
+# environment variable so you can switch without editing the file:
+#
+#   DRONE_MODEL=anemos_urdf TRACK_YAML=configs/tracks/simple.yaml \
+#       python scripts/skrl/train.py --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 ...
+#
+# DRONE_MODEL: one of the keys in DRONE_PROFILES.
+#              "anemos_usd" requires a pre-converted USD; generate it via
+#              scripts/tools/generate_anemos_usd.py.
+# DEFAULT_TRACK_YAML: path to the gate track YAML (RPY in degrees, see
+#              configs/tracks/default.yaml for the format). Read in
+#              RacingQuadcopterEnvCfg_FIXED.__post_init__.
+# ---------------------------------------------------------------------------
+import os as _os
+from Racing_Quadcopter.terrains import load_gates_from_yaml as _load_gates_from_yaml
+
+DRONE_MODEL_ENV_VAR = "DRONE_MODEL"
+TRACK_YAML_ENV_VAR = "TRACK_YAML"
+
+DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
+
+_REPO_ROOT = _os.path.normpath(
+    _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
+)
+DEFAULT_TRACK_YAML = _os.path.join(_REPO_ROOT, "configs", "tracks", "default.yaml")
+
+assert DRONE_MODEL in DRONE_PROFILES, (
+    f"Invalid DRONE_MODEL={DRONE_MODEL!r}. Set ${DRONE_MODEL_ENV_VAR} to one of: {list(DRONE_PROFILES)}"
+)
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
 
@@ -423,57 +449,50 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
 # ---------------------------------------------------------------------------
 # Fixed-track variants
 # ---------------------------------------------------------------------------
-# Replace FIXED_GATES with your own circuit.  Positions are in the sub-terrain's
-# corner-origin local frame (a 15×15 m tile runs from (0,0) to (15,15) in XY).
-# yaw_deg is clockwise from +Y: 0° → drone passes in +Y, 90° → in +X.
-
-FIXED_GATES: list[GateSpec] = [
-    # 0 — low start, heading north
-    GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
-
-    # 1-3 — climbing right sweep toward the top of the tile
-    GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
-    GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
-    GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
-
-    # 4-5 — SPLIT-S
-    # Gate 4: enter heading south at 4.2 m altitude.
-    # Drone rolls inverted, dives, and exits gate 5 heading north at 1.5 m
-    # (2.7 m altitude drop, ~1.5 m forward — extremely tight).
-    GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # entry
-    GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # exit
-
-    # 6-7 — left-side swoop
-    GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
-    GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
-
-    # 8-9 — CHICANE (offset gates, tight lateral snap)
-    GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
-    GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
-]
-
-FIXED_GATES_old: list[GateSpec] = [
-    # 0 — low start, heading north
-    #GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
-
-    # 1-3 — climbing right sweep toward the top of the tile
-    GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
-    GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
-    GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
-    GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
-]
+# Tracks are defined in YAML under ``configs/tracks/``. The path is set on
+# ``RacingQuadcopterEnvCfg_FIXED.gate_track_yaml`` and can be overridden via the
+# ``RACING_GATE_TRACK_YAML`` env variable (read in __post_init__ before terrain
+# generation, so it works through subprocess launches like the sweep runner).
+#
+# Legacy hard-coded layouts kept for reference — see configs/tracks/default.yaml
+# and configs/tracks/simple.yaml for the YAML equivalents.
+# ---------------------------------------------------------------------------
+# FIXED_GATES (full circuit, see configs/tracks/default.yaml):
+#   GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
+#   GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
+#   GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
+#   GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
+#   GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # SPLIT-S entry
+#   GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # SPLIT-S exit
+#   GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
+#   GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
+#   GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
+#   GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
+#
+# FIXED_GATES_simple (4-gate diamond, see configs/tracks/simple.yaml):
+#   GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
+#   GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
+#   GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
+#   GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
 
 
 @configclass
 class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
     """Training config with a fixed, deterministic racing circuit.
 
-    Override ``FIXED_GATES`` at the top of this file (or subclass and replace
-    ``__post_init__``) to define your own track layout.
+    The track is loaded from ``gate_track_yaml`` (a path to a track YAML, see
+    ``configs/tracks/default.yaml`` for the format). The ``RACING_GATE_TRACK_YAML``
+    environment variable takes precedence — useful for subprocess overrides
+    (sweep runner) since cfg-attribute overrides via ``--override`` are applied
+    *after* ``__post_init__`` and therefore too late to influence track generation.
     """
 
+    gate_track_yaml: str = DEFAULT_TRACK_YAML
+
     def __post_init__(self) -> None:
-        terrain_generator = create_fixed_track_terrain(FIXED_GATES, seed=self.seed)
+        track_path = _os.environ.get(TRACK_YAML_ENV_VAR, self.gate_track_yaml)
+        gates = _load_gates_from_yaml(track_path)
+        terrain_generator = create_fixed_track_terrain(gates, seed=self.seed)
         self.scene.terrain = TerrainImporterCfg(
             prim_path="/World/ground",
             terrain_type="generator",
