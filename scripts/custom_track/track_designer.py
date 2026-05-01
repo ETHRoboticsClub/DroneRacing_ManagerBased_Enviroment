@@ -75,7 +75,7 @@ class TopDownCanvas(FigureCanvas):
         self._dragging: bool = False
         self._snap: float = 0.0
         self._default_z: float = 1.5
-        self._bounds = (-15.0, 15.0, -15.0, 15.0)
+        self._bounds = (-20.0, 20.0, -20.0, 20.0)
 
         self.mpl_connect("button_press_event", self._on_press)
         self.mpl_connect("motion_notify_event", self._on_motion)
