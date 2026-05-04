@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "track_name": "3D S-Slalom",
+  "description": "3D S-shaped slalom where gates alternate left/right AND high/low. Consecutive gates are stacked vertically at similar XY but different Z, forcing the drone to weave laterally while climbing and descending. Includes approach, the 3D slalom section, and a return loop.",
+  "elements_tested": [
+    "3d_slalom",
+    "vertical_stacking",
+    "simple_gate",
+    "180_turn"
+  ],
+  "gate_size": 0.7,
+  "bar_thickness": 0.05,
+  "loop_closed": true,
+  "gates": [
+    {
+      "x": -20.93,
+      "y": -1.73,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G1: Start gate"
+    },
+    {
+      "x": -14.93,
+      "y": -1.73,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G2: Approach straight"
+    },
+    {
+      "x": -8.93,
+      "y": 0.77,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G3: S-slalom - right, LOW"
+    },
+    {
+      "x": -5.93,
+      "y": 0.77,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G4: S-slalom - right, HIGH (climb up, same lateral side)"
+    },
+    {
+      "x": -2.93,
+      "y": -4.23,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G5: S-slalom - left, HIGH (weave left while staying high)"
+    },
+    {
+      "x": 0.07,
+      "y": -4.23,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G6: S-slalom - left, LOW (drop down, same lateral side)"
+    },
+    {
+      "x": 3.07,
+      "y": 0.77,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G7: S-slalom - right, LOW (weave right while staying low)"
+    },
+    {
+      "x": 6.07,
+      "y": 0.77,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G8: S-slalom - right, HIGH (climb up again)"
+    },
+    {
+      "x": 9.07,
+      "y": -4.23,
+      "z": 3.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G9: S-slalom - left, HIGH (weave left while high)"
+    },
+    {
+      "x": 12.07,
+      "y": -4.23,
+      "z": 1.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G10: S-slalom - left, LOW (drop down)"
+    },
+    {
+      "x": 15.07,
+      "y": -1.73,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G11: Slalom exit - center"
+    },
+    {
+      "x": 17.07,
+      "y": 3.27,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G12: 180-turn entry"
+    },
+    {
+      "x": 13.07,
+      "y": 6.27,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G13: 180-turn apex"
+    },
+    {
+      "x": -2.93,
+      "y": 6.27,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G14: Return straight"
+    },
+    {
+      "x": -18.93,
+      "y": 3.27,
+      "z": 1.5,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "auto_yaw": true,
+      "comment": "G15: Final turn back to start"
+    }
+  ]
+}
