@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -19,6 +20,24 @@ from isaaclab.utils.buffers.delay_buffer import DelayBuffer
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.ndarray:
+    """Invertible X-frame mixer :math:`[T,\\tau]^\\top = B\\mathbf u^{\\circ 2}`; returns ``B^{-1}`` ``(4,4)`` float64.
+
+    Parameters ``k_t``, ``k_d``, ``arm_length_m`` match ``DroneProfile`` / env cfg.
+    """
+    ktl = k_t * arm_length_m / np.sqrt(2.0)
+    b = np.array(
+        [
+            [k_t, k_t, k_t, k_t],
+            [ktl, -ktl, -ktl, ktl],
+            [-ktl, -ktl, ktl, ktl],
+            [k_d, -k_d, k_d, -k_d],
+        ],
+        dtype=np.float64,
+    )
+    return np.linalg.inv(b)
 
 
 class QuadcopterThrustAction(ActionTerm):
@@ -110,6 +129,16 @@ class QuadcopterThrustAction(ActionTerm):
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
         self._moment[:, 0, :] = self.cfg.moment_scale * self._delayed_actions[:, 1:]
         self._processed_actions[:] = self._delayed_actions
+
+        # [T, τ]^T = B u^{∘2}  →  u^{∘2} = B^{-1} [T, τ]^T,  u = sqrt( clamp(u^{∘2}, 0) )
+        if hasattr(self._env, "_mixer_b_inv") and hasattr(self._env, "_motor_speeds"):
+            T_col = self._thrust[:, 0, 2]
+            tau_b = self._moment[:, 0, :]
+            wrench = torch.cat([T_col.unsqueeze(-1), tau_b], dim=-1).to(
+                dtype=self._env._mixer_b_inv.dtype
+            )
+            omega_sq = wrench @ self._env._mixer_b_inv.T
+            self._env._motor_speeds[:] = torch.sqrt(torch.clamp(omega_sq, min=0.0))
 
     def apply_actions(self):
         self._asset.permanent_wrench_composer.set_forces_and_torques(

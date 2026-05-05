@@ -143,6 +143,11 @@ def _write_spawn_state(
         env._actions_buf[env_ids] = init_actions
         env._prev_actions[env_ids] = init_actions
 
+    if hasattr(env, "_motor_speeds"):
+        env._motor_speeds[env_ids] = 0.0
+    if hasattr(env, "_prev_motor_speeds"):
+        env._prev_motor_speeds[env_ids] = 0.0
+
 
 def _sample_spawn_gate(
     env: ManagerBasedRLEnv, env_ids: torch.Tensor

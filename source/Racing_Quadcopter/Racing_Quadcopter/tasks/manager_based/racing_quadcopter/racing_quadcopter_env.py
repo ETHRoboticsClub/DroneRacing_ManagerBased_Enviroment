@@ -22,6 +22,7 @@ from Racing_Quadcopter.terrains import get_gate_registry
 from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.gate_utils import update_racing_state
+from .mdp.actions import build_quad_mixer_b_inv
 from .mdp.stats import init_stats, step_stats
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, RewardWeights
 from .vis.trajectory_vis import (
@@ -44,6 +45,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Type-hint only; both are populated during load_managers → _prepare_racing_task.
         self._robot: Articulation
         self._contact_sensor: ContactSensor
+        self._mixer_b_inv: torch.Tensor
         super().__init__(cfg, render_mode, **kwargs)
 
     def load_managers(self):
@@ -73,6 +75,18 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._prev_actions = torch.zeros_like(self._actions_buf)
         # Action-noise per-env bias (sampled at reset if enabled)
         self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # Per-drone motor speeds [N, 4] (one element per impeller); updated elsewhere as needed.
+        self._motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+        self._prev_motor_speeds = torch.zeros_like(self._motor_speeds)
+
+        # X-frame mixer B^{-1} [4, 4] from cfg motor params (computed once per env instance).
+        mixer_b_inv_np = build_quad_mixer_b_inv(
+            self.cfg.motor_k_t,
+            self.cfg.motor_k_d,
+            self.cfg.motor_arm_length_m,
+        )
+        self._mixer_b_inv = torch.as_tensor(mixer_b_inv_np, device=self.device, dtype=torch.float32)
 
         # Float 0/1 per env: set by check_gate_passages each step.
         self._gate_passed_buf = torch.zeros(self.num_envs, device=self.device)
@@ -405,6 +419,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Second obs pass: the "real" obs returned to the policy, with history update.
         # Runs after resets so freshly-spawned envs contribute correct observations.
         self.obs_buf = self.observation_manager.compute(update_history=True)
+
+        self._prev_motor_speeds[:] = self._motor_speeds
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 

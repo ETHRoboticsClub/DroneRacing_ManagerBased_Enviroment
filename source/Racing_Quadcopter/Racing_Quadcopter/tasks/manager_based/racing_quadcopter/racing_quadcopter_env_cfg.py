@@ -44,10 +44,23 @@ class DroneProfile:
     body_name: str
     thrust_to_weight: float
     moment_scale: float
+    motor_k_t: float #: Thrust coefficient :math:`k_T` [N/(rad/s)²] for :math:`T_i = k_T \Omega_i^2`.
+    motor_k_d: float #: Drag torque coefficient :math:`k_D` [N·m/(rad/s)²] for yaw mixing row in :math:`B`.
+    motor_arm_length_m: float #: Diagonal arm length :math:`l` [m] in the X-frame mixer :math:`B` (center to rotor).
+    #: Nominal max rotor speed [rad/s] for scaling motor-speed observations (see ``motor_speeds_obs``).
+    motor_omega_max_rad_s: float
 
 
 def _make_profile(
-    cfg: ArticulationCfg, body_name: str, thrust_to_weight: float, moment_scale: float
+    cfg: ArticulationCfg,
+    body_name: str,
+    thrust_to_weight: float,
+    moment_scale: float,
+    *,
+    motor_k_t: float,
+    motor_k_d: float,
+    motor_arm_length_m: float,
+    motor_omega_max_rad_s: float,
 ) -> DroneProfile:
     return DroneProfile(
         robot_cfg=cfg.replace(prim_path="{ENV_REGEX_NS}/Robot").replace(
@@ -56,15 +69,50 @@ def _make_profile(
         body_name=body_name,
         thrust_to_weight=thrust_to_weight,
         moment_scale=moment_scale,
+        motor_k_t=motor_k_t,
+        motor_k_d=motor_k_d,
+        motor_arm_length_m=motor_arm_length_m,
+        motor_omega_max_rad_s=motor_omega_max_rad_s,
     )
 
 
 # Anemos: ~0.85 kg total (base_link 0.835 + 4 props), inertia ixx≈2.16e-3, iyy≈2.92e-3.
 # T/W ~4 is conservative for a 5" racing quad; moment_scale=0.1 gives ~35-45 rad/s² peak.
 DRONE_PROFILES: dict[str, DroneProfile] = {
-    "crazyflie":   _make_profile(CRAZYFLIE_CFG,         body_name="body",      thrust_to_weight=1.9, moment_scale=0.01),
-    "anemos_usd":  _make_profile(ANEMOS_DRONE_CFG_USD,  body_name="base_link", thrust_to_weight=4.0, moment_scale=0.1),
-    "anemos_urdf": _make_profile(ANEMOS_DRONE_CFG_URDF, body_name="base_link", thrust_to_weight=4.0, moment_scale=0.1),
+    # motor_* placeholders until identified from bench/model; safe defaults for invertible B.
+    #Motor values taken from Crazyflie 2.0 https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    "crazyflie": _make_profile(
+        CRAZYFLIE_CFG,
+        body_name="body",
+        thrust_to_weight=1.9,
+        moment_scale=0.01,
+        motor_k_t=2.9e-8,
+        motor_k_d=7.3e-10,
+        motor_arm_length_m=0.0397,
+        # Observation scaling nominal peak ω (~25 krpm class); tune from datasheet.
+        motor_omega_max_rad_s=2600.0,
+    ),
+    # Table values you provided (replace if USD differs).
+    "anemos_usd": _make_profile(
+        ANEMOS_DRONE_CFG_USD,
+        body_name="base_link",
+        thrust_to_weight=4.0,
+        moment_scale=0.1,
+        motor_k_t=8.54858e-6,
+        motor_k_d=1e-8,
+        motor_arm_length_m=0.17,
+        motor_omega_max_rad_s=1000.0,
+    ),
+    "anemos_urdf": _make_profile(
+        ANEMOS_DRONE_CFG_URDF,
+        body_name="base_link",
+        thrust_to_weight=4.0,
+        moment_scale=0.1,
+        motor_k_t=8.54858e-6,
+        motor_k_d=1e-8,
+        motor_arm_length_m=0.17,
+        motor_omega_max_rad_s=1000.0,
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -77,6 +125,8 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
 # DRONE_MODEL: one of the keys in DRONE_PROFILES.
 #              "anemos_usd" requires a pre-converted USD; generate it via
 #              scripts/tools/generate_anemos_usd.py.
+#              Motor mixer k_T, k_D, l and obs scale Ω_max live on DroneProfile;
+#              env builds B^{-1} once from RacingQuadcopterEnvCfg.
 # DEFAULT_TRACK_YAML: path to the gate track YAML (RPY in degrees, see
 #              configs/tracks/default.yaml for the format). Read in
 #              RacingQuadcopterEnvCfg_FIXED.__post_init__.
@@ -215,8 +265,12 @@ class ObservationsCfg:
             history_length=history_length,
         )
 
-        #ROBOT
-        #TODO: Add motors speeds
+        #Having actions as observations is good enough (Linear transformation)
+        # motor_speeds = ObsTerm(
+        #     func=observations.motor_speeds_obs,
+        #     noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
+        #     history_length=history_length,
+        # )
 
         #ACTION
         last_action = ObsTerm(
@@ -262,6 +316,7 @@ class RewardsCfg:
     action_smoothness = RewTerm(
         func=rewards.penalty_action_smoothness, weight=RewardWeights.ACTION_SMOOTHNESS
     )
+
     action_magnitude = RewTerm(
         func=rewards.penalty_action_magnitude, weight=RewardWeights.ACTION_MAGNITUDE
     )
@@ -395,6 +450,15 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     curriculum_min_gates_passed: int = 10
     curriculum_min_mean_velocity: float = 2.5
     curriculum_max_center_offset: float = 0.25
+
+    # Motor mixing (:math:`B`, :math:`B^{-1}` built once in env from ``DRONE_PROFILE``).
+    motor_k_t: float = PROFILE.motor_k_t
+    motor_k_d: float = PROFILE.motor_k_d
+    motor_arm_length_m: float = PROFILE.motor_arm_length_m
+    motor_omega_max_rad_s: float = PROFILE.motor_omega_max_rad_s
+
+    #: Threshold Δu_thresh (rad/s): motor-speed penalty counts excess only above this per rotor per step.
+    motor_speed_delta_thresh_rad_s: float = 0.1
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 50,

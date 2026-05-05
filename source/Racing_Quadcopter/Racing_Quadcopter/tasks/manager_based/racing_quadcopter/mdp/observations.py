@@ -74,3 +74,12 @@ def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     when the cap is randomised across episodes (curriculum).
     """
     return env._velocity_limit.unsqueeze(-1)
+
+
+def motor_speeds_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Commanded rotor speeds ``[N, 4]`` (rad/s), scaled by ``cfg.motor_omega_max_rad_s``.
+
+    """
+    omega_max = float(getattr(env.cfg, "motor_omega_max_rad_s", 1000.0))
+    scale = max(omega_max, 1e-6)
+    return env._motor_speeds / scale
