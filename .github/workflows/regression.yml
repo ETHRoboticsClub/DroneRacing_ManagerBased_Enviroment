@@ -1,0 +1,218 @@
+###############################################################################
+# Submits a regression sweep to AWS Batch on every push to main, waits for it
+# to finish, downloads the results CSV, and fails the workflow if a chosen
+# metric falls below (or above) a baseline.
+#
+# Prerequisites (one-time):
+#   1. terraform apply (creates the OIDC provider + role)
+#   2. Set repo variable AERO_AWS_ROLE_ARN to terraform output github_actions_role_arn
+#         Settings -> Secrets and variables -> Actions -> Variables -> New
+#   3. Add a sweep config at REGRESSION_SWEEP_PATH below (kept in git, so it
+#      versions with the rest of the codebase)
+#
+# What it does:
+#   - Uploads the regression sweep yaml to a per-commit S3 key
+#   - Invokes the dispatcher Lambda with training_ref = the commit SHA
+#   - Polls Batch until the job finishes (or times out)
+#   - Downloads the sweep results CSV from S3
+#   - Reads BASELINE_METRIC from the CSV and compares against BASELINE_VALUE,
+#     using BASELINE_DIRECTION (`higher` = pass when measured >= baseline,
+#     `lower` = pass when measured <= baseline)
+#   - Fails the workflow if the check doesn't pass
+#
+# To run a one-off (different ref, same workflow): use the "Run workflow"
+# button in the Actions tab to trigger workflow_dispatch with overrides.
+###############################################################################
+name: Regression sweep on commit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      training_ref:
+        description: "Branch/SHA of training repo to clone (default: this commit's SHA)"
+        required: false
+        default: ""
+      sweep_path:
+        description: "Path to sweep yaml in this repo"
+        required: false
+        default: "configs/sweeps/single/regression_test.yaml"
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  S3_BUCKET: ethrc-aeronautics
+  S3_PREFIX: droneracing/isaac-rl-runs/sweeps
+  LAMBDA_NAME: aero-batch-dispatcher
+  JOB_DEFINITION: aero-batch-isaaclab
+  REGRESSION_SWEEP_PATH: configs/sweeps/single/regression_test.yaml
+
+  # Regression check parameters
+  BASELINE_METRIC: lap_pct           # column name in results CSV
+  BASELINE_VALUE: "98.0"             # threshold (string; parsed as float)
+  BASELINE_DIRECTION: higher         # "higher" => pass when value >= threshold
+                                     # "lower"  => pass when value <= threshold
+  BASELINE_AGGREGATION: max          # mean | min | max
+                                     # how to reduce multi-row sweeps to one number
+
+jobs:
+  regression-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AERO_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build run id, upload sweep config, resolve training ref
+        id: meta
+        run: |
+          set -eu
+
+          SWEEP_PATH="${{ github.event.inputs.sweep_path || env.REGRESSION_SWEEP_PATH }}"
+          [ -f "$SWEEP_PATH" ] || { echo "ERR: $SWEEP_PATH does not exist"; exit 1; }
+
+          REF="${{ github.event.inputs.training_ref }}"
+          [ -n "$REF" ] || REF="$GITHUB_SHA"
+
+          RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::6}"
+          S3_URI="s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/inputs/github-actions/$RUN_ID/sweep.yaml"
+
+          aws s3 cp "$SWEEP_PATH" "$S3_URI"
+
+          {
+            echo "run_id=$RUN_ID"
+            echo "s3_uri=$S3_URI"
+            echo "ref=$REF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Submit Batch job via Lambda
+        id: submit
+        run: |
+          set -eu
+          PAYLOAD=$(jq -nc \
+            --arg jobdef "${{ env.JOB_DEFINITION }}" \
+            --arg ref    "${{ steps.meta.outputs.ref }}" \
+            --arg s3uri  "${{ steps.meta.outputs.s3_uri }}" \
+            --arg rid    "${{ steps.meta.outputs.run_id }}" \
+            '{job_definition:$jobdef, training_ref:$ref, sweep_config_s3_uri:$s3uri, run_id:$rid}')
+
+          aws lambda invoke \
+            --function-name "${{ env.LAMBDA_NAME }}" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$PAYLOAD" \
+            response.json
+
+          echo "Lambda response:"
+          cat response.json
+          echo
+
+          JOB_ID=$(jq -r '.jobId' response.json)
+          RUN_ID=$(jq -r '.runId' response.json)
+          echo "::notice title=Batch job submitted::run_id=$RUN_ID job_id=$JOB_ID"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Batch job to finish
+        run: |
+          set -eu
+          JOB_ID="${{ steps.submit.outputs.job_id }}"
+          while :; do
+            STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" \
+              --query 'jobs[0].status' --output text)
+            echo "[$(date -u +%T)] status=$STATUS"
+            case "$STATUS" in
+              SUCCEEDED) echo "::notice title=Batch job succeeded::$JOB_ID"; break ;;
+              FAILED)
+                REASON=$(aws batch describe-jobs --jobs "$JOB_ID" \
+                  --query 'jobs[0].statusReason' --output text)
+                echo "::error title=Batch job failed::$JOB_ID: $REASON"
+                exit 1 ;;
+            esac
+            sleep 30
+          done
+
+      - name: Download sweep results CSV
+        run: |
+          set -eu
+          RUN_ID="${{ steps.submit.outputs.run_id }}"
+          mkdir -p ./results
+          aws s3 cp --recursive \
+            "s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/outputs/runs/$RUN_ID/logs/sweep/" \
+            ./results/ \
+            --exclude '*' --include 'results_*.csv'
+          echo "Downloaded:"
+          ls -la ./results/
+
+      - name: Compare metric to baseline
+        run: |
+          set -eu
+          python3 <<'PY'
+          import csv, glob, os, statistics, sys
+
+          metric    = os.environ["BASELINE_METRIC"]
+          baseline  = float(os.environ["BASELINE_VALUE"])
+          direction = os.environ["BASELINE_DIRECTION"]
+          aggregate = os.environ["BASELINE_AGGREGATION"]
+
+          csvs = sorted(glob.glob("./results/results_*.csv"))
+          if not csvs:
+              print("::error title=Regression check::no results_*.csv found in ./results/")
+              sys.exit(1)
+          # If multiple sweep CSVs ended up here (rare), use the most recent one.
+          csv_path = csvs[-1]
+          print(f"reading {csv_path}")
+
+          with open(csv_path, newline="") as f:
+              rows = list(csv.DictReader(f))
+
+          if not rows:
+              print("::error title=Regression check::CSV has no rows")
+              sys.exit(1)
+
+          if metric not in rows[0]:
+              print(f"::error title=Regression check::metric column '{metric}' "
+                    f"not in CSV. columns: {list(rows[0].keys())}")
+              sys.exit(1)
+
+          values = []
+          for r in rows:
+              cell = (r.get(metric) or "").strip()
+              if not cell:
+                  continue
+              try:
+                  values.append(float(cell))
+              except ValueError:
+                  print(f"::warning::row has non-numeric {metric}={cell!r}, skipping")
+
+          if not values:
+              print(f"::error title=Regression check::no numeric values for "
+                    f"'{metric}'. Status was probably no_checkpoint.")
+              sys.exit(1)
+
+          reducer = {"mean": statistics.fmean, "min": min, "max": max}[aggregate]
+          measured = reducer(values)
+
+          op = ">=" if direction == "higher" else "<="
+          passed = measured >= baseline if direction == "higher" else measured <= baseline
+
+          print(f"{metric}: {aggregate}={measured:.4f} {op} baseline={baseline}? -> "
+                f"{'PASS' if passed else 'FAIL'}  (rows={len(rows)}, valid={len(values)})")
+
+          if not passed:
+              print(f"::error title=Regression detected::"
+                    f"{metric} ({aggregate}) = {measured:.4f}, "
+                    f"baseline {op} {baseline} not met")
+              sys.exit(1)
+
+          print(f"::notice title=Regression check passed::"
+                f"{metric} ({aggregate}) = {measured:.4f} {op} {baseline}")
+          PY
