@@ -32,7 +32,7 @@ from isaaclab_assets import CRAZYFLIE_CFG
 from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF
 
 from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
-from .mdp.actions import QuadcopterThrustActionCfg
+from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterMomentsActionCfg
 from .mdp.curriculums import apply_staged_curriculum
 from .mdp.noise import drone_noise_model_factory
 
@@ -49,6 +49,12 @@ class DroneProfile:
     motor_arm_length_m: float #: Diagonal arm length :math:`l` [m] in the X-frame mixer :math:`B` (center to rotor).
     #: Nominal max rotor speed [rad/s] for scaling motor-speed observations (see ``motor_speeds_obs``).
     motor_omega_max_rad_s: float
+    rate_command_scale: float
+    pid_scales: float
+    pid_p: tuple[float, float, float]
+    pid_i: tuple[float, float, float]
+    pid_d: tuple[float, float, float]
+    pid_f: tuple[float, float, float]
 
 
 def _make_profile(
@@ -61,6 +67,12 @@ def _make_profile(
     motor_k_d: float,
     motor_arm_length_m: float,
     motor_omega_max_rad_s: float,
+    rate_command_scale: float,
+    pid_scales: float,
+    pid_p: tuple[float, float, float],
+    pid_i: tuple[float, float, float],
+    pid_d: tuple[float, float, float],
+    pid_f: tuple[float, float, float],
 ) -> DroneProfile:
     return DroneProfile(
         robot_cfg=cfg.replace(prim_path="{ENV_REGEX_NS}/Robot").replace(
@@ -73,6 +85,12 @@ def _make_profile(
         motor_k_d=motor_k_d,
         motor_arm_length_m=motor_arm_length_m,
         motor_omega_max_rad_s=motor_omega_max_rad_s,
+        rate_command_scale=rate_command_scale,
+        pid_scales=pid_scales,
+        pid_p=pid_p,
+        pid_i=pid_i,
+        pid_d=pid_d,
+        pid_f=pid_f,
     )
 
 
@@ -89,8 +107,13 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         motor_k_t=2.9e-8,
         motor_k_d=7.3e-10,
         motor_arm_length_m=0.0397,
-        # Observation scaling nominal peak ω (~25 krpm class); tune from datasheet.
         motor_omega_max_rad_s=2600.0,
+        rate_command_scale=30.0,
+        pid_scales=0.00005,
+        pid_p=(45.0, 47.0, 45.0),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 32.0),
+        pid_f=(0.0, 0.0, 0.0),
     ),
     # Table values you provided (replace if USD differs).
     "anemos_usd": _make_profile(
@@ -102,6 +125,12 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         motor_k_d=1e-8,
         motor_arm_length_m=0.17,
         motor_omega_max_rad_s=1000.0,
+        rate_command_scale=30.0,
+        pid_scales=0.00005,
+        pid_p=(45.0, 47.0, 45.0),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 32.0),
+        pid_f=(0.0, 0.0, 0.0),
     ),
     "anemos_urdf": _make_profile(
         ANEMOS_DRONE_CFG_URDF,
@@ -112,6 +141,12 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         motor_k_d=1e-8,
         motor_arm_length_m=0.17,
         motor_omega_max_rad_s=1000.0,
+        rate_command_scale=30.0,
+        pid_scales=0.00005,
+        pid_p=(45.0, 47.0, 45.0),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 32.0),
+        pid_f=(0.0, 0.0, 0.0),
     ),
 }
 
@@ -220,18 +255,28 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Thrust + moments on the quadcopter base."""
+    """Thrust plus inner-loop rate PID producing body torques (see ``QuadcopterRatesAction``)."""
 
-    thrust = QuadcopterThrustActionCfg(
+    # moments = QuadcopterMomentsActionCfg(
+    #     asset_name="robot",
+    #     thrust_to_weight=PROFILE.thrust_to_weight,
+    #     action_dim=4,
+    #     body_name=PROFILE.body_name,
+    # )
+
+    rates = QuadcopterRatesActionCfg(
         asset_name="robot",
         thrust_to_weight=PROFILE.thrust_to_weight,
-        moment_scale=PROFILE.moment_scale,
         action_dim=4,
-        min_delay=0,
-        max_delay=0,
         body_name=PROFILE.body_name,
+        pid_scales=PROFILE.pid_scales,
+        pid_p=PROFILE.pid_p,
+        pid_i=PROFILE.pid_i,
+        pid_d=PROFILE.pid_d,
+        pid_f=PROFILE.pid_f,
+        rate_command_scale=PROFILE.rate_command_scale,
+        #pid_gain_randomization_frac=0.1,
     )
-
 
 @configclass
 class ObservationsCfg:
