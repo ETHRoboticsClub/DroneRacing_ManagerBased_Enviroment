@@ -22,14 +22,17 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 _REL_POSITION_SCALE: float = 10.0
 
 def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Next-K gates observation: body-frame relative position + forward per gate.
+    """Next-K gates observation: body-frame rel-position + forward + half-width per gate.
 
     Gate forward is +Y in gate local frame, mapped to world then to body.
+    The per-gate half-width is the effective aperture seen by the policy:
+    ``half_eff = (gate_size / 2) * (1 - 2 * gate_size_obs_buffer_frac)``.
+    Set ``gate_size_obs_buffer_frac=0`` (default) to report the true aperture.
     Fully vectorized over environments and lookahead (no Python loop over K).
 
     Returns:
-        Concatenated ``[N, K*6]`` in direct-env order:
-        ``[rel_x, rel_y, rel_z, fwd_x, fwd_y, fwd_z]`` for each gate.
+        Concatenated ``[N, K*7]``:
+        ``[rel_x, rel_y, rel_z, fwd_x, fwd_y, fwd_z, half_width]`` per gate.
     """
     k = env.cfg.observation.num_next_gates  # lookahead count
     n = env.num_envs
@@ -62,8 +65,13 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     forward_w = quat_apply(g_ori_w, y_exp)           # [N, K, 3] world frame
     forward_b = quat_apply_inverse(q_drone, forward_w)  # [N, K, 3] body frame
 
-    gate_obs = torch.cat([offset_b_scaled, forward_b], dim=-1)  # [N, K, 6]
-    gate_obs = gate_obs.reshape(n, k * 6)
+    # Effective half-width per gate (broadcast: per-cell sizes are uniform across K).
+    buf_frac = float(env.cfg.observation.gate_size_obs_buffer_frac)
+    shrink = max(1.0 - 2.0 * buf_frac, 0.0)
+    half_eff = (env._gate_sizes * 0.5 * shrink).unsqueeze(1).expand(n, k).unsqueeze(-1)  # [N, K, 1]
+
+    gate_obs = torch.cat([offset_b_scaled, forward_b, half_eff], dim=-1)  # [N, K, 7]
+    gate_obs = gate_obs.reshape(n, k * 7)
     return gate_obs
 
 

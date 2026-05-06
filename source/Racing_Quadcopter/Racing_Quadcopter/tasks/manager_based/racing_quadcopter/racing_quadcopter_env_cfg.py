@@ -210,6 +210,10 @@ class GateObservationConfig:
 
     num_next_gates: int = 3
     include_velocity_limit: bool = True
+    # Fraction of the gate aperture to shrink off each side before reporting it as
+    # the 7th observation value (effective_half = half * (1 - 2*frac)). 0.0 reports
+    # the true aperture; 0.2 reports a conservative 60%-width inscribed area.
+    gate_size_obs_buffer_frac: float = 0.0
 
 
 @configclass
