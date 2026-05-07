@@ -162,6 +162,8 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
 #              scripts/tools/generate_anemos_usd.py.
 #              Motor mixer k_T, k_D, l and obs scale Ω_max live on DroneProfile;
 #              env builds B^{-1} once from RacingQuadcopterEnvCfg.
+# ACTION_TYPE: "rates"   — thrust + inner-loop rate PID → body torques (default).
+#              "moments" — direct thrust + body moments, no inner PID loop.
 # DEFAULT_TRACK_YAML: path to the gate track YAML (RPY in degrees, see
 #              configs/tracks/default.yaml for the format). Read in
 #              RacingQuadcopterEnvCfg_FIXED.__post_init__.
@@ -171,8 +173,12 @@ from Racing_Quadcopter.terrains import load_gates_from_yaml as _load_gates_from_
 
 DRONE_MODEL_ENV_VAR = "DRONE_MODEL"
 TRACK_YAML_ENV_VAR = "TRACK_YAML"
+ACTION_TYPE_ENV_VAR = "ACTION_TYPE"
+
+_ACTION_TYPES = ("rates", "moments")
 
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
+ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "rates")
 
 _REPO_ROOT = _os.path.normpath(
     _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
@@ -181,6 +187,9 @@ DEFAULT_TRACK_YAML = _os.path.join(_REPO_ROOT, "configs", "tracks", "default.yam
 
 assert DRONE_MODEL in DRONE_PROFILES, (
     f"Invalid DRONE_MODEL={DRONE_MODEL!r}. Set ${DRONE_MODEL_ENV_VAR} to one of: {list(DRONE_PROFILES)}"
+)
+assert ACTION_TYPE in _ACTION_TYPES, (
+    f"Invalid ACTION_TYPE={ACTION_TYPE!r}. Set ${ACTION_TYPE_ENV_VAR} to one of: {list(_ACTION_TYPES)}"
 )
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
@@ -259,28 +268,32 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Thrust plus inner-loop rate PID producing body torques (see ``QuadcopterRatesAction``)."""
+    """Action space selected by ACTION_TYPE env var ('rates' or 'moments')."""
 
-    # moments = QuadcopterMomentsActionCfg(
-    #     asset_name="robot",
-    #     thrust_to_weight=PROFILE.thrust_to_weight,
-    #     action_dim=4,
-    #     body_name=PROFILE.body_name,
-    # )
+    rates: QuadcopterRatesActionCfg | None = None
+    moments: QuadcopterMomentsActionCfg | None = None
 
-    rates = QuadcopterRatesActionCfg(
-        asset_name="robot",
-        thrust_to_weight=PROFILE.thrust_to_weight,
-        action_dim=4,
-        body_name=PROFILE.body_name,
-        pid_scales=PROFILE.pid_scales,
-        pid_p=PROFILE.pid_p,
-        pid_i=PROFILE.pid_i,
-        pid_d=PROFILE.pid_d,
-        pid_f=PROFILE.pid_f,
-        rate_command_scale=PROFILE.rate_command_scale,
-        #pid_gain_randomization_frac=0.1,
-    )
+    def __post_init__(self):
+        if ACTION_TYPE == "rates":
+            self.rates = QuadcopterRatesActionCfg(
+                asset_name="robot",
+                thrust_to_weight=PROFILE.thrust_to_weight,
+                action_dim=4,
+                body_name=PROFILE.body_name,
+                pid_scales=PROFILE.pid_scales,
+                pid_p=PROFILE.pid_p,
+                pid_i=PROFILE.pid_i,
+                pid_d=PROFILE.pid_d,
+                pid_f=PROFILE.pid_f,
+                rate_command_scale=PROFILE.rate_command_scale,
+            )
+        else:  # moments
+            self.moments = QuadcopterMomentsActionCfg(
+                asset_name="robot",
+                thrust_to_weight=PROFILE.thrust_to_weight,
+                action_dim=4,
+                body_name=PROFILE.body_name,
+            )
 
 @configclass
 class ObservationsCfg:
