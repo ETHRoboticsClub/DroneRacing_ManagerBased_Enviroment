@@ -208,7 +208,9 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Path to YAML config file. Supported keys: "
             "param_grid, sweep_mode, task_train, task_play, train_iterations, "
-            "eval_steps, num_envs, extra_train_args, extra_play_args."
+            "eval_steps, num_envs, extra_train_args, extra_play_args, "
+            "env_vars (dict of VAR: value, inherited by train/play subprocesses), "
+            "gate_track."
         ),
     )
     return parser.parse_args()
@@ -254,6 +256,20 @@ def _normalize_param_grid(raw_param_grid: object) -> dict[str, list]:
         raise ValueError("'param_grid' is empty. Provide at least one parameter.")
 
     return normalized
+
+
+def _apply_env_vars(env_vars: object) -> None:
+    """Set arbitrary process env vars from a ``env_vars`` YAML mapping.
+
+    Keys become environment variable names; values are coerced to str.
+    These are inherited by every subprocess spawned via _run_stream because
+    that function copies os.environ at launch time.
+    """
+    if not isinstance(env_vars, dict):
+        raise ValueError("'env_vars' must be a mapping of VAR_NAME -> value.")
+    for k, v in env_vars.items():
+        os.environ[str(k)] = str(v)
+    print(f"[Sweep] env_vars set: {', '.join(f'{k}={v}' for k, v in env_vars.items())}")
 
 
 def _apply_gate_track(gate_track: object) -> None:
@@ -323,6 +339,8 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
             PARAM_GRID = _normalize_param_grid(cfg["param_grid"])
         if "sweep_mode" in cfg:
             SWEEP_MODE = str(cfg["sweep_mode"])
+        if "env_vars" in cfg:
+            _apply_env_vars(cfg["env_vars"])
         if "gate_track" in cfg:
             _apply_gate_track(cfg["gate_track"])
 

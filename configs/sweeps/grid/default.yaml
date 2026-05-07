@@ -2,6 +2,12 @@
 # Usage:
 #   python3 scripts/sweep.py --config configs/sweeps/cartesian/default.yaml
 
+
+##############
+# DEPRECATED #
+##############
+task_train: Isaac-
+
 task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
 task_play: Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 
@@ -31,19 +37,6 @@ param_grid:
     - true
   velocity_limit_range:
     - "(8.0, 15.0)"
-
-  observation_noise.enable:
-    - true
-  observation_noise.gaussian_std_base_lin_vel:
-    - 0.015
-  observation_noise.gaussian_std_base_ang_vel:
-    - 0.015
-  observation_noise.gaussian_std_obs_gates:
-    - 0.02
-  observation_noise.bias_range_obs_gates:
-    - "(-0.08, 0.08)"
-  observation_noise.dropout_prob:
-    - 0.0
 
   action_noise.enable:
     - true

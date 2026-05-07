@@ -8,6 +8,9 @@ task_play:  Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 extra_train_args: ["--headless"]
 extra_play_args:  ["--headless"]
 
+env_vars:
+  DRONE_MODEL: "crazyflie"
+
 sweep_mode: sequential
 
 num_envs: 8192
