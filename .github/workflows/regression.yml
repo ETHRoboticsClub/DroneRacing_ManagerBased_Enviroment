@@ -61,8 +61,8 @@ env:
 
 jobs:
   regression-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: self-hosted
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
