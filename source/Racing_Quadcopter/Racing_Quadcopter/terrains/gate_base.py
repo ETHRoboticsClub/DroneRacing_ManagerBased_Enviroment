@@ -73,6 +73,52 @@ def clear_gate_registry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# GateSpec → GateData conversion
+# ---------------------------------------------------------------------------
+
+def gate_specs_to_gate_data(
+    specs: list,
+    gate_size: float,
+    bar_thickness: float,
+) -> GateData:
+    """Convert a list of :class:`GateSpec` into a :class:`GateData` instance.
+
+    Shared by ``fixed_gates.fixed_gates_terrain`` (terrain generation) and the
+    multi-track env's ``_load_cell_gate_data`` (runtime data loading).
+
+    Yaw is negated when converting to a scipy ``Rotation`` because ``GateSpec``
+    uses a CW-from-+Y convention while scipy uses CCW-around-Z.  Quaternions are
+    stored as wxyz to match IsaacLab convention (scipy returns xyzw).
+    """
+    positions_list: list[np.ndarray] = []
+    orientations_list: list[np.ndarray] = []
+    for spec in specs:
+        pos = np.array(spec.position, dtype=float)
+        rot = tf.Rotation.from_euler(
+            "xyz", [spec.roll_deg, spec.pitch_deg, -spec.yaw_deg], degrees=True
+        )
+        q = rot.as_quat()  # xyzw
+        positions_list.append(pos)
+        orientations_list.append(np.array([q[3], q[0], q[1], q[2]]))  # → wxyz
+
+    positions_arr = np.array(positions_list)
+    orientations_arr = np.array(orientations_list)
+    first_rot = tf.Rotation.from_quat(
+        [orientations_arr[0, 1], orientations_arr[0, 2],
+         orientations_arr[0, 3], orientations_arr[0, 0]]
+    )
+    return GateData(
+        positions=positions_arr,
+        orientations=orientations_arr,
+        gate_size=gate_size,
+        bar_thickness=bar_thickness,
+        start_position=positions_arr[0].copy(),
+        start_tangent=first_rot.apply([0.0, 1.0, 0.0]),
+        waypoints=positions_arr.copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gate mesh construction
 # ---------------------------------------------------------------------------
 

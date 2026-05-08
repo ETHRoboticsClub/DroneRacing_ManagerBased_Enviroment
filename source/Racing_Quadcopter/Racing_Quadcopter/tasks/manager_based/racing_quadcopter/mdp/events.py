@@ -347,3 +347,54 @@ def reset_racing_spawn(
         # The new limit is also written into the observation so the policy can adapt.
         lo, hi = env.cfg.velocity_limit_range
         env._velocity_limit[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo
+
+
+def _apply_upside_down_override(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Re-write drone orientation to 180° around X (upside-down), keeping spawn position.
+
+    Called after a standard spawn has already set ``_prev_drone_pos``. Reads the
+    position from there, writes back with a flipped quaternion.  Gate indices and
+    the action/motor buffers are reset by ``_write_spawn_state`` as a side-effect.
+
+    wxyz (0, 1, 0, 0) encodes a 180° rotation around the world X axis, which
+    flips the drone so its +Z (body up) points toward -Z (world down).
+    """
+    n = len(env_ids)
+    pos = env._prev_drone_pos[env_ids].clone()
+    quat = torch.zeros(n, 4, device=env.device)
+    quat[:, 1] = 1.0  # wxyz (0, 1, 0, 0) = 180° around X = upside-down
+    _write_spawn_state(env, env_ids, pos, quat, torch.zeros(n, 6, device=env.device))
+
+
+def reset_skill_eval_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> None:
+    """Per-terrain spawn dispatcher for skill evaluation terrains.
+
+    Iterates over ``env.cfg.skill_terrains`` (one entry per terrain) and
+    applies each terrain's spawn logic to the subset of ``env_ids`` assigned to
+    that terrain (determined via ``env._env_col_idx``, stored by
+    :class:`RacingQuadcopterSkillEvalRLEnv`).
+
+    Currently supported per-terrain flags (extend :class:`SkillTerrainCfg` and
+    add branches here to expose new spawn behaviours):
+        spawn_upside_down : spawn behind gate 0, then flip orientation 180° around X.
+        spawn_recovery    : spawn behind gate 0, then apply random attitude + velocity
+                            (delegates to ``_apply_recovery_override``).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+
+    skill_terrains = env.cfg.skill_terrains
+    for col_idx, terrain_cfg in enumerate(skill_terrains):
+        mask = env._env_col_idx[env_ids] == col_idx
+        col_ids = env_ids[mask]
+        if len(col_ids) == 0:
+            continue
+
+        # Base spawn: deterministic grid behind gate 0 (same as eval/fixed_spawn mode).
+        _apply_fixed_initialization(env, col_ids)
+
+        # Per-terrain overrides applied on top of the base spawn.
+        if getattr(terrain_cfg, "spawn_upside_down", False):
+            _apply_upside_down_override(env, col_ids)
+        elif getattr(terrain_cfg, "spawn_recovery", False):
+            _apply_recovery_override(env, col_ids)

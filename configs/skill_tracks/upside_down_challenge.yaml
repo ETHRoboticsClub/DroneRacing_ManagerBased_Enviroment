@@ -1,0 +1,14 @@
+# Upside-down challenge — same circuit as standard but drones spawn inverted.
+# Tests the policy's ability to self-right and complete the track from an
+# adverse initial attitude.
+# rotation: [roll, pitch, yaw] in degrees.
+
+gate_track:
+  - position: [12.5, 5.0, 4.5]
+    rotation: [0, 0, 45]
+  - position: [12.5, 12.5, 4.5]
+    rotation: [0, 0, 315]
+  - position: [5.0, 12.5, 4.5]
+    rotation: [0, 0, 225]
+  - position: [5.0, 5.0, 4.5]
+    rotation: [0, 0, 135]
