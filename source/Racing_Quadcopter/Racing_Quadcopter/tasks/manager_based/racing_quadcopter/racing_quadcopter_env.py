@@ -495,3 +495,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         if gate_log:
             self.extras["log"].update(gate_log)
+            self._on_episode_metrics_collected(gate_log)
+
+    def _on_episode_metrics_collected(self, gate_log: dict) -> None:
+        """Hook called after each reset once `gate_log` has been merged into ``extras["log"]``.
+
+        Default is a no-op. Subclasses (e.g. ``RacingQuadcopterSkillEvalRLEnv``)
+        override this to write the metrics directly to a tensorboard writer
+        without relying on the agent runner having a configured ``log_dir``.
+        """
+        return

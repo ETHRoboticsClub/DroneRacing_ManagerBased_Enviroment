@@ -16,38 +16,99 @@ from isaaclab.utils.math import quat_apply
 from .stats import accumulate_episode_stats
 
 
+def _emit_episode_metrics(env: ManagerBasedRLEnv, ids: torch.Tensor, prefix: str, gate_log: dict) -> None:
+    """Write gates_passed / mean_velocity_kmh / lap_completion_pct / mean_lap_time_s to gate_log.
+
+    Logging contract: ``gates_passed`` and ``mean_velocity_kmh`` are always
+    emitted; ``lap_completion_pct`` is emitted whenever the subset has at least
+    one countable run (a finished lap or a terminated partial run);
+    ``mean_lap_time_s`` is emitted only when at least one env completed a full lap.
+
+    ``mean_velocity_kmh`` is the per-step world-frame speed averaged over each
+    env's episode (in m/s), then averaged across envs in the subset, then
+    converted to km/h (×3.6) to match the console "Speed" stat.
+
+    ``lap_completion_pct`` mirrors the console "Lap%" formula: each completed lap
+    contributes 1.0, each terminated (not timed-out) episode contributes a
+    partial-run value of ``(gates_passed % gate_count) / gate_count``, and the
+    metric is the mean over those run entries.
+    """
+    if ids.numel() == 0:
+        return
+
+    gate_log[f"{prefix}/gates_passed"] = env._gates_passed[ids].float().mean().item()
+
+    step_counts = env._episode_step_count[ids]
+    valid_steps = step_counts > 0
+    if valid_steps.any():
+        mean_vel_ms = (
+            env._episode_velocity_sum[ids][valid_steps] / step_counts[valid_steps]
+        ).mean().item()
+        gate_log[f"{prefix}/mean_velocity_kmh"] = mean_vel_ms * 3.6
+    else:
+        gate_log[f"{prefix}/mean_velocity_kmh"] = 0.0
+
+    lap_counts = env._episode_lap_count[ids].long()
+    gates_passed = env._gates_passed[ids].long()
+    gate_counts = env._gate_counts[ids].long()
+    reset_terminated = getattr(env, "reset_terminated", None)
+    if reset_terminated is not None:
+        terminated = reset_terminated[ids].bool()
+    else:
+        terminated = torch.zeros_like(lap_counts, dtype=torch.bool)
+
+    has_laps = lap_counts > 0
+    if has_laps.any():
+        mean_lap_time = (
+            env._episode_lap_time_sum[ids][has_laps] / lap_counts[has_laps]
+        ).mean().item()
+        gate_log[f"{prefix}/mean_lap_time_s"] = mean_lap_time
+
+    # Lap-completion percentage, matching the sliding-window console "Lap%".
+    partial_mask = terminated & (gate_counts > 0)
+    runs_count = int(lap_counts.sum().item()) + int(partial_mask.sum().item())
+    if runs_count > 0:
+        completed_value = float(lap_counts.sum().item())
+        if partial_mask.any():
+            gp_p = gates_passed[partial_mask].float()
+            gc_p = gate_counts[partial_mask].float()
+            partial_value = float(((gp_p % gc_p) / gc_p).sum().item())
+        else:
+            partial_value = 0.0
+        gate_log[f"{prefix}/lap_completion_pct"] = (completed_value + partial_value) / runs_count * 100.0
+
+
 def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor: torch.Tensor) -> dict:
     """Snapshot episode stats into _last_episode_* and zero accumulators for the next episode.
 
     Must be called BEFORE super()._reset_idx so the accumulators still hold the
     completed episode's data. After super()._reset_idx the EventManager will call
     reset_racing_spawn which zeros _current_gate_idx and _gates_passed.
+
+    When the env exposes ``_env_col_idx`` (skill-evaluation env), per-terrain
+    metrics are emitted under ``terrain_{i}/*`` in addition to the global
+    ``Episode_Metrics/*`` keys. Each terrain gets its own top-level
+    tensorboard panel; the global aggregate stays under ``Episode_Metrics/``.
     """
     gate_log: dict = {}
     if env_ids_tensor.numel() == 0:
         return gate_log
 
-    gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[env_ids_tensor].float().mean().item()
+    # Global metrics across all resetting envs.
+    _emit_episode_metrics(env, env_ids_tensor, "Episode_Metrics", gate_log)
 
-    step_counts = env._episode_step_count[env_ids_tensor]
-    valid_steps = step_counts > 0
-    if valid_steps.any():
-        mean_vel = (
-            env._episode_velocity_sum[env_ids_tensor][valid_steps] / step_counts[valid_steps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_velocity"] = mean_vel
-    else:
-        gate_log["Episode_Metrics/mean_velocity"] = 0.0
+    # Per-terrain breakdown when running on the skill-evaluation env.
+    env_col_idx = getattr(env, "_env_col_idx", None)
+    if env_col_idx is not None:
+        cols = env_col_idx[env_ids_tensor]
+        for col in cols.unique().tolist():
+            ids = env_ids_tensor[cols == col]
+            _emit_episode_metrics(env, ids, f"terrain_{int(col)}", gate_log)
 
-    gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[env_ids_tensor].mean().item()
-
+    # Update running global lap-time totals (used by the console stats line, not per-terrain).
     lap_counts = env._episode_lap_count[env_ids_tensor]
     has_laps = lap_counts > 0
     if has_laps.any():
-        mean_lap_time = (
-            env._episode_lap_time_sum[env_ids_tensor][has_laps] / lap_counts[has_laps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_lap_time_s"] = mean_lap_time
         env._total_lap_time_sum += float(env._episode_lap_time_sum[env_ids_tensor][has_laps].sum().item())
         env._total_lap_count += int(lap_counts[has_laps].sum().item())
 

@@ -116,6 +116,7 @@ class RacingQuadcopterSkillEvalEnvCfg(RacingQuadcopterEnvCfg):
         # Evaluation defaults.
         self.scene.num_envs = 256
         self.eval_mode = True
+        self.force_collision_termination = True
         self.observations.policy.enable_corruption = False
         self.action_noise.enable = False
         self.events.randomize_robot_mass = None

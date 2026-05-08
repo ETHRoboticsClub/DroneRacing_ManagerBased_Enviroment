@@ -18,6 +18,7 @@ needed.
 
 from __future__ import annotations
 
+import datetime
 import os
 
 import numpy as np
@@ -95,12 +96,19 @@ class RacingQuadcopterMultiTrackRLEnv(RacingQuadcopterRLEnv):
 class RacingQuadcopterSkillEvalRLEnv(RacingQuadcopterMultiTrackRLEnv):
     """Skill-evaluation env: multi-track layout with per-terrain spawn logic.
 
-    Extends :class:`RacingQuadcopterMultiTrackRLEnv` by storing the per-env terrain
-    assignment as ``self._env_col_idx`` after gate tracking is set up. The custom
-    reset event ``reset_skill_eval_spawn`` (registered in
-    :class:`RacingQuadcopterSkillEvalEnvCfg`) reads this buffer to dispatch each
-    resetting env to the spawn logic defined in its terrain's :class:`SkillTerrainCfg`.
+    Extends :class:`RacingQuadcopterMultiTrackRLEnv` by:
+      - Storing the per-env terrain assignment as ``self._env_col_idx`` so
+        ``reset_skill_eval_spawn`` can route each resetting env to its terrain's
+        spawn logic (defined in :class:`SkillTerrainCfg`).
+      - Opening a dedicated :class:`SummaryWriter` and overriding
+        ``_on_episode_metrics_collected`` to write every metric key to it. This
+        gives per-terrain metrics a tensorboard sink even when the agent runner
+        was started with ``log_dir=None`` (the rsl_rl play path), where
+        ``extras["log"]`` is otherwise discarded.
     """
+
+    _tb_writer = None
+    _tb_log_dir: str | None = None
 
     def _load_cell_gate_data(
         self,
@@ -112,3 +120,55 @@ class RacingQuadcopterSkillEvalRLEnv(RacingQuadcopterMultiTrackRLEnv):
         # Store as a long tensor so it can be used for indexing in the reset event.
         self._env_col_idx = torch.from_numpy(env_col.astype(int)).long().to(self.device)
         return result
+
+    def load_managers(self) -> None:
+        super().load_managers()
+        # Open the tensorboard writer after managers are built so cfg.log_dir
+        # (set by play.py) is available and any cfg-driven manager state is in place.
+        self._setup_skill_eval_tb_writer()
+
+    def _setup_skill_eval_tb_writer(self) -> None:
+        """Open a SummaryWriter for skill-eval metrics and announce the path."""
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            print(
+                "[Skill Eval] tensorboard is not installed — per-terrain metrics will not be "
+                "written to disk. Install it with `pip install tensorboard` to enable logging."
+            )
+            self._tb_writer = None
+            self._tb_log_dir = None
+            return
+
+        run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        base = getattr(self.cfg, "log_dir", None) or os.path.join(os.getcwd(), "logs")
+        log_dir = os.path.abspath(os.path.join(base, "skill_eval", run_name))
+        os.makedirs(log_dir, exist_ok=True)
+
+        self._tb_writer = SummaryWriter(log_dir=log_dir)
+        self._tb_log_dir = log_dir
+        print(
+            "\n"
+            "==================================================================\n"
+            "[Skill Eval] Per-terrain metrics → tensorboard\n"
+            f"  Log dir : {log_dir}\n"
+            f"  View    : tensorboard --logdir {log_dir}\n"
+            "  Look for one panel per terrain (`terrain_{i}/...`) plus the\n"
+            "  cross-terrain aggregate under `Episode_Metrics/...`.\n"
+            "==================================================================\n"
+        )
+
+    def _on_episode_metrics_collected(self, gate_log: dict) -> None:
+        """Write every metric key from this reset to tensorboard."""
+        if self._tb_writer is None:
+            return
+        step = self.common_step_counter
+        for k, v in gate_log.items():
+            self._tb_writer.add_scalar(k, float(v), step)
+        self._tb_writer.flush()
+
+    def close(self) -> None:
+        if getattr(self, "_tb_writer", None) is not None:
+            self._tb_writer.close()
+            self._tb_writer = None
+        super().close()
