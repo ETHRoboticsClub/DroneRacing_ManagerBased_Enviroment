@@ -22,7 +22,13 @@ if TYPE_CHECKING:
 
 
 def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.ndarray:
-    """Invertible X-frame mixer :math:`[T,\\tau]^\\top = B\\mathbf u^{\\circ 2}`; returns ``B^{-1}`` ``(4,4)`` float64.
+    """Invertible X-frame mixer B matrix
+    
+    x: front, y: left, z: up
+    M1: (+l, +l) CCW
+    M2: (+l, -l) CW
+    M3: (-l, +l) CW
+    M4: (-l, -l) CCW
 
     Parameters ``k_t``, ``k_d``, ``arm_length_m`` match ``DroneProfile`` / env cfg.
     Rows are thrust, roll moment, pitch moment, yaw drag torque (see project notes / ``docs/drone.pdf``).
@@ -31,12 +37,13 @@ def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.nd
     b = np.array(
         [
             [k_t, k_t, k_t, k_t],
-            [-ktl, ktl, -ktl, ktl],
-            [ktl, ktl, -ktl, -ktl],
+            [ktl, -ktl, ktl, -ktl],
+            [-ktl, -ktl, ktl, ktl],
             [k_d, -k_d, -k_d, k_d],
         ],
         dtype=np.float64,
     )
+    #
     return np.linalg.inv(b)
 
 
