@@ -109,6 +109,21 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             dtype=torch.long,
         ).unsqueeze(0).expand(self.num_envs, -1)
 
+        # ``camera_keypoint`` link (URDF) — required for perception reward; fail fast if missing/ambiguous.
+        _cam_ids, _ = self._robot.find_bodies("camera_keypoint")
+        if isinstance(_cam_ids, torch.Tensor):
+            _n = int(_cam_ids.numel())
+        else:
+            _n = len(_cam_ids)
+        if _n != 1:
+            raise RuntimeError(
+                "Perception reward requires exactly one articulation body named 'camera_keypoint'. "
+                f"find_bodies('camera_keypoint') matched {_n} (expected 1). Check the robot URDF/USD."
+            )
+        self._camera_keypoint_body_idx: int = (
+            int(_cam_ids[0].item()) if isinstance(_cam_ids, torch.Tensor) else int(_cam_ids[0])
+        )
+
         # All body IDs monitored for contact; ".*" captures every link.
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*")
 

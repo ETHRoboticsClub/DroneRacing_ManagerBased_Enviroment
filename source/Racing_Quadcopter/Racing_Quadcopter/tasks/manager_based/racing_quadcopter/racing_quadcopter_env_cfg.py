@@ -207,6 +207,8 @@ class RewardWeights:
     ORIENTATION: float = -0.005
     ANGULAR_VELOCITY: float = -0.001
     ACTION_SMOOTHNESS: float = -0.0001
+    ACTION_RATE_THRESH: float = -0.0005
+    LOW_ACTION: float = -0.001
     ACTION_MAGNITUDE: float = -0.001
     CRASH: float = -50.0
     WRONG_SIDE: float = -0.1
@@ -370,7 +372,7 @@ class RewardsCfg:
         func=rewards.reward_velocity_toward_gate, weight=RewardWeights.VELOCITY_TOWARD_GATE
     )
     velocity_limit = RewTerm(func=rewards.penalty_velocity_limit, weight=RewardWeights.VELOCITY_LIMIT)
-    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+    
     orientation = RewTerm(func=rewards.penalty_orientation, weight=RewardWeights.ORIENTATION)
     angular_velocity = RewTerm(
         func=rewards.penalty_angular_velocity, weight=RewardWeights.ANGULAR_VELOCITY
@@ -384,6 +386,8 @@ class RewardsCfg:
     )
     crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
     wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)
+
+    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
 
 
 @configclass
