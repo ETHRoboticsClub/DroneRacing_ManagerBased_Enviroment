@@ -142,7 +142,7 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         motor_arm_length_m=0.17,
         motor_omega_max_rad_s=1000.0,
         rate_command_scale=30.0,
-        pid_scales=0.00005,
+        pid_scales=0.005,
         pid_p=(45.0, 47.0, 45.0),
         pid_i=(0.0, 0.0, 0.0),
         pid_d=(32.0, 34.0, 32.0),
@@ -178,7 +178,7 @@ ACTION_TYPE_ENV_VAR = "ACTION_TYPE"
 _ACTION_TYPES = ("rates", "moments")
 
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
-ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "rates")
+ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "moments")
 
 _REPO_ROOT = _os.path.normpath(
     _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
@@ -295,6 +295,7 @@ class ActionsCfg:
                 thrust_to_weight=PROFILE.thrust_to_weight,
                 action_dim=4,
                 body_name=PROFILE.body_name,
+                moment_scale=PROFILE.moment_scale,
             )
 
 @configclass

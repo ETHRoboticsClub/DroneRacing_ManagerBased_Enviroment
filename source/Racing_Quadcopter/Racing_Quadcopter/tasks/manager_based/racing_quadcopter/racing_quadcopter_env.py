@@ -109,16 +109,26 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             dtype=torch.long,
         ).unsqueeze(0).expand(self.num_envs, -1)
 
-        # ``camera_keypoint`` link (URDF) — required for perception reward; fail fast if missing/ambiguous.
-        _cam_ids, _ = self._robot.find_bodies("camera_keypoint")
+        # ``camera_keypoint`` link (URDF) — preferred frame for perception reward; else base (body/base_link/``base``).
+        try:
+            _cam_ids, _ = self._robot.find_bodies("camera_keypoint")
+        except ValueError:
+            try:
+                _cam_ids, _ = self._robot.find_bodies("body|base_link|^base$")
+            except ValueError as err:
+                raise RuntimeError(
+                    "Perception reward needs a `camera_keypoint` body or a single base link matching "
+                    "`body`, `base_link`, or `base`. "
+                    f"Available bodies: {self._robot.body_names}"
+                ) from err
         if isinstance(_cam_ids, torch.Tensor):
             _n = int(_cam_ids.numel())
         else:
             _n = len(_cam_ids)
         if _n != 1:
             raise RuntimeError(
-                "Perception reward requires exactly one articulation body named 'camera_keypoint'. "
-                f"find_bodies('camera_keypoint') matched {_n} (expected 1). Check the robot URDF/USD."
+                "Perception reward requires exactly one `camera_keypoint` body, or exactly one base link "
+                f"(body/base_link/base). Matched {_n} bodies. Check the robot URDF/USD."
             )
         self._camera_keypoint_body_idx: int = (
             int(_cam_ids[0].item()) if isinstance(_cam_ids, torch.Tensor) else int(_cam_ids[0])
