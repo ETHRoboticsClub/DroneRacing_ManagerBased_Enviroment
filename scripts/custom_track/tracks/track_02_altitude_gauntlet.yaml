@@ -1,0 +1,66 @@
+schema_version: 1
+track_name: Altitude Gauntlet
+description: Tests Split-S (over top then drop through bottom), Reverse Split-S (bottom
+  up), and Ladder (double-stack top/bottom gates with circle-around). Heavy altitude
+  variation.
+elements_tested:
+- split_s
+- reverse_split_s
+- ladder
+- simple_gate
+gate_size: 0.7
+bar_thickness: 0.05
+loop_closed: true
+gate_track:
+- position: [-9.0, -9.85, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G1: Start - straight'
+- position: [-2.0, -9.85, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G2: Approach straight'
+- position: [5.0, -9.85, 3.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G3: Split-S top gate (fly over/through high)'
+- position: [9.0, -5.85, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G4: Split-S bottom gate (drop down, exit low)'
+- position: [13.0, -1.85, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G5: Low recovery straight'
+- position: [13.0, 4.15, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G6: Reverse Split-S bottom gate (enter low, throttle up)'
+- position: [9.0, 8.15, 3.2]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G7: Reverse Split-S top gate (exit high)'
+- position: [3.0, 10.15, 3.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G8: Ladder top gate (double-stack top)'
+- position: [-1.0, 8.15, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G9: Ladder bottom gate (circle down and through)'
+- position: [-5.0, 4.15, 2.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G10: Transition at mid-height'
+- position: [-9.0, 4.15, 3.2]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G11: 2nd Ladder top gate'
+- position: [-13.0, 2.15, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G12: 2nd Ladder bottom gate'
+- position: [-13.0, -3.85, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G13: Return to start altitude'
