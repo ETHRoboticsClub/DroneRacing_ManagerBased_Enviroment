@@ -169,6 +169,13 @@ jobs:
           echo "Downloaded:"
           ls -la ./results/
 
+      - name: Abort AWS Batch job on cancellation
+        if: cancelled() && steps.submit.outputs.job_id != ''
+        run: |
+          aws batch terminate-job \
+            --job-id "${{ steps.submit.outputs.job_id }}" \
+            --reason "GitHub Actions workflow cancelled"
+
       - name: Compare metric to baseline
         env:
           BASELINE_VALUE: ${{ matrix.baseline_value }}

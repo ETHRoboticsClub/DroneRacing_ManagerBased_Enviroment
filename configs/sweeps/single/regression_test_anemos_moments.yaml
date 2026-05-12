@@ -16,7 +16,7 @@ sweep_mode: sequential
 
 num_envs: 8192
 
-train_iterations: 500
+train_iterations: 834  # 20016 steps
 eval_steps: 3000
 
 # rotation: [roll, pitch, yaw] in degrees (ROS/URDF RPY order).
