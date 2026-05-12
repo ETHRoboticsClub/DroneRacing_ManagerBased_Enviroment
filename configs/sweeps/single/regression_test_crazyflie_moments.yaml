@@ -10,6 +10,7 @@ extra_play_args:  ["--headless"]
 
 env_vars:
   DRONE_MODEL: "crazyflie"
+  ACTION_TYPE: "moments"
 
 sweep_mode: sequential
 
