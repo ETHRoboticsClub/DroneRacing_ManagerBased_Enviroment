@@ -66,7 +66,7 @@ def fixed_gates_terrain(
         # 90°→+X), while scipy uses CCW around Z — negate yaw to match.
         rot = tf.Rotation.from_euler(
             "xyz",
-            [spec.roll_deg, spec.pitch_deg, -spec.yaw_deg],
+            [spec.rotation[0], spec.rotation[1], -spec.rotation[2]],
             degrees=True,
         )
         quat_xyzw = rot.as_quat()
