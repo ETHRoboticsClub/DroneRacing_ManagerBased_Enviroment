@@ -43,7 +43,7 @@ class DroneProfile:
     robot_cfg: ArticulationCfg
     body_name: str
     thrust_to_weight: float
-    moment_scale: float
+    moment_scale: tuple[float, float, float]  #: Per-axis (roll, pitch, yaw) moment scales [N·m] mapping action ±1 → full physical authority.
     motor_k_t: float #: Thrust coefficient :math:`k_T` [N/(rad/s)²] for :math:`T_i = k_T \Omega_i^2`.
     motor_k_d: float #: Drag torque coefficient :math:`k_D` [N·m/(rad/s)²] for yaw mixing row in :math:`B`.
     motor_arm_length_m: float #: Diagonal arm length :math:`l` [m] in the X-frame mixer :math:`B` (center to rotor).
@@ -61,7 +61,7 @@ def _make_profile(
     cfg: ArticulationCfg,
     body_name: str,
     thrust_to_weight: float,
-    moment_scale: float,
+    moment_scale: tuple[float, float, float],
     *,
     motor_k_t: float,
     motor_k_d: float,
@@ -95,15 +95,24 @@ def _make_profile(
 
 
 # Anemos: ~0.85 kg total (base_link 0.835 + 4 props), inertia ixx≈2.16e-3, iyy≈2.92e-3.
-# T/W ~4 is conservative for a 5" racing quad; moment_scale=0.1 gives ~35-45 rad/s² peak.
+#
+# moment_scale derivation (per-axis, from URDF geometry and k_t/k_d):
+#   τ_roll_max  = min(Σ|y_left| , Σ|y_right|) × k_t × Ω_max²
+#               = min(0.1438, 0.1360) × 8.54858 = 1.16 N·m   (motors at y=±0.068–0.072 m)
+#   τ_pitch_max = min(Σ|x_back| , Σ|x_front|) × k_t × Ω_max²
+#               = min(0.1640, 0.1771) × 8.54858 = 1.40 N·m   (motors at x=±0.082–0.089 m)
+#   τ_yaw_max   = 2 × k_d × Ω_max²
+#               = 2 × 1e-8 × 1e6 = 0.020 N·m
+#   Conservative: min of both ± directions so action ±1 is achievable without saturation.
 DRONE_PROFILES: dict[str, DroneProfile] = {
-    # motor_* placeholders until identified from bench/model; safe defaults for invertible B.
-    #Motor values taken from Crazyflie 2.0 https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    # Motor values taken from Crazyflie 2.0:
+    # https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    # Crazyflie moment_scale: roll/pitch max ≈ 0.011 N·m, yaw max ≈ 0.010 N·m → (0.01, 0.01, 0.01) is correct.
     "crazyflie": _make_profile(
         CRAZYFLIE_CFG,
         body_name="body",
         thrust_to_weight=1.9,
-        moment_scale=0.01,
+        moment_scale=(0.01, 0.01, 0.01),
         motor_k_t=2.9e-8,
         motor_k_d=7.3e-10,
         motor_arm_length_m=0.0397,
@@ -115,37 +124,39 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         pid_d=(32.0, 34.0, 32.0),
         pid_f=(0.0, 0.0, 0.0),
     ),
-    # Table values you provided (replace if USD differs).
     "anemos_usd": _make_profile(
         ANEMOS_DRONE_CFG_USD,
         body_name="base_link",
-        thrust_to_weight=4.0,
-        moment_scale=0.1,
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
         motor_k_t=8.54858e-6,
         motor_k_d=1e-8,
-        motor_arm_length_m=0.17,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
         motor_omega_max_rad_s=1000.0,
         rate_command_scale=30.0,
         pid_scales=0.005,
-        pid_p=(45.0, 47.0, 45.0),
+        # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
+        # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
+        #      D=0: yaw authority is too low for derivative term to add meaningful damping
+        pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
-        pid_d=(32.0, 34.0, 32.0),
+        pid_d=(32.0, 34.0, 0.45),
         pid_f=(0.0, 0.0, 0.0),
     ),
     "anemos_urdf": _make_profile(
         ANEMOS_DRONE_CFG_URDF,
         body_name="base_link",
-        thrust_to_weight=4.0,
-        moment_scale=0.1,
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
         motor_k_t=8.54858e-6,
         motor_k_d=1e-8,
-        motor_arm_length_m=0.17,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
         motor_omega_max_rad_s=1000.0,
         rate_command_scale=30.0,
         pid_scales=0.005,
-        pid_p=(45.0, 47.0, 45.0),
+        pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
-        pid_d=(32.0, 34.0, 32.0),
+        pid_d=(32.0, 34.0, 0.45),
         pid_f=(0.0, 0.0, 0.0),
     ),
 }
@@ -236,8 +247,7 @@ class ActionNoiseCfg:
     - lpf_alpha: first-order low-pass applied to actions (1.0=no smoothing)
     """
 
-    # Conservative training defaults: enabled in training, disabled in *_PLAY configs.
-    enable: bool = True
+    enable: bool = False
     per_episode_bias: bool = True
     gaussian_std: float = 0.0
     bias_range: tuple[float, float] = (-0.0, 0.0)
@@ -304,7 +314,7 @@ class ObservationsCfg:
     
     @configclass
     class PolicyCfg(ObsGroup):
-        enable_corruption: bool = True
+        enable_corruption: bool = False
         concatenate_terms: bool = True
         
         history_length: int = 3
@@ -459,6 +469,7 @@ class TerminationsCfg:
     below_height = DoneTerm(func=terminations.below_height_threshold, time_out=False)
     runaway = DoneTerm(func=terminations.runaway_velocity, time_out=False)
     collision = DoneTerm(func=terminations.collision_termination, time_out=False)
+    wrong_direction = DoneTerm(func=terminations.wrong_direction_crossing, time_out=False)
     lap_complete = DoneTerm(func=terminations.lap_complete, time_out=True)
 
 
@@ -494,7 +505,16 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     eval_mode: bool = False
     crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
     fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
-    recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
+    recovery_spawn_prob: float = 0.0 # fraction [0,1] of envs that spawn with random orientation + velocity
+
+    # ── Domain randomization flags ─────────────────────────────────────────────
+    # All default to False (no domain randomization). Set True individually to
+    # enable the corresponding perturbation.
+    randomize_mass: bool = False              # startup: scale robot mass ±10 %
+    randomize_com: bool = False               # startup: shift CoM ±15 mm per axis
+    randomize_actuator_gains: bool = False    # startup: scale stiffness/damping ±10 %
+    apply_external_disturbances: bool = False # interval: random force/torque + velocity push
+    observation_noise_enable: bool = False    # per-step obs Gaussian noise + per-episode bias
     speed_log_interval_s: float = 10.0
     stats_warmup_s: float = 0.0    # skip stats accumulation for this many simulation seconds at episode start
     draw_trajectory: bool = True        # green closed-loop polyline through all waypoints (USD, no collision)
@@ -541,6 +561,19 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     viewer: ViewerCfg = ViewerCfg(eye=(15.0, 15.0, 7.0), lookat=(3.0, 3.0, 0.0), origin_type="world")
 
+    def _apply_dr_flags(self) -> None:
+        """Wire domain-randomization flags into sub-configs. Called by every __post_init__."""
+        if not self.randomize_mass:
+            self.events.randomize_robot_mass = None
+        if not self.randomize_com:
+            self.events.randomize_base_com = None
+        if not self.randomize_actuator_gains:
+            self.events.randomize_robot_actuator_gains = None
+        if not self.apply_external_disturbances:
+            self.events.base_external_force_torque = None
+            self.events.push_robot = None
+        self.observations.policy.enable_corruption = self.observation_noise_enable
+
     def __post_init__(self) -> None:
         terrain_generator = create_racing_gates_terrain(self.seed)
         self.scene.terrain = TerrainImporterCfg(
@@ -558,6 +591,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             debug_vis=True,
         )
         self.sim.render_interval = self.decimation
+        self._apply_dr_flags()
 
 
 @configclass
@@ -569,10 +603,6 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observations.policy.enable_corruption = False
-        self.action_noise.enable = False
-        self.events.randomize_robot_mass = None
-        self.events.randomize_robot_actuator_gains = None
         self.stats_warmup_s = 30.0
         print("[INFO] Evaluation mode is ON.")
 
@@ -639,6 +669,7 @@ class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
             debug_vis=True,
         )
         self.sim.render_interval = self.decimation
+        self._apply_dr_flags()
 
 
 @configclass
@@ -650,9 +681,5 @@ class RacingQuadcopterEnvCfg_FIXED_PLAY(RacingQuadcopterEnvCfg_FIXED):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observations.policy.enable_corruption = False
-        self.action_noise.enable = False
-        self.events.randomize_robot_mass = None
-        self.events.randomize_robot_actuator_gains = None
         self.stats_warmup_s = 30.0
         print("[INFO] Fixed-track evaluation mode is ON.")
