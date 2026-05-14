@@ -185,11 +185,14 @@ from Racing_Quadcopter.terrains import load_gates_from_yaml as _load_gates_from_
 DRONE_MODEL_ENV_VAR = "DRONE_MODEL"
 TRACK_YAML_ENV_VAR = "TRACK_YAML"
 ACTION_TYPE_ENV_VAR = "ACTION_TYPE"
+OBSERVATION_SPACE_ENV_VAR = "OBSERVATION_SPACE"
 
 _ACTION_TYPES = ("rates", "moments")
+_OBSERVATION_SPACES = ("mono_race", "ours")
 
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
 ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "moments")
+OBSERVATION_SPACE = _os.environ.get(OBSERVATION_SPACE_ENV_VAR, "ours")
 
 _REPO_ROOT = _os.path.normpath(
     _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
@@ -201,6 +204,9 @@ assert DRONE_MODEL in DRONE_PROFILES, (
 )
 assert ACTION_TYPE in _ACTION_TYPES, (
     f"Invalid ACTION_TYPE={ACTION_TYPE!r}. Set ${ACTION_TYPE_ENV_VAR} to one of: {list(_ACTION_TYPES)}"
+)
+assert OBSERVATION_SPACE in _OBSERVATION_SPACES, (
+    f"Invalid OBSERVATION_SPACE={OBSERVATION_SPACE!r}. Set ${OBSERVATION_SPACE_ENV_VAR} to one of: {list(_OBSERVATION_SPACES)}"
 )
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
@@ -231,6 +237,8 @@ class GateObservationConfig:
     """Observation parameters."""
 
     num_next_gates: int = 3
+    mono_race_num_next_gates: int = 1
+    mono_race_future_gates_pose_ahead: int = 2
     include_velocity_limit: bool = True
     # Fraction of the gate aperture to shrink off each side before reporting it as
     # the 7th observation value (effective_half = half * (1 - 2*frac)). 0.0 reports
@@ -313,7 +321,7 @@ class ObservationsCfg:
     """Policy observations."""
     
     @configclass
-    class PolicyCfg(ObsGroup):
+    class OursObservationsCfg(ObsGroup):
         enable_corruption: bool = False
         concatenate_terms: bool = True
         
@@ -340,13 +348,6 @@ class ObservationsCfg:
             history_length=history_length,
         )
 
-        #Having actions as observations is good enough (Linear transformation)
-        # motor_speeds = ObsTerm(
-        #     func=observations.motor_speeds_obs,
-        #     noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
-        #     history_length=history_length,
-        # )
-
         #ACTION
         last_action = ObsTerm(
             func=observations.last_action,
@@ -366,7 +367,44 @@ class ObservationsCfg:
             history_length=history_length,
         )
 
-    policy: PolicyCfg = PolicyCfg()
+    @configclass
+    class MonoRaceObservationsCfg(ObsGroup):
+        enable_corruption: bool = False
+        concatenate_terms: bool = True
+
+        history_length: int = 1
+
+        mono_race_gate_position_velocity_gate_frame = ObsTerm(
+            func=observations.mono_race_gate_position_velocity_gate_frame,
+            history_length=history_length,
+        )
+        mono_race_gate_orientations = ObsTerm(
+            func=observations.mono_race_gate_orientations,
+            history_length=history_length,
+        )
+
+        mono_race_future_gates_pose_in_current_gate_frame = ObsTerm(
+            func=observations.mono_race_future_gates_pose_in_current_gate_frame,
+            history_length=history_length,
+        )
+        base_ang_vel = ObsTerm(
+            func=observations.base_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            scale= 0.2,
+            history_length=history_length,
+        )
+
+        motor_speeds = ObsTerm(
+            func=observations.motor_speeds_obs,
+            history_length=history_length,
+        )
+
+
+    if OBSERVATION_SPACE == "mono_race":
+        policy: MonoRaceObservationsCfg = MonoRaceObservationsCfg()
+    else:
+        policy: OursObservationsCfg = OursObservationsCfg()
 
 
 @configclass

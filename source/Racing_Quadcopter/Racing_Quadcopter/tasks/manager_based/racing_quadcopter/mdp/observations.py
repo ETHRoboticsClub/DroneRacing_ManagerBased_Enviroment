@@ -11,15 +11,19 @@ All gate-related math lives in this module. The env only exposes state
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import *
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
 # Divide world-frame gate offsets (metres) by this before feeding to the network.
 # Keeps inputs in roughly [-1, 1] for gates up to ~10 m away.
 _REL_POSITION_SCALE: float = 10.0
+_REL_VELOCITY_SCALE: float = 4.0 
+_REL_ATTITUDE_SCALE: float = math.pi  # radians → roughly [-1, 1] for ``φ, θ, ψ``
 
 def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Next-K gates observation: body-frame rel-position + forward + half-width per gate.
@@ -73,6 +77,112 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     gate_obs = torch.cat([offset_b_scaled, forward_b, half_eff], dim=-1)  # [N, K, 7]
     gate_obs = gate_obs.reshape(n, k * 7)
     return gate_obs
+
+
+def mono_race_gate_position_velocity_gate_frame(env: ManagerBasedRLEnv) -> torch.Tensor:
+
+    k = env.cfg.observation.mono_race_num_next_gates
+    n = env.num_envs
+
+    drone_pos_w = env._robot.data.root_pos_w  # [N, 3]
+
+    # Make sure step indices match k
+    gate_step_indices = torch.arange(
+        k, device=env.device
+    ).unsqueeze(0)  # [1, K]
+
+    # [N, K]
+    gate_idx_raw = env._current_gate_idx.unsqueeze(1) + gate_step_indices
+    gate_counts = env._gate_counts.unsqueeze(1)  # [N, 1]
+
+    safe_counts = gate_counts.clone()
+    safe_counts[safe_counts == 0] = 1
+
+    gate_idx = gate_idx_raw % safe_counts  # [N, K]
+
+    # Gather gate poses
+    idx3 = gate_idx.unsqueeze(-1).expand(-1, -1, 3)
+    idx4 = gate_idx.unsqueeze(-1).expand(-1, -1, 4)
+
+    g_pos_w = torch.gather(env._gate_positions, 1, idx3)       # [N, K, 3]
+    g_ori_w = torch.gather(env._gate_orientations, 1, idx4)    # [N, K, 4]
+
+    # Relative position in gate frame
+    offset_w = g_pos_w - drone_pos_w.unsqueeze(1)              # [N, K, 3]
+
+    pos_g = quat_apply_inverse(
+        g_ori_w.reshape(-1, 4),
+        offset_w.reshape(-1, 3),
+    ).reshape(n, k, 3) / _REL_POSITION_SCALE
+
+    # Velocity in gate frame
+    drone_lin_vel_w = env._robot.data.root_lin_vel_w           # [N, 3]
+
+    vel_w = drone_lin_vel_w.unsqueeze(1).expand(-1, k, -1)
+
+    vel_g = quat_apply_inverse(
+        g_ori_w.reshape(-1, 4),
+        vel_w.reshape(-1, 3),
+    ).reshape(n, k, 3) / _REL_VELOCITY_SCALE
+
+    # Final observation
+    gate_obs = torch.cat([pos_g, vel_g], dim=-1)               # [N, K, 6]
+
+    return gate_obs.reshape(n, k * 6)
+
+def mono_race_future_gates_pose_in_current_gate_frame(
+    env: ManagerBasedRLEnv) -> torch.Tensor:
+    """For each of the next ``k`` gates: offset from current gate centre to that gate's centre in ``G_i``, plus relative yaw (``OBSERVATION_SPACE.md`` §2, rows 62–65).
+    ``k`` from ``num_future_gates`` or ``cfg.observation.mono_race_future_gates_pose_ahead``; returns ``[N, 4·k]`` as ``[xyz, ψ]`` per future gate, scaled."""
+    k_cfg = int(getattr(env.cfg.observation, "mono_race_future_gates_pose_ahead", 2))
+    k = max(1, k_cfg)
+    n = env.num_envs
+    dev = env.device
+    safe_counts = env._gate_counts.clamp(min=1)
+    gi = env._current_gate_idx % safe_counts  # [N]
+
+    offsets = torch.arange(1, k + 1, device=dev, dtype=torch.long).view(1, k).expand(n, -1)
+    gate_idx_future = (gi.unsqueeze(1) + offsets) % safe_counts.unsqueeze(1)
+
+    idx_i3 = gi.view(n, 1, 1).expand(n, 1, 3)
+    idx_i4 = gi.view(n, 1, 1).expand(n, 1, 4)
+    pos_i = torch.gather(env._gate_positions, 1, idx_i3)
+    ori_i = torch.gather(env._gate_orientations, 1, idx_i4)
+
+    idx_f3 = gate_idx_future.unsqueeze(-1).expand(-1, -1, 3)
+    idx_f4 = gate_idx_future.unsqueeze(-1).expand(-1, -1, 4)
+    pos_f = torch.gather(env._gate_positions, 1, idx_f3)
+    ori_f = torch.gather(env._gate_orientations, 1, idx_f4)
+
+    delta_w = pos_f - pos_i
+    ori_i_k = ori_i.expand(-1, k, -1)
+    p_gi = quat_apply_inverse(ori_i_k, delta_w) / _REL_POSITION_SCALE
+
+    q_i = ori_i.squeeze(1).unsqueeze(1).expand(-1, k, -1).reshape(n * k, 4)
+    q_f = ori_f.reshape(n * k, 4)
+    q_rel = quat_mul(quat_inv(q_i), q_f)
+    _ , _ , psi = euler_xyz_from_quat(q_rel, wrap_to_2pi=False) #The gates are only rotated around the z axis, so the roll and pitch are always 0.
+    psi_g = psi.view(n, k, 1) / _REL_ATTITUDE_SCALE
+
+
+    block = torch.cat([p_gi, psi_g], dim=-1)
+    return block.reshape(n, 4 * k)
+
+
+def mono_race_gate_orientations(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Body roll, pitch, yaw (ZYX) relative to the active target gate ``G_i`` (``OBSERVATION_SPACE.md`` §2, rows 6–8).
+    Returns ``[N, 3]``, scaled by ``_REL_ATTITUDE_SCALE``."""
+    n = env.num_envs
+    cur = env._current_gate_idx.reshape(n)
+    counts = env._gate_counts.reshape(n).clamp(min=1)
+    gi = (cur % counts).unsqueeze(1)
+    # ``expand(n,1,4)`` on ``[n,1]`` is invalid (dims align from the right); need a true ``[n,1,4]`` index.
+    idx4 = gi.unsqueeze(-1).expand(n, 1, 4)
+    q_g0 = torch.gather(env._gate_orientations, 1, idx4).squeeze(1)
+    q_bw = env._robot.data.root_quat_w
+    q_bg = quat_mul(quat_inv(q_g0), q_bw)
+    phi, theta, psi = euler_xyz_from_quat(q_bg, wrap_to_2pi=False)
+    return torch.stack([phi, theta, psi], dim=-1) / _REL_ATTITUDE_SCALE
 
 
 def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
