@@ -64,6 +64,7 @@ class QuadcopterMomentsAction(ActionTerm):
         masses = self._asset.root_physx_view.get_masses()[0].sum()
         self._gravity_mag = torch.tensor(env.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (masses * self._gravity_mag).item()
+        self._moment_scale = torch.tensor(self.cfg.moment_scale, device=self.device, dtype=torch.float32)
         self.actions_delay_buffer = DelayBuffer(self.cfg.max_delay, env.num_envs, device=self.device)
 
     @property
@@ -134,7 +135,7 @@ class QuadcopterMomentsAction(ActionTerm):
             self._env._actions_buf[:] = self._delayed_actions
         thrust_cmd = (self._delayed_actions[:, 0] + 1.0) * 0.5 # normalize the thrust command to be between 0 and 1
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._delayed_actions[:, 1:]
+        self._moment[:, 0, :] = self._moment_scale * self._delayed_actions[:, 1:]
         self._processed_actions[:] = self._delayed_actions
 
         # [T, τ]^T = B u^{∘2}  →  u^{∘2} = B^{-1} [T, τ]^T,  u = sqrt( clamp(u^{∘2}, 0) )
@@ -161,7 +162,7 @@ class QuadcopterMomentsActionCfg(ActionTermCfg):
     asset_name: str = "robot"
 
     thrust_to_weight: float = 1.9
-    moment_scale: float = 0.01
+    moment_scale: tuple[float, float, float] = (0.01, 0.01, 0.01)  # (roll, pitch, yaw) N·m
     action_dim: int = 4
     min_delay: int = 0
     max_delay: int = 0

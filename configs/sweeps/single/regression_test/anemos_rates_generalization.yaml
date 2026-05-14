@@ -2,19 +2,19 @@
 # This config is used for regression testing
 # Required scores: Lap% >= 98% and Lap Time <= 11s
 
-task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
-task_play:  Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
+task_train: Isaac-Racing-Quadcopter-Manager-v0
+task_play:  Isaac-Racing-Quadcopter-Manager-Play-v0
 
 extra_train_args: ["--headless"]
 extra_play_args:  ["--headless"]
 
 env_vars:
   DRONE_MODEL: "anemos_urdf"
-  ACTION_TYPE: "moments"
+  ACTION_TYPE: "rates"
 
 sweep_mode: sequential
 
-num_envs: 8192
+num_envs: 1024
 
 train_iterations: 834  # 20016 steps
 eval_steps: 3000
@@ -61,13 +61,4 @@ gate_track:
     rotation: [0, 0, 25]
 
 param_grid:
-  curriculum_stage1_steps:
-    - 7500
-  curriculum_stage2_steps:
-    - 10000
-  #observation_noise.enable:
-  #  - false
-  action_noise.enable:
-    - false
-  DIRECT_VELOCITY_TOWARD_GATE:
-    - 2.0
+  episode_length_s: [30.0]

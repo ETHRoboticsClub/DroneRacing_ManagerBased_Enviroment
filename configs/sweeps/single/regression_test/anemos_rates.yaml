@@ -14,7 +14,7 @@ env_vars:
 
 sweep_mode: sequential
 
-num_envs: 8192
+num_envs: 1024
 
 train_iterations: 834  # 20016 steps
 eval_steps: 3000
@@ -61,13 +61,4 @@ gate_track:
     rotation: [0, 0, 25]
 
 param_grid:
-  curriculum_stage1_steps:
-    - 7500
-  curriculum_stage2_steps:
-    - 10000
-  #observation_noise.enable:
-  #  - false
-  action_noise.enable:
-    - false
-  DIRECT_VELOCITY_TOWARD_GATE:
-    - 2.0
+  episode_length_s: [30.0]

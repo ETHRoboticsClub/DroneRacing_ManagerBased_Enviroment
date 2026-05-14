@@ -78,49 +78,8 @@ TASK_PLAY  = "Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0"
 #                                           More negative → agent avoids crashes harder
 #                                           at the risk of being overly conservative.
 #
-# NOTE:
-# This is an intentionally richer example spanning multiple categories.
-# Grid size grows multiplicatively; trim value lists if runs become too expensive.
 PARAM_GRID: dict[str, list] = {
-    # ------------------------------------------------------------------
-    # Curriculum / general task settings
-    # ------------------------------------------------------------------
-    "recovery_spawn_prob": [0.2],
-    "curriculum_stage1_steps": [10000],
-    "curriculum_stage2_steps": [10000],
     "episode_length_s": [30.0],
-
-    # ------------------------------------------------------------------
-    # Dynamics / task-level randomization
-    # ------------------------------------------------------------------
-    "randomize_velocity_limit": [True],
-    "velocity_limit_range": ["(8.0, 15.0)"],
-
-    # ------------------------------------------------------------------
-    # Observation randomization
-    # ------------------------------------------------------------------
-    "observation_noise.enable": [True],
-    "observation_noise.gaussian_std_base_lin_vel": [0.015],
-    "observation_noise.gaussian_std_base_ang_vel": [0.015],
-    "observation_noise.gaussian_std_obs_gates": [0.02],
-    "observation_noise.bias_range_obs_gates": ["(-0.08, 0.08)"],
-    "observation_noise.dropout_prob": [0.0],
-
-    # ------------------------------------------------------------------
-    # Action randomization
-    # ------------------------------------------------------------------
-    "action_noise.enable": [True],
-    "action_noise.gaussian_std": [0.02],
-    "action_noise.bias_range": ["(-0.03, 0.03)"],
-    "action_noise.lpf_alpha": [0.85],
-
-    # ------------------------------------------------------------------
-    # Rewards
-    # ------------------------------------------------------------------
-    "rewards.gate_progress.weight": [20.0],
-    # Convenience shorthand: direct (unscaled) coefficient → converted to
-    # rewards.<term>.weight by multiplying with MANAGER_SCALE.
-    "DIRECT_VELOCITY_TOWARD_GATE": [0.1],
 }
 
 TRAIN_ITERATIONS: int = 417   # --max_iterations passed to train.py (iterations, not timesteps)

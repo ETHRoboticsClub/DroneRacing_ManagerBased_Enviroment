@@ -263,7 +263,65 @@ python scripts/skrl/play.py --task Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 python scripts/rsl_rl/play.py --task Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 ```
 
-## 11) Recommended Next Extensions
+## 11) Enabling Randomization — Quick Reference
+
+All randomization is **off by default**. Each technique is controlled by a top-level flag on `RacingQuadcopterEnvCfg` so it can be toggled via `--override` without editing any file.
+
+### Flags and what they control
+
+| Flag | Default | Controls |
+|---|---|---|
+| `randomize_mass` | `False` | Startup mass scale ±10 % (`randomize_robot_mass` event) |
+| `randomize_com` | `False` | Startup CoM shift ±15 mm per axis (`randomize_base_com` event) |
+| `randomize_actuator_gains` | `False` | Startup stiffness/damping scale ±10 % (`randomize_robot_actuator_gains` event) |
+| `apply_external_disturbances` | `False` | Interval random force/torque + velocity push (`base_external_force_torque`, `push_robot` events) |
+| `observation_noise_enable` | `False` | Per-step Gaussian noise + per-episode bias on all obs terms (sets `PolicyCfg.enable_corruption`) |
+| `action_noise.enable` | `False` | Per-step Gaussian noise, per-episode bias, and LPF lag on actions (`ActionNoiseCfg`) |
+| `recovery_spawn_prob` | `0.0` | Fraction of envs that respawn with fully random attitude and velocity (stage 2+ only) |
+| `randomize_velocity_limit` | `False` | Re-sample per-env speed cap from `velocity_limit_range` each episode |
+
+### Enable full DR stack for a training run
+
+```bash
+python scripts/skrl/train.py \
+    --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
+    --headless \
+    --override randomize_mass=True \
+    --override randomize_com=True \
+    --override randomize_actuator_gains=True \
+    --override apply_external_disturbances=True \
+    --override observation_noise_enable=True \
+    --override action_noise.enable=True \
+    --override recovery_spawn_prob=0.2
+```
+
+### Enable selectively (e.g. obs noise only)
+
+```bash
+python scripts/skrl/train.py \
+    --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
+    --headless \
+    --override observation_noise_enable=True
+```
+
+### Tune action noise parameters
+
+`action_noise.enable=True` uses the values already set in `ActionNoiseCfg`. Override individual knobs if needed:
+
+```bash
+--override action_noise.enable=True \
+--override action_noise.gaussian_std=0.015 \
+--override action_noise.bias_range="(-0.05, 0.05)" \
+--override action_noise.lpf_alpha=0.9
+```
+
+### Note on Play configs
+
+Play configs (`*-Play-v0`) inherit the same defaults (all DR off) and additionally set `eval_mode=True` and `fixed_spawn=True`. No extra flags are needed to run a clean evaluation.
+
+---
+
+## 12) Recommended Next Extensions
 
 If you want to push this further in a conventional way:
 - add correlated IMU noise (random walk + bias drift),

@@ -97,6 +97,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # until the curriculum threshold is met.
         self._crashed_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._collision_termination_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Set by check_gate_passages: drone crossed the current gate from the wrong direction.
+        self._wrong_crossing_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Gate-frame basis vectors on device; reused in every quat_apply call.
         # Gate convention: +Y = forward (passage), +X = right, +Z = up.
