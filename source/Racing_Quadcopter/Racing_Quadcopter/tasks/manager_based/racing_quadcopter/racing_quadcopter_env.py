@@ -488,3 +488,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         if gate_log:
             self.extras["log"].update(gate_log)
+
+        # SKRL only logs scalar tensors from extras["log"]; managers emit floats.
+        if self.extras.get("log"):
+            log_tensors: dict[str, torch.Tensor] = {}
+            for key, value in self.extras["log"].items():
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    log_tensors[key] = value.detach().reshape(()).to(device=self.device, dtype=torch.float32)
+                elif isinstance(value, (float, int, bool)):
+                    log_tensors[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            self.extras["log"] = log_tensors
