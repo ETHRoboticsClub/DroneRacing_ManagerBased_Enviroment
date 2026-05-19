@@ -116,6 +116,15 @@ def penalty_crash(env: ManagerBasedRLEnv) -> torch.Tensor:
     return env._crashed_buf.float()
 
 
+def penalty_wrong_direction(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Binary 1.0 on frames where the drone crossed the current gate from behind. Shape [N].
+
+    Paired with the ``wrong_direction`` termination: provides a sharp local penalty so the
+    gradient does not have to flow through the value function to teach gate orientation.
+    """
+    return env._wrong_crossing_buf.float()
+
+
 def penalty_wrong_side(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Penalise being on the exit side of the gate without having passed it.
 

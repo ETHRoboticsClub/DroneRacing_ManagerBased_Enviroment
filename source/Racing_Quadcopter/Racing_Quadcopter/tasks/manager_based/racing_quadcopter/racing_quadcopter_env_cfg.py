@@ -229,6 +229,9 @@ class RewardWeights:
     ACTION_MAGNITUDE: float = -0.001
     CRASH: float = -50.0
     WRONG_SIDE: float = -0.1
+    
+    # Currently not in use
+    # WRONG_DIRECTION: float = -50.0
 
 
 
@@ -402,9 +405,9 @@ class ObservationsCfg:
 
 
     if OBSERVATION_SPACE == "mono_race":
-        policy: MonoRaceObservationsCfg = MonoRaceObservationsCfg()
+        policy = MonoRaceObservationsCfg()
     else:
-        policy: OursObservationsCfg = OursObservationsCfg()
+        policy = OursObservationsCfg()
 
 
 @configclass
@@ -435,6 +438,10 @@ class RewardsCfg:
     )
     crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
     wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = RewTerm(func=rewards.penalty_wrong_direction, weight=RewardWeights.WRONG_DIRECTION)
 
     # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
 
@@ -507,9 +514,11 @@ class TerminationsCfg:
     below_height = DoneTerm(func=terminations.below_height_threshold, time_out=False)
     runaway = DoneTerm(func=terminations.runaway_velocity, time_out=False)
     collision = DoneTerm(func=terminations.collision_termination, time_out=False)
-    wrong_direction = DoneTerm(func=terminations.wrong_direction_crossing, time_out=False)
     lap_complete = DoneTerm(func=terminations.lap_complete, time_out=True)
-
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = DoneTerm(func=terminations.wrong_direction_crossing, time_out=False)
 
 @configclass
 class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
@@ -517,7 +526,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     seed: int = 42
 
-    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=True)
+    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=False, clone_in_fabric=False)
 
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -543,7 +552,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     eval_mode: bool = False
     crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
     fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
-    recovery_spawn_prob: float = 0.0 # fraction [0,1] of envs that spawn with random orientation + velocity
+    recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
 
     # ── Domain randomization flags ─────────────────────────────────────────────
     # All default to False (no domain randomization). Set True individually to

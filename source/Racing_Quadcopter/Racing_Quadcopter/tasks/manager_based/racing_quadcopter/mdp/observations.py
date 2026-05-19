@@ -28,11 +28,12 @@ _REL_ATTITUDE_SCALE: float = math.pi  # radians → roughly [-1, 1] for ``φ, θ
 def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Next-K gates observation: body-frame rel-position + forward + half-width per gate.
 
-    Gate forward is +Y in gate local frame, mapped to world then to body.
+    Gate forward is +Y in gate local frame, mapped to world then to body. ``forward_b`` is
+    the gate-plane normal expressed in the drone body frame. Gates are square and uniform,
+    so rotation about the normal is geometrically inert — ``(forward, half_width)`` fully
+    specifies the passable aperture under arbitrary SO(3) gate rotations.
     The per-gate half-width is the effective aperture seen by the policy:
     ``half_eff = (gate_size / 2) * (1 - 2 * gate_size_obs_buffer_frac)``.
-    Set ``gate_size_obs_buffer_frac=0`` (default) to report the true aperture.
-    Fully vectorized over environments and lookahead (no Python loop over K).
 
     Returns:
         Concatenated ``[N, K*7]``:
@@ -64,10 +65,10 @@ def compute_next_gates_rel_and_fwd_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     offset_b = quat_apply_inverse(q_drone, offset_w)  # [N, K, 3] body frame
     offset_b_scaled = offset_b / _REL_POSITION_SCALE   # normalise to ~[-1, 1]
 
-    # Gate forward direction: local +Y → world → drone body frame.
+    # Gate forward (+Y) direction: gate local → world → drone body frame.
     y_exp = y_local.view(1, 1, 3).expand(n, k, 3)  # [N, K, 3]
-    forward_w = quat_apply(g_ori_w, y_exp)           # [N, K, 3] world frame
-    forward_b = quat_apply_inverse(q_drone, forward_w)  # [N, K, 3] body frame
+    forward_w = quat_apply(g_ori_w, y_exp)
+    forward_b = quat_apply_inverse(q_drone, forward_w)  # [N, K, 3]
 
     # Effective half-width per gate (broadcast: per-cell sizes are uniform across K).
     buf_frac = float(env.cfg.observation.gate_size_obs_buffer_frac)
@@ -107,8 +108,9 @@ def mono_race_gate_position_velocity_gate_frame(env: ManagerBasedRLEnv) -> torch
     g_pos_w = torch.gather(env._gate_positions, 1, idx3)       # [N, K, 3]
     g_ori_w = torch.gather(env._gate_orientations, 1, idx4)    # [N, K, 4]
 
-    # Relative position in gate frame
-    offset_w = g_pos_w - drone_pos_w.unsqueeze(1)              # [N, K, 3]
+    # Relative position in gate frame: drone − gate (MonoRace convention, see
+    # quad_race_env.py::update_states_gate; matches OBSERVATION_SPACE.md row 0..2).
+    offset_w = drone_pos_w.unsqueeze(1) - g_pos_w              # [N, K, 3]
 
     pos_g = quat_apply_inverse(
         g_ori_w.reshape(-1, 4),
@@ -132,8 +134,9 @@ def mono_race_gate_position_velocity_gate_frame(env: ManagerBasedRLEnv) -> torch
 
 def mono_race_future_gates_pose_in_current_gate_frame(
     env: ManagerBasedRLEnv) -> torch.Tensor:
-    """For each of the next ``k`` gates: offset from current gate centre to that gate's centre in ``G_i``, plus relative yaw (``OBSERVATION_SPACE.md`` §2, rows 62–65).
-    ``k`` from ``num_future_gates`` or ``cfg.observation.mono_race_future_gates_pose_ahead``; returns ``[N, 4·k]`` as ``[xyz, ψ]`` per future gate, scaled."""
+    """For each of the next ``k`` gates: offset from current gate centre to that gate's centre in ``G_i``, plus full relative attitude ``(φ, θ, ψ)``.
+    ``k`` from ``num_future_gates`` or ``cfg.observation.mono_race_future_gates_pose_ahead``; returns ``[N, 6·k]`` as ``[xyz, φ, θ, ψ]`` per future gate, scaled.
+    Roll/pitch are nonzero only for tilted gates loaded from track YAMLs (``fixed_gates.py``); procedural gates remain z-axis only."""
     k_cfg = int(getattr(env.cfg.observation, "mono_race_future_gates_pose_ahead", 2))
     k = max(1, k_cfg)
     n = env.num_envs
@@ -161,12 +164,11 @@ def mono_race_future_gates_pose_in_current_gate_frame(
     q_i = ori_i.squeeze(1).unsqueeze(1).expand(-1, k, -1).reshape(n * k, 4)
     q_f = ori_f.reshape(n * k, 4)
     q_rel = quat_mul(quat_inv(q_i), q_f)
-    _ , _ , psi = euler_xyz_from_quat(q_rel, wrap_to_2pi=False) #The gates are only rotated around the z axis, so the roll and pitch are always 0.
-    psi_g = psi.view(n, k, 1) / _REL_ATTITUDE_SCALE
+    phi, theta, psi = euler_xyz_from_quat(q_rel, wrap_to_2pi=False)
+    rpy_g = torch.stack([phi, theta, psi], dim=-1).view(n, k, 3) / _REL_ATTITUDE_SCALE
 
-
-    block = torch.cat([p_gi, psi_g], dim=-1)
-    return block.reshape(n, 4 * k)
+    block = torch.cat([p_gi, rpy_g], dim=-1)
+    return block.reshape(n, 6 * k)
 
 
 def mono_race_gate_orientations(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -198,6 +200,6 @@ def motor_speeds_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Commanded rotor speeds ``[N, 4]`` (rad/s), scaled by ``cfg.motor_omega_max_rad_s``.
 
     """
-    omega_max = float(getattr(env.cfg, "motor_omega_max_rad_s", 1000.0))
+    omega_max = float(getattr(env.cfg, "motor_omega_max_rad_s"))
     scale = max(omega_max, 1e-6)
     return env._motor_speeds / scale
