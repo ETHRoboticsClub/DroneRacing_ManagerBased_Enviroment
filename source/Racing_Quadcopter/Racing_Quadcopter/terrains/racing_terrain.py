@@ -68,10 +68,10 @@ def create_racing_gates_terrain(seed: int = 42) -> TerrainGeneratorCfg:
                 seed=seed,              # Overwritten to seed=42 by TerrainGenerator anyway
                 trajectory_type="random",  # randomly picks spline or chicane per cell
                 num_waypoints=200,      # finer resolution for tighter curves
-                # Spacing 1.0–7 m → avg 4.0 m → ~10–16 gates per circuit.
-                gate_spacing_range=(1.0, 7.0),
-                # Size 0.45–0.8 m: difficulty=0.7 → ~0.69 m (large), 1.0 → 0.45 m (tight).
-                gate_size_range=(0.45, 0.8),
+                # Spacing 3.0–7 m → avg 5.0 m → ~10–16 gates per circuit.
+                gate_spacing_range=(3.0, 7.0),
+                # Size 0.8–2.0 m: difficulty=0.7 → ~1.5 m (large), 1.0 → 0.8 m (tight).
+                gate_size_range=(0.8, 2.0),
                 # 0.7–4.5 m: meaningful height variation with dramatic climbs at high difficulty.
                 gate_height_range=(0.7, 4.5),
                 bar_thickness=0.05,

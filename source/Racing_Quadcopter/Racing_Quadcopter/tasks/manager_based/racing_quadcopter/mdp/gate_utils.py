@@ -61,18 +61,25 @@ def gate_up(env: ManagerBasedRLEnv, gate_ori: torch.Tensor) -> torch.Tensor:
 # Gate passage detection
 # ---------------------------------------------------------------------------
 
-def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torch.Tensor:
+def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Detect line-crossing through the current gate plane and update gate indices.
 
     Uses the signed distance from the gate plane: a passage is registered when the
     drone transitions from the approach side (dist <= 0) to the exit side (dist > 0)
     AND the interpolated crossing point lies within the gate aperture (square test).
 
+    Also detects wrong-direction crossings: drone enters from the exit side (dist > 0)
+    through the aperture — the gate was crossed backwards.
+
     Returns:
-        Float [N] tensor: 1.0 where a valid passage occurred this step, else 0.0.
+        passed_float: Float [N] tensor: 1.0 where a valid passage occurred this step.
+        wrong_cross:  Bool  [N] tensor: True where a wrong-direction crossing occurred.
     """
     gate_pos = env._curr_gate_pos
     fwd = env._curr_gate_forward
+    right = env._curr_gate_right
+    up = env._curr_gate_up
+    half = env._gate_sizes / 2.0  # [N]
 
     # Signed distance along gate forward axis: negative = approach side, positive = exit.
     to_prev = env._prev_drone_pos - gate_pos  # [N, 3]
@@ -80,39 +87,34 @@ def check_gate_passages(env: ManagerBasedRLEnv, drone_pos: torch.Tensor) -> torc
     dist_prev = (to_prev * fwd).sum(dim=1)  # [N]
     dist_curr = (to_curr * fwd).sum(dim=1)  # [N]
 
-    # Plane crossing: was behind, now in front.
-    crossed = (dist_prev <= 0) & (dist_curr > 0)
+    def _aperture_check(t: torch.Tensor) -> torch.Tensor:
+        crossing = env._prev_drone_pos + t.unsqueeze(-1) * (drone_pos - env._prev_drone_pos)
+        to_cross = crossing - gate_pos
+        lat  = (to_cross * right).sum(dim=1).abs()
+        vert = (to_cross * up).sum(dim=1).abs()
+        return (lat < half) & (vert < half)
 
-    # Interpolate to find the exact point where the trajectory crossed the gate plane.
-    # t=0 → previous position, t=1 → current position.
-    t = (-dist_prev / (dist_curr - dist_prev + 1e-8)).clamp(0.0, 1.0)
-    crossing = env._prev_drone_pos + t.unsqueeze(-1) * (drone_pos - env._prev_drone_pos)
-    to_cross = crossing - gate_pos  # offset from gate centre at crossing point
-
-    right = env._curr_gate_right
-    up = env._curr_gate_up
-    lat  = (to_cross * right).sum(dim=1).abs()  # lateral offset at crossing [N]
-    vert = (to_cross * up).sum(dim=1).abs()     # vertical offset at crossing [N]
-
-    # Aperture check: crossing must be within the square gate opening (per-env size).
-    half = env._gate_sizes / 2.0  # [N]
-    within = (lat < half) & (vert < half)
-
-    passed = crossed & within  # [N] bool
+    # --- Correct-direction crossing: approach side → exit side ---
+    correct_crossed = (dist_prev <= 0) & (dist_curr > 0)
+    t_correct = (-dist_prev / (dist_curr - dist_prev + 1e-8)).clamp(0.0, 1.0)
+    passed = correct_crossed & _aperture_check(t_correct)
 
     if passed.any():
         env._gates_passed[passed] += 1
-        # Advance per-env gate index using the actual per-env gate counts.
         counts = env._gate_counts[passed]
         new_idx = env._current_gate_idx[passed] + 1
-        # Safe modulo: avoid division by zero for any stray zero-count envs.
         mask_nz = counts > 0
         res = torch.zeros_like(new_idx)
         if mask_nz.any():
             res[mask_nz] = new_idx[mask_nz] % counts[mask_nz]
         env._current_gate_idx[passed] = res
 
-    return passed.float()
+    # --- Wrong-direction crossing: exit side → approach side (backwards through aperture) ---
+    wrong_crossed = (dist_prev > 0) & (dist_curr <= 0)
+    t_wrong = (dist_prev / (dist_prev - dist_curr + 1e-8)).clamp(0.0, 1.0)
+    wrong_cross = wrong_crossed & _aperture_check(t_wrong)
+
+    return passed.float(), wrong_cross
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +205,7 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
     speed = torch.norm(drone_vel, dim=1)  # [N] m/s
 
     # Detect gate crossings and update _current_gate_idx / _gates_passed.
-    env._gate_passed_buf = check_gate_passages(env, drone_pos)
+    env._gate_passed_buf, env._wrong_crossing_buf = check_gate_passages(env, drone_pos)
     _refresh_current_gate_cache()
     passed_mask = env._gate_passed_buf > 0.5
     if passed_mask.any():

@@ -22,7 +22,13 @@ if TYPE_CHECKING:
 
 
 def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.ndarray:
-    """Invertible X-frame mixer :math:`[T,\\tau]^\\top = B\\mathbf u^{\\circ 2}`; returns ``B^{-1}`` ``(4,4)`` float64.
+    """Invertible X-frame mixer B matrix
+    
+    x: front, y: left, z: up
+    M1: (+l, +l) CCW
+    M2: (+l, -l) CW
+    M3: (-l, +l) CW
+    M4: (-l, -l) CCW
 
     Parameters ``k_t``, ``k_d``, ``arm_length_m`` match ``DroneProfile`` / env cfg.
     Rows are thrust, roll moment, pitch moment, yaw drag torque (see project notes / ``docs/drone.pdf``).
@@ -31,12 +37,13 @@ def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.nd
     b = np.array(
         [
             [k_t, k_t, k_t, k_t],
-            [-ktl, ktl, -ktl, ktl],
-            [ktl, ktl, -ktl, -ktl],
+            [ktl, -ktl, ktl, -ktl],
+            [-ktl, -ktl, ktl, ktl],
             [k_d, -k_d, -k_d, k_d],
         ],
         dtype=np.float64,
     )
+    #
     return np.linalg.inv(b)
 
 
@@ -57,6 +64,7 @@ class QuadcopterMomentsAction(ActionTerm):
         masses = self._asset.root_physx_view.get_masses()[0].sum()
         self._gravity_mag = torch.tensor(env.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (masses * self._gravity_mag).item()
+        self._moment_scale = torch.tensor(self.cfg.moment_scale, device=self.device, dtype=torch.float32)
         self.actions_delay_buffer = DelayBuffer(self.cfg.max_delay, env.num_envs, device=self.device)
 
     @property
@@ -127,7 +135,7 @@ class QuadcopterMomentsAction(ActionTerm):
             self._env._actions_buf[:] = self._delayed_actions
         thrust_cmd = (self._delayed_actions[:, 0] + 1.0) * 0.5 # normalize the thrust command to be between 0 and 1
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._delayed_actions[:, 1:]
+        self._moment[:, 0, :] = self._moment_scale * self._delayed_actions[:, 1:]
         self._processed_actions[:] = self._delayed_actions
 
         # [T, τ]^T = B u^{∘2}  →  u^{∘2} = B^{-1} [T, τ]^T,  u = sqrt( clamp(u^{∘2}, 0) )
@@ -154,7 +162,7 @@ class QuadcopterMomentsActionCfg(ActionTermCfg):
     asset_name: str = "robot"
 
     thrust_to_weight: float = 1.9
-    moment_scale: float = 0.01
+    moment_scale: tuple[float, float, float] = (0.01, 0.01, 0.01)  # (roll, pitch, yaw) N·m
     action_dim: int = 4
     min_delay: int = 0
     max_delay: int = 0
@@ -180,6 +188,7 @@ class QuadcopterRatesAction(ActionTerm):
         super().__init__(cfg, env)
         self._raw_actions = torch.zeros(env.num_envs, self.cfg.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
+        self._delayed_actions = torch.zeros_like(self._raw_actions)
         self._thrust = torch.zeros(env.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(env.num_envs, 1, 3, device=self.device)
         self._omega_prev = torch.zeros(env.num_envs, 3, device=self.device)
@@ -206,6 +215,7 @@ class QuadcopterRatesAction(ActionTerm):
         self._kd_rand = torch.ones(n, 3, device=self.device, dtype=torch.float32)
         self._kf_rand = torch.ones(n, 3, device=self.device, dtype=torch.float32)
         self._resample_pid_gain_randomization(None)
+        self.actions_delay_buffer = DelayBuffer(self.cfg.max_delay, env.num_envs, device=self.device)
 
     def _resample_pid_gain_randomization(self, env_ids: Sequence[int] | None) -> None:
         """Uniform multipliers in ``[1-f, 1+f]`` per env × axis for each PIDF term (``f`` from cfg)."""
@@ -248,27 +258,64 @@ class QuadcopterRatesAction(ActionTerm):
             self._rate_integral[eids] = 0.0
             self._rate_pid_hold_derivative[eids] = True
 
+        if env_ids is None or env_ids == slice(None):
+            num_envs = self._env.num_envs
+        else:
+            num_envs = len(env_ids)
+        if self.cfg.max_delay > 0:
+            time_lags = torch.randint(
+                low=self.cfg.min_delay,
+                high=self.cfg.max_delay + 1,
+                size=(num_envs,),
+                dtype=torch.int,
+                device=self.device,
+            )
+            self.actions_delay_buffer.set_time_lag(time_lags, env_ids)
+        else:
+            self.actions_delay_buffer.set_time_lag(0, env_ids)
+
+        self.actions_delay_buffer.reset(env_ids)
+
         self._resample_pid_gain_randomization(env_ids)
 
     def process_actions(self, actions: torch.Tensor):
-        # Save previous applied action for smoothness penalty before overwriting.
+        # Save previous applied (delayed) action for smoothness penalty before overwriting.
         if hasattr(self._env, "_prev_actions"):
             if hasattr(self._env, "_actions_buf"):
                 self._env._prev_actions[:] = self._env._actions_buf
             else:
                 self._env._prev_actions[:] = self._raw_actions
 
+        prev_cmd = self._raw_actions.clone()
         cmd = actions.clamp(-1.0, 1.0)
+
+        noise_cfg = getattr(self._env.cfg, "action_noise", None)
+        if noise_cfg is not None and getattr(noise_cfg, "enable", False):
+            std = float(getattr(noise_cfg, "gaussian_std", 0.0))
+            if std > 0.0:
+                cmd = cmd + torch.randn_like(cmd, device=self.device) * std
+
+            if getattr(noise_cfg, "per_episode_bias", False) and hasattr(self._env, "_action_noise_bias"):
+                cmd = cmd + self._env._action_noise_bias
+
+            alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
+            if alpha < 1.0:
+                cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
+
+            if getattr(noise_cfg, "clip_actions", True):
+                cmd = cmd.clamp(-1.0, 1.0)
+
         self._raw_actions[:] = cmd
+        self._delayed_actions[:] = self.actions_delay_buffer.compute(self._raw_actions)
 
         if hasattr(self._env, "_actions_buf"):
-            self._env._actions_buf[:] = cmd
+            self._env._actions_buf[:] = self._delayed_actions
 
-        thrust_cmd = (cmd[:, 0] + 1.0) * 0.5
+        thrust_cmd = (self._delayed_actions[:, 0] + 1.0) * 0.5
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
 
         omega_meas = self._asset.data.root_ang_vel_b
-        omega_des = cmd[:, 1:] * self.cfg.rate_command_scale
+        omega_des = self._delayed_actions[:, 1:] * self.cfg.rate_command_scale
         err = omega_des - omega_meas
 
         dt = self._env.cfg.sim.dt
@@ -299,7 +346,7 @@ class QuadcopterRatesAction(ActionTerm):
             tau = tau.clamp(-tlim, tlim)
 
         self._moment[:, 0, :] = tau
-        self._processed_actions[:] = cmd
+        self._processed_actions[:] = self._delayed_actions
 
         if hasattr(self._env, "_mixer_b_inv") and hasattr(self._env, "_motor_speeds"):
             T_col = self._thrust[:, 0, 2]
@@ -331,6 +378,8 @@ class QuadcopterRatesActionCfg(ActionTermCfg):
 
     thrust_to_weight: float = 1.9
     action_dim: int = 4
+    min_delay: int = 0
+    max_delay: int = 0
     body_name: str = "body"  # base_link for anemos (gets overridden by env cfg)
 
     #: Maps normalized rate sticks ``[-1, 1]`` to desired body angular rates [rad/s].

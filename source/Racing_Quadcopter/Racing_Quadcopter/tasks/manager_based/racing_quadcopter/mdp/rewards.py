@@ -18,6 +18,8 @@ See module-level ``WEIGHT_*`` constants for use in :class:`RewardsCfg`.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
@@ -58,24 +60,6 @@ def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
     centering_value = torch.exp(-3.0 * env._curr_dist_to_gate_lateral / gate_size)   # falls off with lateral offset
     proximity_factor = torch.exp(-0.5 * env._curr_dist_to_gate_forward.abs())         # falls off with distance to plane
     return centering_value * proximity_factor * env._on_approach_gate_side.float()
-
-
-def penalty_perception(env: ManagerBasedRLEnv, theta_threshold: float = torch.pi / 3.0) -> torch.Tensor:
-    """Penalty when next gate leaves the forward camera cone.
-
-    p_perc = lambda_perc * theta_cam if theta_cam > theta_threshold else 0
-    """
-    drone_quat = env._robot.data.root_quat_w
-
-    # Drone +Y is forward (Crazyflie body convention).
-    drone_forward = quat_apply(drone_quat, env._y_local.expand(env.num_envs, -1))
-    drone_forward_norm = drone_forward / (torch.norm(drone_forward, dim=1, keepdim=True) + 1e-8)
-
-    cos_theta = torch.sum(drone_forward_norm * env._curr_dist_to_gate_vector_normalized, dim=1).clamp(-1.0, 1.0)
-    theta_cam = torch.acos(cos_theta)  # angle between drone forward and gate direction [N]
-
-    penalty = theta_cam * env._on_approach_gate_side.float()
-    return torch.where(theta_cam > theta_threshold, penalty, torch.zeros_like(theta_cam))
 
 
 def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -139,3 +123,55 @@ def penalty_wrong_side(env: ManagerBasedRLEnv) -> torch.Tensor:
     penalty on the step the drone legitimately crosses through.
     """
     return (~env._on_approach_gate_side).float() * (1.0 - env._gate_passed_buf)
+
+
+####################
+# MONORACE REWARDS #
+####################
+
+
+def penalty_perception(
+    env: ManagerBasedRLEnv, theta_threshold: float = math.pi / 6.0
+) -> torch.Tensor:
+    """The perception penalty encourages the drone to keep the next gate within the forward-facing
+       camera's view:
+    """
+    gate_pos = env._curr_gate_pos  # [N, 3]
+    kp_idx: int = env._camera_keypoint_body_idx
+    root_quat = env._robot.data.root_quat_w
+
+    anchor_pos = env._robot.data.body_pos_w[:, kp_idx]
+    cam_axis = env._x_local.expand(env.num_envs, -1)
+    cam_quat = root_quat
+
+    to_gate = gate_pos - anchor_pos
+    dist = torch.norm(to_gate, dim=1)
+    to_gate_norm = to_gate / (dist.unsqueeze(-1) + 1e-8)
+
+    cam_forward = quat_apply(cam_quat, cam_axis)
+    cam_forward_norm = cam_forward / (torch.norm(cam_forward, dim=1, keepdim=True) + 1e-8)
+
+    cos_theta = torch.sum(cam_forward_norm * to_gate_norm, dim=1).clamp(-1.0, 1.0)
+    theta = torch.acos(cos_theta)
+
+    active = env._on_approach_gate_side & (dist > 0.1)
+    penalty = theta * active.float()
+    return torch.where(theta > theta_threshold, penalty, torch.zeros_like(theta))
+
+def penalty_action_rate_thresh(
+    env: ManagerBasedRLEnv, delta_omega_norm_thresh: float = 0.05
+) -> torch.Tensor:
+    """Penalise large per-step motor speed jumps (|Δω|/ω_max minus a threshold, summed over rotors)."""
+    omega_max = env.cfg.motor_omega_max_rad_s
+    diff = (env._motor_speeds - env._prev_motor_speeds).abs() / omega_max
+    return (diff - delta_omega_norm_thresh).clamp(min=0.0).sum(dim=1)
+
+
+def penalty_low_action(env: ManagerBasedRLEnv, low_floor_norm: float = 0.5) -> torch.Tensor:
+    """This penalty was introduced after observing that an early policy exhibited highly aggressive bang–
+        bang control, switching almost exclusively between minimum and maximum motor commands,
+        which led to motor overheating. The low action penalty discourages low actions:"""
+    omega_max = env.cfg.motor_omega_max_rad_s
+    w = env._motor_speeds / omega_max
+    return (low_floor_norm - w).clamp(min=0.0).sum(dim=1)
+

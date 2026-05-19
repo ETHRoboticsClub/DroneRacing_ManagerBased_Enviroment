@@ -182,6 +182,25 @@
       </geometry>
     </collision>
   </link>
+  <!--
+    camera_keypoint: marker frame vs base_link — translation only [85.196, 1.872, 67.774] mm,
+    same orientation as base_link (rpy=0). Isaac: find_bodies("camera_keypoint").
+    Tiny sphere visual required so URDF→USD converter resolves /visuals/camera_keypoint
+    in anemos_physics.usd (without it the anemos_base.usd reference is dangling).
+  -->
+  <link name="camera_keypoint">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <sphere radius="0.001"/>
+      </geometry>
+    </visual>
+  </link>
   <joint name="Revolute_15" type="continuous">
     <origin rpy="0 0 0" xyz="0.088628 -0.068017 0.040514"/>
     <parent link="base_link"/>
@@ -205,5 +224,10 @@
     <parent link="base_link"/>
     <child link="BR_5_inch_CW_prop_1_1_1"/>
     <axis xyz="0.0 -0.0 1.0"/>
+  </joint>
+  <joint name="camera_keypoint_fixed" type="fixed">
+      <origin rpy="0 -0.523599 0" xyz="0.085196 0.001872 0.067774"/>
+      <parent link="base_link"/>
+      <child link="camera_keypoint"/>
   </joint>
 </robot>

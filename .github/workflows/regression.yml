@@ -1,16 +1,20 @@
 ###############################################################################
-# Submits a regression sweep to AWS Batch on every push to main, waits for it
-# to finish, downloads the results CSV, and fails the workflow if a chosen
-# metric falls below (or above) a baseline.
+# Submits regression sweeps to AWS Batch on every push to main, waits for
+# them to finish, downloads the results CSVs, and fails the workflow if a
+# chosen metric falls below (or above) a baseline.
+#
+# Four configs are tested in parallel via a matrix:
+#   - crazyflie_moments  (regression_test_crazyflie_moments.yaml, lap_pct >= 98 %)
+#   - crazyflie_rates    (regression_test_crazyflie_rates.yaml,   lap_pct >= 98 %)
+#   - anemos_moments     (regression_test_anemos_moments.yaml,    lap_pct >= 96 %)
+#   - anemos_rates       (regression_test_anemos_rates.yaml,      lap_pct >= 96 %)
 #
 # Prerequisites (one-time):
 #   1. terraform apply (creates the OIDC provider + role)
 #   2. Set repo variable AERO_AWS_ROLE_ARN to terraform output github_actions_role_arn
 #         Settings -> Secrets and variables -> Actions -> Variables -> New
-#   3. Add a sweep config at REGRESSION_SWEEP_PATH below (kept in git, so it
-#      versions with the rest of the codebase)
 #
-# What it does:
+# What it does (per matrix entry):
 #   - Uploads the regression sweep yaml to a per-commit S3 key
 #   - Invokes the dispatcher Lambda with training_ref = the commit SHA
 #   - Polls Batch until the job finishes (or times out)
@@ -21,7 +25,7 @@
 #   - Fails the workflow if the check doesn't pass
 #
 # To run a one-off (different ref, same workflow): use the "Run workflow"
-# button in the Actions tab to trigger workflow_dispatch with overrides.
+# button in the Actions tab to trigger workflow_dispatch with a ref override.
 ###############################################################################
 name: Regression sweep on commit
 
@@ -34,10 +38,6 @@ on:
         description: "Branch/SHA of training repo to clone (default: this commit's SHA)"
         required: false
         default: ""
-      sweep_path:
-        description: "Path to sweep yaml in this repo"
-        required: false
-        default: "configs/sweeps/single/regression_test.yaml"
 
 permissions:
   id-token: write   # required for OIDC
@@ -49,20 +49,40 @@ env:
   S3_PREFIX: droneracing/isaac-rl-runs/sweeps
   LAMBDA_NAME: aero-batch-dispatcher
   JOB_DEFINITION: aero-batch-isaaclab
-  REGRESSION_SWEEP_PATH: configs/sweeps/single/regression_test.yaml
 
-  # Regression check parameters
-  BASELINE_METRIC: lap_pct           # column name in results CSV
-  BASELINE_VALUE: "98.0"             # threshold (string; parsed as float)
-  BASELINE_DIRECTION: higher         # "higher" => pass when value >= threshold
-                                     # "lower"  => pass when value <= threshold
-  BASELINE_AGGREGATION: max          # mean | min | max
-                                     # how to reduce multi-row sweeps to one number
+  # Regression check parameters (shared across all matrix entries)
+  BASELINE_METRIC: lap_pct       # column name in results CSV
+  BASELINE_DIRECTION: higher     # "higher" => pass when value >= threshold
+                                 # "lower"  => pass when value <= threshold
+  BASELINE_AGGREGATION: max      # mean | min | max
 
 jobs:
   regression-test:
     runs-on: self-hosted
-    timeout-minutes: 60
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false   # run all configs even if one fails
+      matrix:
+        include:
+          - drone: crazyflie_moments
+            sweep_path: configs/sweeps/single/regression_test/crazyflie_moments.yaml
+            baseline_value: "98.0"
+          - drone: crazyflie_rates
+            sweep_path: configs/sweeps/single/regression_test/crazyflie_rates.yaml
+            baseline_value: "98.0"
+          - drone: anemos_moments
+            sweep_path: configs/sweeps/single/regression_test/anemos_moments.yaml
+            baseline_value: "96.0"
+          - drone: anemos_rates
+            sweep_path: configs/sweeps/single/regression_test/anemos_rates.yaml
+            baseline_value: "96.0"
+          - drone: anemos_rates_generalization
+            sweep_path: configs/sweeps/single/regression_test/anemos_rates_generalization.yaml
+            baseline_value: "94.0"
+
+    name: regression-test (${{ matrix.drone }})
+
     steps:
       - uses: actions/checkout@v4
 
@@ -77,13 +97,13 @@ jobs:
         run: |
           set -eu
 
-          SWEEP_PATH="${{ github.event.inputs.sweep_path || env.REGRESSION_SWEEP_PATH }}"
+          SWEEP_PATH="${{ matrix.sweep_path }}"
           [ -f "$SWEEP_PATH" ] || { echo "ERR: $SWEEP_PATH does not exist"; exit 1; }
 
           REF="${{ github.event.inputs.training_ref }}"
           [ -n "$REF" ] || REF="$GITHUB_SHA"
 
-          RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::6}"
+          RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::6}-${{ matrix.drone }}"
           S3_URI="s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/inputs/github-actions/$RUN_ID/sweep.yaml"
 
           aws s3 cp "$SWEEP_PATH" "$S3_URI"
@@ -117,7 +137,7 @@ jobs:
 
           JOB_ID=$(jq -r '.jobId' response.json)
           RUN_ID=$(jq -r '.runId' response.json)
-          echo "::notice title=Batch job submitted::run_id=$RUN_ID job_id=$JOB_ID"
+          echo "::notice title=Batch job submitted::drone=${{ matrix.drone }} run_id=$RUN_ID job_id=$JOB_ID"
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
@@ -152,7 +172,16 @@ jobs:
           echo "Downloaded:"
           ls -la ./results/
 
+      - name: Abort AWS Batch job on cancellation
+        if: cancelled() && steps.submit.outputs.job_id != ''
+        run: |
+          aws batch terminate-job \
+            --job-id "${{ steps.submit.outputs.job_id }}" \
+            --reason "GitHub Actions workflow cancelled"
+
       - name: Compare metric to baseline
+        env:
+          BASELINE_VALUE: ${{ matrix.baseline_value }}
         run: |
           set -eu
           python3 <<'PY'

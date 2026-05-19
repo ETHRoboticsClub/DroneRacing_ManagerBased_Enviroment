@@ -97,6 +97,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # until the curriculum threshold is met.
         self._crashed_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._collision_termination_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Set by check_gate_passages: drone crossed the current gate from the wrong direction.
+        self._wrong_crossing_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Gate-frame basis vectors on device; reused in every quat_apply call.
         # Gate convention: +Y = forward (passage), +X = right, +Z = up.
@@ -108,6 +110,31 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             device=self.device,
             dtype=torch.long,
         ).unsqueeze(0).expand(self.num_envs, -1)
+
+        # ``camera_keypoint`` link (URDF) — preferred frame for perception reward; else base (body/base_link/``base``).
+        try:
+            _cam_ids, _ = self._robot.find_bodies("camera_keypoint")
+        except ValueError:
+            try:
+                _cam_ids, _ = self._robot.find_bodies("body|base_link|^base$")
+            except ValueError as err:
+                raise RuntimeError(
+                    "Perception reward needs a `camera_keypoint` body or a single base link matching "
+                    "`body`, `base_link`, or `base`. "
+                    f"Available bodies: {self._robot.body_names}"
+                ) from err
+        if isinstance(_cam_ids, torch.Tensor):
+            _n = int(_cam_ids.numel())
+        else:
+            _n = len(_cam_ids)
+        if _n != 1:
+            raise RuntimeError(
+                "Perception reward requires exactly one `camera_keypoint` body, or exactly one base link "
+                f"(body/base_link/base). Matched {_n} bodies. Check the robot URDF/USD."
+            )
+        self._camera_keypoint_body_idx: int = (
+            int(_cam_ids[0].item()) if isinstance(_cam_ids, torch.Tensor) else int(_cam_ids[0])
+        )
 
         # All body IDs monitored for contact; ".*" captures every link.
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*")
@@ -461,3 +488,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         if gate_log:
             self.extras["log"].update(gate_log)
+
+        # SKRL only logs scalar tensors from extras["log"]; managers emit floats.
+        if self.extras.get("log"):
+            log_tensors: dict[str, torch.Tensor] = {}
+            for key, value in self.extras["log"].items():
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    log_tensors[key] = value.detach().reshape(()).to(device=self.device, dtype=torch.float32)
+                elif isinstance(value, (float, int, bool)):
+                    log_tensors[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            self.extras["log"] = log_tensors
