@@ -48,6 +48,12 @@ class SkillTerrainCfg:
     track_yaml: str = _os.path.join(_SKILL_TRACKS_DIR, "default_difficult.yaml")
     spawn_upside_down: bool = False
     spawn_recovery: bool = False
+    obs_delay_steps: int = 0
+    """Number of simulation steps to delay the policy observation (0 = no delay).
+
+    Simulates sensor/communication latency: the policy receives the observation
+    that was computed ``obs_delay_steps`` steps ago instead of the current one.
+    """
 
 
 @configclass
@@ -59,10 +65,11 @@ class RacingQuadcopterSkillEvalEnvCfg(RacingQuadcopterEnvCfg):
     and each entry's fields control both which track to build and how to spawn
     drones when they reset.
 
-    The default configuration has three terrains:
+    The default configuration has four terrains:
       - Terrain 0: upside-down challenge — drones spawn inverted.
       - Terrain 1: default difficult run — normal deterministic spawn.
       - Terrain 2: recovery challenge — drones spawn with random attitude/velocity.
+      - Terrain 3: sensor delay — policy receives observations delayed by 5 steps (~50 ms).
     """
 
     skill_terrains: list = [
@@ -77,6 +84,10 @@ class RacingQuadcopterSkillEvalEnvCfg(RacingQuadcopterEnvCfg):
         SkillTerrainCfg(
             track_yaml=_os.path.join(_SKILL_TRACKS_DIR, "recovery_challenge.yaml"),
             spawn_recovery=True,
+        ),
+        SkillTerrainCfg(
+            track_yaml=_os.path.join(_SKILL_TRACKS_DIR, "sensor_delay_challenge.yaml"),
+            obs_delay_steps=5,
         ),
     ]
 

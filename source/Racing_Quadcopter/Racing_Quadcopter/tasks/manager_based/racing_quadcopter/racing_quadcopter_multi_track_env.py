@@ -105,6 +105,10 @@ class RacingQuadcopterSkillEvalRLEnv(RacingQuadcopterMultiTrackRLEnv):
         gives per-terrain metrics a tensorboard sink even when the agent runner
         was started with ``log_dir=None`` (the rsl_rl play path), where
         ``extras["log"]`` is otherwise discarded.
+      - Optionally delaying the policy observation by a configurable number of
+        simulation steps (per terrain, via ``SkillTerrainCfg.obs_delay_steps``).
+        The delay is applied after the second obs pass in ``step()`` so the policy
+        receives a stale snapshot, simulating sensor/communication latency.
     """
 
     _tb_writer = None
@@ -126,6 +130,7 @@ class RacingQuadcopterSkillEvalRLEnv(RacingQuadcopterMultiTrackRLEnv):
         # Open the tensorboard writer after managers are built so cfg.log_dir
         # (set by play.py) is available and any cfg-driven manager state is in place.
         self._setup_skill_eval_tb_writer()
+        self._init_obs_delay_state()
 
     def _setup_skill_eval_tb_writer(self) -> None:
         """Open a SummaryWriter for skill-eval metrics and announce the path."""
@@ -166,6 +171,62 @@ class RacingQuadcopterSkillEvalRLEnv(RacingQuadcopterMultiTrackRLEnv):
         for k, v in gate_log.items():
             self._tb_writer.add_scalar(k, float(v), step)
         self._tb_writer.flush()
+
+    # ------------------------------------------------------------------
+    # Observation delay
+    # ------------------------------------------------------------------
+
+    def _init_obs_delay_state(self) -> None:
+        """Compute per-env delay assignments from skill_terrains config.
+
+        Called once from ``load_managers`` after ``_env_col_idx`` is available.
+        The circular buffer itself is allocated lazily on the first ``step`` call
+        because obs_dim is only known after the first observation is computed.
+        """
+        delays = [getattr(t, "obs_delay_steps", 0) for t in self.cfg.skill_terrains]
+        self._max_obs_delay: int = max(delays, default=0)
+
+        if self._max_obs_delay == 0:
+            self._per_env_delay = None
+            self._obs_delay_buffer = None
+            return
+
+        per_env = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        for col_idx, d in enumerate(delays):
+            if d > 0:
+                per_env[self._env_col_idx == col_idx] = d
+        self._per_env_delay = per_env
+        # Circular buffer allocated lazily once obs_dim is known.
+        self._obs_delay_buffer: torch.Tensor | None = None
+        self._obs_delay_buf_size: int = self._max_obs_delay + 1
+
+        n_delay_envs = int((per_env > 0).sum().item())
+        print(
+            f"[Skill Eval] Observation delay enabled: "
+            f"max_delay={self._max_obs_delay} steps, "
+            f"{n_delay_envs}/{self.num_envs} envs affected."
+        )
+
+    def _apply_obs_delay(self, obs: torch.Tensor) -> torch.Tensor:
+        """Write current obs into the circular buffer and return each env's delayed slice."""
+        if self._obs_delay_buffer is None:
+            self._obs_delay_buffer = torch.zeros(
+                self._obs_delay_buf_size, self.num_envs, obs.shape[-1], device=self.device
+            )
+
+        ptr = int(self.common_step_counter) % self._obs_delay_buf_size
+        self._obs_delay_buffer[ptr] = obs
+
+        # For env i, read from buffer[(ptr - delay[i]) % buf_size, i, :].
+        delayed_ptr = (self.common_step_counter - self._per_env_delay) % self._obs_delay_buf_size
+        env_idx = torch.arange(self.num_envs, device=self.device)
+        return self._obs_delay_buffer[delayed_ptr, env_idx]
+
+    def step(self, action: torch.Tensor):
+        obs_buf, reward_buf, terminated, time_outs, extras = super().step(action)
+        if self._max_obs_delay > 0 and "policy" in obs_buf:
+            obs_buf["policy"] = self._apply_obs_delay(obs_buf["policy"])
+        return obs_buf, reward_buf, terminated, time_outs, extras
 
     def close(self) -> None:
         if getattr(self, "_tb_writer", None) is not None:
