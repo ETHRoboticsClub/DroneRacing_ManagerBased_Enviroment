@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import random
 from collections.abc import Sequence
 
 import numpy as np
@@ -17,6 +19,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_apply
 
 from Racing_Quadcopter.terrains import get_gate_registry
 from .mdp.curriculums import init_two_stage_curriculum
@@ -27,12 +30,33 @@ from .mdp.stats import init_stats, step_stats
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, RewardWeights
 from .vis.trajectory_vis import (
     add_gate_sphere_lights_usd,
+    add_holographic_floor_grid,
+    add_neon_dome_cap,
+    add_neon_walls_between_pillars,
+    add_sky_dome_accents,
+    add_wet_reflective_ground,
     apply_emissive_to_robots,
     draw_gate_indicators_usd,
     draw_gate_labels_usd,
     draw_gate_outlines_usd,
+    draw_stadium_pillars_usd,
     draw_trajectory_usd,
+    init_camera_arrow_usd,
+    init_drone_trail_usd,
+    init_opponent_glow_marker_usd,
+    init_party_lights_usd,
+    init_target_gate_highlight_usd,
+    setup_cyberpunk_atmosphere,
     setup_dark_scene,
+    update_camera_arrow_usd,
+    update_drone_trail_usd,
+    update_curves_display_color_usd,
+    update_emissive_intensity_usd,
+    update_emissive_material_full_usd,
+    update_party_light_color_usd,
+    update_party_light_intensity_usd,
+    update_opponent_glow_marker_usd,
+    update_target_gate_highlight_usd,
 )
 
 
@@ -222,6 +246,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         max_gates = max(per_cell_counts)
         self._num_gates  = max_gates
         self._gate_sizes = torch.zeros(self.num_envs, device=self.device)  # [N] per-env gate aperture
+        # Single-cell FPV/race mode currently uses uniform bar geometry; stored as a scalar
+        # for the target-gate highlight overlay (see _update_target_gate_highlight).
+        self._gate_bar_thickness = float(gate_datas[0].bar_thickness)
 
         terrain_origins = terrain.terrain_origins
         if terrain_origins is None:
@@ -360,6 +387,455 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 intensity=self.cfg.demo_drone_glow_intensity,
             )
 
+        # Per-step camera-direction arrow above each drone (visualisation only — never
+        # touched by physics or the policy). Prim is created here once; points are
+        # rewritten each step by `_update_camera_arrow()`.
+        self._camera_arrow_prim_path: str | None = None
+        if self.cfg.draw_camera_arrow:
+            self._camera_arrow_prim_path = init_camera_arrow_usd(num_drones=self.num_envs)
+
+        # Target-gate highlight: single emissive outline tracking env_0's next gate.
+        # env_0 is "main"; env_1 (if present) is the opponent. Prim created once with
+        # placeholder points; corners are rewritten each step by
+        # _update_target_gate_highlight() when the target changes.
+        self._target_gate_highlight_prim_path: str | None = None
+        self._target_gate_highlight_last_idx: int = -1
+        if getattr(self.cfg, "draw_target_gate_highlight", False):
+            self._target_gate_highlight_prim_path = init_target_gate_highlight_usd(
+                color=getattr(self.cfg, "target_gate_highlight_color", (0.0, 1.0, 1.0)),
+                width=getattr(self.cfg, "target_gate_highlight_width", 0.10),
+                emissive_intensity=getattr(self.cfg, "target_gate_highlight_emissive", 30.0),
+            )
+
+        # Opponent glow (race scenario): emissive sphere prim at /World/OpponentGlow/Marker
+        # whose translate is rewritten each step to follow env_1's body world position.
+        # Lives outside the env namespace so it avoids the USD instance-proxy issue —
+        # env_1's mesh prims are inside env_0's prototype and can't be material-bound
+        # independently, so a separate prim is the only way to glow only the opponent.
+        self._opponent_glow_prim_path: str | None = None
+        opponent_glow_color = getattr(self.cfg, "opponent_glow_color", None)
+        if opponent_glow_color is not None and self.num_envs >= 2:
+            self._opponent_glow_prim_path = init_opponent_glow_marker_usd(
+                color=opponent_glow_color,
+                radius=float(getattr(self.cfg, "opponent_glow_radius", 0.05)),
+                emissive_intensity=float(getattr(self.cfg, "opponent_glow_intensity", 80.0)),
+                light_radius=float(getattr(self.cfg, "opponent_glow_light_radius", 0.6)),
+                light_intensity=float(getattr(self.cfg, "opponent_glow_light_intensity", 4.0e4)),
+                root_path="/World/OpponentGlow",
+            )
+
+        # Main drone glow — same compound (small LED + halo SphereLight) but light blue
+        # and parented at /World/MainGlow so it doesn't conflict with the opponent's.
+        self._main_glow_prim_path: str | None = None
+        main_glow_color = getattr(self.cfg, "main_glow_color", None)
+        if main_glow_color is not None and self.num_envs >= 1:
+            self._main_glow_prim_path = init_opponent_glow_marker_usd(
+                color=main_glow_color,
+                radius=float(getattr(self.cfg, "main_glow_radius", 0.05)),
+                emissive_intensity=float(getattr(self.cfg, "main_glow_intensity", 80.0)),
+                light_radius=float(getattr(self.cfg, "main_glow_light_radius", 0.6)),
+                light_intensity=float(getattr(self.cfg, "main_glow_light_intensity", 4.0e4)),
+                root_path="/World/MainGlow",
+            )
+
+        # Drone light trails: one BasisCurves per drone, rolling buffer of last N positions.
+        self._trail_prim_paths: list[str] = []
+        self._trail_positions: torch.Tensor | None = None
+        self._trail_initialised: torch.Tensor | None = None
+        if getattr(self.cfg, "draw_drone_trails", False):
+            trail_length = int(getattr(self.cfg, "trail_length", 40))
+            trail_colors = [
+                getattr(self.cfg, "main_trail_color", (0.1, 0.3, 1.0)),         # env_0 main
+                getattr(self.cfg, "opponent_trail_color", (1.0, 0.0, 1.0)),     # env_1 opponent
+            ]
+            trail_width = float(getattr(self.cfg, "trail_width", 0.04))
+            trail_emissive = float(getattr(self.cfg, "trail_emissive", 25.0))
+            for env_id in range(self.num_envs):
+                path = init_drone_trail_usd(
+                    env_id=env_id,
+                    color=trail_colors[env_id % len(trail_colors)],
+                    trail_length=trail_length,
+                    width=trail_width,
+                    emissive_intensity=trail_emissive,
+                )
+                if path is not None:
+                    self._trail_prim_paths.append(path)
+            if self._trail_prim_paths:
+                self._trail_positions = torch.zeros(
+                    self.num_envs, trail_length, 3, device=self.device
+                )
+                self._trail_initialised = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
+                )
+
+        # Cyberpunk arena: wet reflective ground + holographic grid + emissive pillars
+        # connected by neon walls + volumetric fog + chromatic aberration. Each layer
+        # is gated by its own cfg flag so the user can dial individual elements.
+        # Centre = the 1×1 terrain cell origin (or first cell of multi-cell grids).
+        arena_centre = tuple(float(c) for c in origins_np.reshape(-1, 3)[0])
+
+        if getattr(self.cfg, "draw_wet_ground", False):
+            add_wet_reflective_ground(
+                centre=arena_centre,
+                size=float(getattr(self.cfg, "wet_ground_size", 80.0)),
+                color=getattr(self.cfg, "wet_ground_color", (0.012, 0.012, 0.025)),
+                metallic=float(getattr(self.cfg, "wet_ground_metallic", 0.75)),
+                roughness=float(getattr(self.cfg, "wet_ground_roughness", 0.18)),
+            )
+
+        if getattr(self.cfg, "draw_holographic_grid", False):
+            add_holographic_floor_grid(
+                centre=arena_centre,
+                size=float(getattr(self.cfg, "holo_grid_size", 30.0)),
+                spacing=float(getattr(self.cfg, "holo_grid_spacing", 1.5)),
+                line_width=float(getattr(self.cfg, "holo_grid_width", 0.025)),
+                color=getattr(self.cfg, "holo_grid_color", (0.0, 1.0, 0.95)),
+                emissive_intensity=float(getattr(self.cfg, "holo_grid_emissive", 18.0)),
+            )
+
+        if getattr(self.cfg, "draw_stadium_pillars", False):
+            draw_stadium_pillars_usd(
+                terrain_origins_np=origins_np,
+                count=int(getattr(self.cfg, "stadium_pillar_count", 12)),
+                ring_radius=float(getattr(self.cfg, "stadium_pillar_ring_radius", 9.5)),
+                pillar_radius=float(getattr(self.cfg, "stadium_pillar_radius", 0.3)),
+                pillar_height=float(getattr(self.cfg, "stadium_pillar_height", 10.0)),
+                colors=tuple(getattr(self.cfg, "stadium_pillar_colors",
+                                      ((1.0, 0.45, 0.0), (0.3, 0.7, 1.0)))),
+                emissive_intensity=float(getattr(self.cfg, "stadium_pillar_emissive", 60.0)),
+            )
+
+        if getattr(self.cfg, "draw_neon_walls", False):
+            add_neon_walls_between_pillars(
+                centre=arena_centre,
+                pillar_count=int(getattr(self.cfg, "stadium_pillar_count", 12)),
+                ring_radius=float(getattr(self.cfg, "stadium_pillar_ring_radius", 9.5)),
+                heights=tuple(getattr(self.cfg, "neon_wall_heights",
+                                       (0.6, 2.0, 4.0, 6.0, 8.0, 10.0))),
+                colors=tuple(getattr(self.cfg, "neon_wall_colors", (
+                    (1.0, 0.45, 0.0),
+                    (0.3, 0.7, 1.0),
+                    (1.0, 0.45, 0.0),
+                    (0.3, 0.7, 1.0),
+                    (1.0, 0.45, 0.0),
+                    (0.3, 0.7, 1.0),
+                ))),
+                line_width=float(getattr(self.cfg, "neon_wall_width", 0.06)),
+                emissive_intensity=float(getattr(self.cfg, "neon_wall_emissive", 45.0)),
+            )
+
+        if getattr(self.cfg, "draw_dome_cap", False):
+            add_neon_dome_cap(
+                centre=arena_centre,
+                base_z=float(getattr(self.cfg, "stadium_pillar_height", 10.0)),
+                radius=float(getattr(self.cfg, "dome_cap_radius", 9.5)),
+                n_meridians=int(getattr(self.cfg, "dome_cap_meridians", 12)),
+                n_latitudes=int(getattr(self.cfg, "dome_cap_latitudes", 5)),
+                meridian_segments=int(getattr(self.cfg, "dome_cap_segments", 18)),
+                colors=tuple(getattr(self.cfg, "dome_cap_colors",
+                                      ((1.0, 0.45, 0.0), (0.3, 0.7, 1.0)))),
+                line_width=float(getattr(self.cfg, "dome_cap_width", 0.06)),
+                emissive_intensity=float(getattr(self.cfg, "dome_cap_emissive", 55.0)),
+            )
+
+        if getattr(self.cfg, "draw_sky_accents", False):
+            add_sky_dome_accents(
+                centre=arena_centre,
+                base_z=float(getattr(self.cfg, "stadium_pillar_height", 10.0)),
+                radius=float(getattr(self.cfg, "dome_cap_radius", 9.5)),
+                count=int(getattr(self.cfg, "sky_accent_count", 160)),
+                palette=tuple(getattr(self.cfg, "sky_accent_palette", (
+                    (1.0, 0.5, 0.0),
+                    (1.0, 0.7, 0.3),
+                    (0.3, 0.7, 1.0),
+                    (1.0, 1.0, 1.0),
+                ))),
+                point_radius_range=tuple(getattr(self.cfg, "sky_accent_radius_range", (0.04, 0.12))),
+                emissive_intensity=float(getattr(self.cfg, "sky_accent_emissive", 100.0)),
+            )
+
+        # Party lights — drone-glow-style SphereLights at random arena positions, each
+        # flickering on/off on its own schedule and changing color periodically.
+        # Replaces the old sweeping-spotlight show lights with a more dynamic, chaotic
+        # "concert/festival" feel. Cyclically updated by _update_party_lights().
+        self._party_lights: list[dict] = []
+        if getattr(self.cfg, "draw_party_lights", False):
+            self._party_lights = init_party_lights_usd(
+                centre=arena_centre,
+                count=int(getattr(self.cfg, "party_light_count", 20)),
+                plan_radius_range=tuple(getattr(self.cfg, "party_light_plan_radius_range", (3.0, 9.4))),
+                height_range=tuple(getattr(self.cfg, "party_light_height_range", (1.5, 14.0))),
+                palette=tuple(getattr(self.cfg, "party_light_palette", (
+                    (1.0, 0.3, 0.0),
+                    (0.3, 0.7, 1.0),
+                    (0.75, 0.20, 1.0),
+                    (1.0, 1.0, 1.0),
+                    (0.0, 1.0, 0.5),
+                    (1.0, 0.1, 0.6),
+                ))),
+                light_body_radius=float(getattr(self.cfg, "party_light_body_radius", 0.04)),
+                base_intensity=float(getattr(self.cfg, "party_light_base_intensity", 8.0e7)),
+                intensity_freq_range=tuple(getattr(self.cfg, "party_light_freq_range", (0.4, 2.2))),
+                sharpness_range=tuple(getattr(self.cfg, "party_light_sharpness_range", (1.5, 4.0))),
+                color_change_period_range=tuple(getattr(self.cfg, "party_light_color_change_period_range", (2.5, 8.0))),
+                seed=int(getattr(self.cfg, "party_light_seed", 42)),
+            )
+
+        if getattr(self.cfg, "draw_all_gate_outlines", False):
+            # White overlay on EVERY gate. Pairs with the (light-blue) target gate
+            # highlight on env_0's next gate for clear visual differentiation.
+            draw_gate_outlines_usd(
+                gate_datas=gate_datas,
+                terrain_origins_np=origins_np,
+                centre_offset=centre_offset,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                color=getattr(self.cfg, "all_gate_outline_color", (1.0, 1.0, 1.0)),
+                emissive_intensity=float(getattr(self.cfg, "all_gate_outline_emissive", 18.0)),
+                width=float(getattr(self.cfg, "all_gate_outline_width", 0.06)),
+                root_path="/World/AllGateOutlinesVis",
+            )
+
+        # FPV video recording — opens an MP4 writer; frames are appended each step in
+        # _capture_video_frame() from the env_0 FPV camera output.
+        self._video_writer = None
+        self._video_frames_written: int = 0
+        self._video_length_frames: int = 0
+        self._video_path: str | None = None
+        if getattr(self.cfg, "record_fpv_video", False):
+            self._init_fpv_video_writer()
+
+        if getattr(self.cfg, "enable_cyberpunk_atmosphere", False):
+            setup_cyberpunk_atmosphere(
+                fog_color=getattr(self.cfg, "cyber_fog_color", (0.05, 0.02, 0.12)),
+                fog_intensity=float(getattr(self.cfg, "cyber_fog_intensity", 1.0)),
+                fog_start_dist=float(getattr(self.cfg, "cyber_fog_start", 2.0)),
+                fog_end_dist=float(getattr(self.cfg, "cyber_fog_end", 80.0)),
+                fog_distance_density=float(getattr(self.cfg, "cyber_fog_density", 0.025)),
+                chromatic_aberration_strength=float(getattr(self.cfg, "cyber_chromatic_strength", 0.005)),
+                dome_light_intensity=float(getattr(self.cfg, "cyber_dome_intensity", 80.0)),
+                dome_light_color=getattr(self.cfg, "cyber_dome_color", (0.10, 0.05, 0.22)),
+            )
+
+    def _update_camera_arrow(self) -> None:
+        """Rewrite the per-drone camera-direction arrow points from current state.
+
+        Tail position = camera_keypoint world position (so the arrow tracks the actual
+        optical centre, not the drone's geometric centre). Direction = camera-frame +X
+        rotated by the keypoint's world quaternion — the true optical axis including the
+        URDF-defined 30° pitch.
+        """
+        if self._camera_arrow_prim_path is None:
+            return
+        kp_idx = self._camera_keypoint_body_idx
+        cam_pos_w = self._robot.data.body_pos_w[:, kp_idx]                # [N, 3]
+        cam_quat_w = self._robot.data.body_quat_w[:, kp_idx]              # [N, 4]
+        cam_axis = self._x_local.expand(self.num_envs, -1)                # [N, 3]
+        cam_fwd_w = quat_apply(cam_quat_w, cam_axis)                      # [N, 3]
+        update_camera_arrow_usd(
+            self._camera_arrow_prim_path,
+            positions_w=cam_pos_w.detach().cpu().numpy(),
+            directions_w=cam_fwd_w.detach().cpu().numpy(),
+        )
+
+    def _update_opponent_glow_marker(self) -> None:
+        """Track env_1's body world position with the opponent glow."""
+        if self._opponent_glow_prim_path is None or self.num_envs < 2:
+            return
+        pos_w = self._robot.data.root_pos_w[1].detach().cpu().numpy()
+        update_opponent_glow_marker_usd(self._opponent_glow_prim_path, pos_w)
+
+    def _update_main_glow_marker(self) -> None:
+        """Track env_0's body world position with the main drone glow."""
+        if self._main_glow_prim_path is None:
+            return
+        pos_w = self._robot.data.root_pos_w[0].detach().cpu().numpy()
+        update_opponent_glow_marker_usd(self._main_glow_prim_path, pos_w)
+
+    # --- FPV video recording -------------------------------------------------
+
+    def _init_fpv_video_writer(self) -> None:
+        """Open an MP4 writer for the env_0 FPV camera. No-op if the camera or
+        encoding deps are unavailable.
+        """
+        try:
+            import imageio  # noqa: PLC0415
+        except ImportError:
+            print("[WARN] record_fpv_video=True but 'imageio' is not installed; skipping.")
+            return
+        if "fpv_camera" not in self.scene.sensors:
+            print("[WARN] record_fpv_video=True but the FPV camera is not in the scene; skipping.")
+            return
+
+        out_dir = str(getattr(self.cfg, "video_output_dir", "logs/fpv_videos"))
+        os.makedirs(out_dir, exist_ok=True)
+        filename = str(getattr(self.cfg, "video_filename", "") or
+                       __import__("datetime").datetime.now().strftime("fpv_%Y%m%d_%H%M%S.mp4"))
+        if not filename.endswith(".mp4"):
+            filename = f"{filename}.mp4"
+        self._video_path = os.path.join(out_dir, filename)
+
+        # video_fps = 0 → auto, pick exactly 1/step_dt so playback matches real-time.
+        fps_cfg = int(getattr(self.cfg, "video_fps", 0))
+        fps = fps_cfg if fps_cfg > 0 else max(1, int(round(1.0 / float(self.step_dt))))
+        length_s = float(getattr(self.cfg, "video_length_s", 30.0))
+        self._video_length_frames = int(round(length_s / float(self.step_dt)))
+        crf = int(getattr(self.cfg, "video_crf", 14))
+
+        # imageio + imageio-ffmpeg = MP4 writer with libx264. CRF 14 ≈ visually lossless.
+        self._video_writer = imageio.get_writer(
+            self._video_path,
+            fps=fps,
+            codec="libx264",
+            quality=None,
+            pixelformat="yuv420p",
+            macro_block_size=1,
+            ffmpeg_params=["-crf", str(crf), "-preset", "medium"],
+        )
+        print(f"[INFO] Recording FPV video to {self._video_path}  "
+              f"({self._video_length_frames} frames @ {fps} fps)")
+
+    def _capture_video_frame(self) -> None:
+        """Pull env_0's FPV RGB frame and append to the writer (per step)."""
+        if self._video_writer is None:
+            return
+        cam = self.scene.sensors.get("fpv_camera")
+        if cam is None:
+            return
+        try:
+            rgb = cam.data.output["rgb"][0]  # [H, W, 3 or 4]
+        except (KeyError, IndexError):
+            return
+        frame = rgb.detach().cpu().numpy()
+        if frame.ndim == 3 and frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        self._video_writer.append_data(frame)
+        self._video_frames_written += 1
+        if self._video_frames_written >= self._video_length_frames:
+            self._video_writer.close()
+            self._video_writer = None
+            print(f"[INFO] FPV video saved to {self._video_path}  "
+                  f"({self._video_frames_written} frames)")
+
+    def _update_party_lights(self) -> None:
+        """Flicker party-light intensities (sine-shaped on/off) and occasionally swap colors.
+
+        Each light has its own (freq, phase, sharpness, color_change_period). Intensity at
+        time t is ``base * max(0, sin(2π·f·t + φ)) ** sharpness`` — sharp pulses where most
+        lights are mostly off but occasionally peak. Every ``color_change_period`` seconds
+        the light swaps to a different palette color, giving the chaotic light-show feel.
+        """
+        if not self._party_lights:
+            return
+        t = float(self.common_step_counter) * float(self.step_dt)
+        palette = getattr(self.cfg, "party_light_palette", (
+            (1.0, 0.3, 0.0),
+            (0.3, 0.7, 1.0),
+            (0.75, 0.20, 1.0),
+            (1.0, 1.0, 1.0),
+            (0.0, 1.0, 0.5),
+            (1.0, 0.1, 0.6),
+        ))
+        n_palette = len(palette)
+        for info in self._party_lights:
+            sine = math.sin(2.0 * math.pi * info["freq"] * t + info["phase"])
+            envelope = max(0.0, sine) ** info["sharpness"]
+            update_party_light_intensity_usd(info["path"], info["base_intensity"] * envelope)
+            # Periodic color rotation.
+            if t >= info["next_color_change_at"]:
+                # Pick a new color different from current.
+                new_idx = (info["color_idx"] + 1 + (hash((info["path"], int(t * 1000))) % (n_palette - 1))) % n_palette
+                info["color_idx"] = new_idx
+                update_party_light_color_usd(info["path"], palette[new_idx])
+                info["next_color_change_at"] = t + info["color_change_period"]
+
+    def _update_target_gate_flicker(self) -> None:
+        """Flicker the target-gate-highlight outline — color (purple ↔ white) AND intensity.
+
+        Mutates three channels every step so the flicker is unmistakable:
+        - displayColor on the BasisCurves prim (immediate in every Hydra delegate)
+        - emissive_color + diffuse_color_constant on the OmniPBR shader
+        - emissive_intensity on the shader
+
+        The intensity swing is huge (depth up to 2× the base) and the color lerps between
+        the highlight base color and white on a fast random/sine schedule.
+        """
+        if self._target_gate_highlight_prim_path is None:
+            return
+        base_intensity = float(getattr(self.cfg, "target_gate_highlight_emissive", 500.0))
+        freq = float(getattr(self.cfg, "target_gate_flicker_freq_hz", 12.0))
+        depth = float(getattr(self.cfg, "target_gate_flicker_depth", 1.4))
+        jitter_amp = float(getattr(self.cfg, "target_gate_flicker_jitter", 0.5))
+        col_a = getattr(self.cfg, "target_gate_highlight_color", (0.75, 0.20, 1.0))
+        col_b = getattr(self.cfg, "target_gate_flicker_alt_color", (1.0, 1.0, 1.0))
+
+        t = float(self.common_step_counter) * float(self.step_dt)
+        sine = math.sin(2.0 * math.pi * freq * t)
+        # Mix factor: 0 → col_a (purple), 1 → col_b (white). Use abs(sine) + jitter.
+        mix = max(0.0, min(1.0, 0.5 * (1.0 + sine) + 0.3 * (random.random() - 0.5)))
+        color = (
+            col_a[0] * (1.0 - mix) + col_b[0] * mix,
+            col_a[1] * (1.0 - mix) + col_b[1] * mix,
+            col_a[2] * (1.0 - mix) + col_b[2] * mix,
+        )
+        # Intensity swing — clamp at 0 below, allow large overshoot above.
+        intensity = base_intensity * (1.0 + depth * sine) + base_intensity * jitter_amp * (random.random() - 0.5)
+        intensity = max(0.0, intensity)
+
+        # Three update paths for maximum visibility across Hydra delegates.
+        update_curves_display_color_usd(self._target_gate_highlight_prim_path, color)
+        update_emissive_material_full_usd("/World/TargetGateHighlight/Mat", color, intensity)
+        update_emissive_intensity_usd("/World/TargetGateHighlight/Mat", intensity)
+
+    def _update_drone_trails(self) -> None:
+        """Roll the per-drone position buffer and rewrite the BasisCurves points."""
+        if not self._trail_prim_paths or self._trail_positions is None:
+            return
+        # Current body world positions [N, 3].
+        cur_pos = self._robot.data.root_pos_w
+        # Roll buffer: drop oldest sample, append current.
+        self._trail_positions[:, :-1] = self._trail_positions[:, 1:].clone()
+        self._trail_positions[:, -1] = cur_pos
+        # First step (and post-reset) per env: fill the whole buffer with the current
+        # position so the trail doesn't streak in from the world origin.
+        if self._trail_initialised is not None:
+            uninit_mask = ~self._trail_initialised
+            if uninit_mask.any():
+                idx = uninit_mask.nonzero(as_tuple=False).squeeze(-1)
+                self._trail_positions[idx] = cur_pos[idx].unsqueeze(1)
+                self._trail_initialised[idx] = True
+        # Push to USD (one curve per env).
+        positions_np = self._trail_positions.detach().cpu().numpy()
+        for env_id, prim_path in enumerate(self._trail_prim_paths):
+            update_drone_trail_usd(prim_path, positions_np[env_id])
+
+    def _update_target_gate_highlight(self) -> None:
+        """Refresh the env_0 target-gate highlight outline.
+
+        Skips re-authoring USD when the target gate index hasn't changed since the
+        last update — the outline is geometrically static between gate passages.
+        env_0 is the "main" drone; the highlight tracks its `_current_gate_idx`.
+        """
+        if self._target_gate_highlight_prim_path is None:
+            return
+        target_idx = int(self._current_gate_idx[0].item())
+        if target_idx == self._target_gate_highlight_last_idx:
+            return
+        self._target_gate_highlight_last_idx = target_idx
+
+        gate_pos = self._gate_positions[0, target_idx].detach().cpu().numpy()
+        gate_quat = self._gate_orientations[0, target_idx].detach().cpu().numpy()
+        gate_size = float(self._gate_sizes[0].item())
+        update_target_gate_highlight_usd(
+            self._target_gate_highlight_prim_path,
+            gate_pos_w=gate_pos,
+            gate_quat_wxyz=gate_quat,
+            gate_size=gate_size,
+            bar_thickness=self._gate_bar_thickness,
+        )
+
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
         self.action_manager.process_action(action.to(self.device))
@@ -382,6 +858,17 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Step 3: gate passage detection, crash buffer refresh, episode velocity stats.
         # Must run after the final scene.update() so all sensor data is current.
         update_racing_state(self)
+
+        # Refresh per-drone camera-direction arrows (visualisation only). No-op when
+        # the cfg flag is off or the USD modules are unavailable (headless).
+        self._update_camera_arrow()
+        self._update_target_gate_highlight()
+        self._update_target_gate_flicker()
+        self._update_main_glow_marker()
+        self._update_opponent_glow_marker()
+        self._update_party_lights()
+        self._update_drone_trails()
+        self._capture_video_frame()
 
         step_stats(self)
 
@@ -453,6 +940,14 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
+        # Force the target-gate highlight to re-author after env_0 resets, since the
+        # current gate index typically rolls back to the spawn gate.
+        if self._target_gate_highlight_prim_path is not None and 0 in env_ids_tensor.tolist():
+            self._target_gate_highlight_last_idx = -1
+        # Mark trail buffers as uninitialised for reset envs so the next _update fills
+        # them from the post-reset spawn pose instead of streaking from the old position.
+        if self._trail_initialised is not None and len(env_ids_tensor) > 0:
+            self._trail_initialised[env_ids_tensor] = False
 
         # Must run BEFORE super()._reset_idx: the super call triggers the EventManager
         # reset mode which zeros _gates_passed, _current_gate_idx, etc. via
