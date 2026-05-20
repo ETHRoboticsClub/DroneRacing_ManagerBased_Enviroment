@@ -312,7 +312,10 @@ class QuadcopterRatesAction(ActionTerm):
             self._env._actions_buf[:] = self._delayed_actions
 
         thrust_cmd = (self._delayed_actions[:, 0] + 1.0) * 0.5
-        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
+        #self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * thrust_cmd
+
+        # Hardcoded, TODO: UNDO LATER!
+        self._thrust[:, 0, 2] = 34.192 * thrust_cmd
 
         omega_meas = self._asset.data.root_ang_vel_b
         omega_des = self._delayed_actions[:, 1:] * self.cfg.rate_command_scale

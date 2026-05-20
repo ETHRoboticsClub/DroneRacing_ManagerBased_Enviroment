@@ -237,7 +237,7 @@ class RewardsCfg:
     high_thrust = RewTerm(
         func=rewards.penalty_high_thrust,
         weight=WaypointRewardWeights.HIGH_THRUST,
-        params={"threshold": 0.7},
+        params={"threshold": 0.4},
     )
     # # Comment this term out to verify the rest of the setup learns on its own.
     # holding = RewTerm(func=rewards.reward_holding, weight=WaypointRewardWeights.HOLDING)
