@@ -68,7 +68,8 @@ PROFILE = DRONE_PROFILES[DRONE_MODEL]
 @scale_dataclass_attributes(100.0)
 @dataclass
 class WaypointRewardWeights:
-    DISTANCE_TO_WAYPOINT: float = -0.2    # -1.0 * 0.2
+    DISTANCE_TO_WAYPOINT: float = 100.0  # -1.0 * 0.2
+    HOVERING_TO_WAYPOINT: float = 100.0  # -0.5 * 0.2
     LIN_VEL: float = -0.04                 # -0.2 * 0.2
     ANG_VEL: float = -0.1                 # -0.05 * 0.2
     ACTION_MAGNITUDE: float = -0.01       # -0.02 * 0.2
@@ -78,6 +79,8 @@ class WaypointRewardWeights:
     # Waypoint-task extensions (not in the old direct env).
     WAYPOINT_COLLECTED: float = 1000.0       # sparse bonus on collection
     HOLDING: float = 2.0                   # optional; safe to comment out
+    #MAX_VELOCITY: float = -100.0           # penalty for max velocity
+    HIGH_THRUST: float = -10000.0             # penalty for scaled thrust above threshold
 
 
 @configclass
@@ -162,7 +165,7 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         enable_corruption: bool = False
         concatenate_terms: bool = True
-        history_length: int = 3
+        history_length: int = 1
 
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
@@ -174,41 +177,24 @@ class ObservationsCfg:
             params={"asset_cfg": SceneEntityCfg("robot")},
             history_length=history_length,
         )
+
+        #Command 
         next_waypoints = ObsTerm(
             func=observations.next_waypoints_rel_body,
+            params={"num_waypoints": 1},
             history_length=history_length,
         )
-        collection_time_const = ObsTerm(
-            func=observations.collection_time_const,
-            history_length=history_length,
-        )
-        collection_progress = ObsTerm(
-            func=observations.collection_progress,
-            history_length=history_length,
-        )
-        last_action = ObsTerm(
-            func=observations.last_action,
-            history_length=history_length,
-        )
-
-    @configclass
-    class CriticCfg(PolicyCfg):
-        # Critic obs stay clean regardless of any DR toggles on the actor.
-        enable_corruption: bool = False
-
-        # Privileged signal: true body-frame linear velocity. Not available
-        # to the actor (mocap deployment constraint).
-        # Same history_length as PolicyCfg (3). Hardcoded rather than
-        # referencing PolicyCfg.history_length because the enclosing class
-        # name isn't yet in scope inside this nested class body.
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
-            params={"asset_cfg": SceneEntityCfg("robot")},
-            history_length=3,
+            params={"asset_cfg": SceneEntityCfg("robot")},            history_length=history_length,
         )
+        # last_action = ObsTerm(
+        #     func=observations.last_action,
+        #     history_length=history_length,
+        # )
 
     policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
+
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +206,11 @@ class RewardsCfg:
     distance_to_waypoint = RewTerm(
         func=rewards.reward_distance_to_waypoint, weight=WaypointRewardWeights.DISTANCE_TO_WAYPOINT
     )
+    hovering_to_waypoint = RewTerm(
+        func=rewards.reward_hovering_to_waypoint, weight=WaypointRewardWeights.HOVERING_TO_WAYPOINT
+    )
+
+
     lin_vel = RewTerm(func=rewards.penalty_lin_vel, weight=WaypointRewardWeights.LIN_VEL)
     ang_vel = RewTerm(func=rewards.penalty_ang_vel, weight=WaypointRewardWeights.ANG_VEL)
     action_magnitude = RewTerm(
@@ -237,8 +228,19 @@ class RewardsCfg:
     waypoint_collected = RewTerm(
         func=rewards.reward_waypoint_collected, weight=WaypointRewardWeights.WAYPOINT_COLLECTED
     )
-    # Comment this term out to verify the rest of the setup learns on its own.
-    holding = RewTerm(func=rewards.reward_holding, weight=WaypointRewardWeights.HOLDING)
+
+    # max_velocity = RewTerm(
+    #     func=rewards.penalty_max_velocity,
+    #     weight=WaypointRewardWeights.MAX_VELOCITY,
+    #     params={"threshold": 2.0},
+    # )
+    high_thrust = RewTerm(
+        func=rewards.penalty_high_thrust,
+        weight=WaypointRewardWeights.HIGH_THRUST,
+        params={"threshold": 0.7},
+    )
+    # # Comment this term out to verify the rest of the setup learns on its own.
+    # holding = RewTerm(func=rewards.reward_holding, weight=WaypointRewardWeights.HOLDING)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +248,7 @@ class RewardsCfg:
 # ---------------------------------------------------------------------------
 @configclass
 class EventsCfg:
-    '''randomize_robot_mass = EventTerm(
+    randomize_robot_mass = EventTerm(
         func=events.randomize_rigid_body_mass,
         mode="startup",
         params={
@@ -265,17 +267,6 @@ class EventsCfg:
             "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
         },
     )
-    randomize_robot_actuator_gains = EventTerm(
-        func=events.randomize_actuator_gains,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "stiffness_distribution_params": (0.9, 1.1),
-            "damping_distribution_params": (0.9, 1.1),
-            "operation": "scale",
-            "distribution": "uniform",
-        },
-    )
     base_external_force_torque = EventTerm(
         func=events.apply_external_force_torque,
         mode="interval",
@@ -285,7 +276,7 @@ class EventsCfg:
             "force_range": (-0.02, 0.02),
             "torque_range": (-0.02, 0.02),
         },
-    )'''
+    )
     reset_scene_to_default = EventTerm(func=events.reset_scene_to_default, mode="reset")
     reset_waypoint_spawn = EventTerm(func=events.reset_waypoint_spawn, mode="reset")
 

@@ -40,7 +40,6 @@ def reset_waypoint_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
         return
     n = env_ids.shape[0]
 
-    # Active target → first waypoint of the per-env track.
     env._current_wp_idx[env_ids] = 0
     env._holding[env_ids] = False
     env._collection_timer[env_ids] = 0.0
@@ -73,6 +72,7 @@ def reset_waypoint_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
 
     env._actions_buf[env_ids] = 0.0
     env._prev_actions[env_ids] = 0.0
+    env._unclamped_actions_buf[env_ids] = 0.0
 
     # Per-episode action-noise bias (zeroed unless DR enabled & per_episode_bias).
     action_noise_cfg = getattr(env.cfg, "action_noise", None)

@@ -48,7 +48,20 @@ def reward_distance_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
     the per-step contribution into a per-second magnitude so the
     integrated penalty over an episode is independent of dt.
     """
-    return torch.pow(env._curr_dist_to_waypoint + 2.0, 3.0) * env.step_dt
+    return torch.exp(-0.5*env._curr_dist_to_waypoint**2) * env.step_dt
+
+
+def reward_hovering_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """``(d + 2)^3 * step_dt`` for the current target. Matches the old env.
+
+    Cubic-shifted form gives a strong gradient even at large distances; the
+    +2 shift keeps the derivative finite at d=0 and is more aggressive
+    than a quadratic at every range. Multiplying by ``step_dt`` converts
+    the per-step contribution into a per-second magnitude so the
+    integrated penalty over an episode is independent of dt.
+    """
+    return torch.exp(-40*env._curr_dist_to_waypoint**2) * env.step_dt
+
 
 
 def penalty_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -117,3 +130,24 @@ def reward_holding(env: ManagerBasedRLEnv) -> torch.Tensor:
     cubic distance shaping) provide the necessary gradient on their own.
     """
     return env._holding.float()
+
+def penalty_max_velocity(env: ManagerBasedRLEnv, threshold: float = 2.0) -> torch.Tensor:
+    """``max(0, ‖v_b‖ - threshold)² * step_dt`` — penalises speed above *threshold* (m/s).
+
+    Zero below the cap so the drone can move freely at low speed; the critic
+    still sees body-frame velocity via this term when the limit is exceeded.
+    """
+    speed = torch.norm(env._robot.data.root_lin_vel_b, dim=1)
+    speed_excess = (speed - threshold).clamp(min=0.0)
+    return speed_excess.square() * env.step_dt
+
+
+def penalty_high_thrust(env: ManagerBasedRLEnv, threshold: float = 0.7) -> torch.Tensor:
+    """``max(0, thrust_scaled - threshold)² * step_dt`` — penalises excess collective thrust.
+
+    ``thrust_scaled = (action[0] + 1) / 2`` in [0, 1], matching
+    ``QuadcopterRatesAction`` / Betaflight thrust mapping on ``_actions_buf``.
+    """
+    thrust_scaled = (env._actions_buf[:, 0] + 1.0) * 0.5
+    thrust_excess = (thrust_scaled - threshold).clamp(min=0.0)
+    return thrust_excess.square() * env.step_dt
