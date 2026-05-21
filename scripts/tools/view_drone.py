@@ -5,7 +5,7 @@
 
 """Spawn one drone with **no gravity** and **HDRI sky** (image-based dome lighting).
 
-Body **+Z** (red) and **+X** (green) axis lines (0.5 m) are drawn from the robot root.
+Body **+X** (blue), **+Y** (green), and **+Z** (red) axis lines (0.5 m) are drawn from the robot root.
 
 .. code-block:: bash
 
@@ -148,40 +148,63 @@ def _line_marker(prim_path: str, color: tuple[float, float, float]) -> Visualiza
 
 def _make_body_axis_lines(
     device: str,
-) -> tuple[VisualizationMarkers, VisualizationMarkers, torch.Tensor, torch.Tensor]:
-    """Red +Z and green +X lines from the robot root (0.5 m each)."""
+) -> tuple[
+    VisualizationMarkers,
+    VisualizationMarkers,
+    VisualizationMarkers,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """+X blue, +Y green, +Z red lines from the robot root (0.5 m each)."""
+    x_marker = _line_marker("/World/Visuals/body_axis_x", (0.0, 0.0, 1.0))
+    y_marker = _line_marker("/World/Visuals/body_axis_y", (0.0, 1.0, 0.0))
     z_marker = _line_marker("/World/Visuals/body_axis_z", (1.0, 0.0, 0.0))
-    x_marker = _line_marker("/World/Visuals/body_axis_x", (0.0, 1.0, 0.0))
 
     half = _AXIS_LINE_LEN_M * 0.5
-    offset_z_b = torch.tensor([[0.0, 0.0, half]], device=device)
     offset_x_b = torch.tensor([[half, 0.0, 0.0]], device=device)
+    offset_y_b = torch.tensor([[0.0, half, 0.0]], device=device)
+    offset_z_b = torch.tensor([[0.0, 0.0, half]], device=device)
 
-    # Cylinder +Z -> body +X: rotate -90 deg about body Y.
-    quat_cyl_to_body_x = quat_from_euler_xyz(
-        torch.zeros(1, device=device),
-        torch.tensor([-math.pi / 2.0], device=device),
-        torch.zeros(1, device=device),
+    zero = torch.zeros(1, device=device)
+    # Cylinder default axis is local +Z; rotate into body +X / +Y.
+    quat_cyl_to_body_x = quat_from_euler_xyz(zero, torch.tensor([-math.pi / 2.0], device=device), zero)
+    quat_cyl_to_body_y = quat_from_euler_xyz(torch.tensor([math.pi / 2.0], device=device), zero, zero)
+    return (
+        x_marker,
+        y_marker,
+        z_marker,
+        offset_x_b,
+        offset_y_b,
+        offset_z_b,
+        quat_cyl_to_body_x,
+        quat_cyl_to_body_y,
     )
-    return z_marker, x_marker, offset_z_b, offset_x_b, quat_cyl_to_body_x
 
 
 def _update_body_axis_lines(
     robot: Articulation,
-    z_marker: VisualizationMarkers,
     x_marker: VisualizationMarkers,
-    offset_z_b: torch.Tensor,
+    y_marker: VisualizationMarkers,
+    z_marker: VisualizationMarkers,
     offset_x_b: torch.Tensor,
+    offset_y_b: torch.Tensor,
+    offset_z_b: torch.Tensor,
     quat_cyl_to_body_x: torch.Tensor,
+    quat_cyl_to_body_y: torch.Tensor,
 ) -> None:
     pos_w = robot.data.root_pos_w
     quat_w = robot.data.root_quat_w
 
-    mid_z = pos_w + quat_apply(quat_w, offset_z_b)
     mid_x = pos_w + quat_apply(quat_w, offset_x_b)
+    mid_y = pos_w + quat_apply(quat_w, offset_y_b)
+    mid_z = pos_w + quat_apply(quat_w, offset_z_b)
 
-    z_marker.visualize(translations=mid_z, orientations=quat_w)
     x_marker.visualize(translations=mid_x, orientations=quat_mul(quat_w, quat_cyl_to_body_x))
+    y_marker.visualize(translations=mid_y, orientations=quat_mul(quat_w, quat_cyl_to_body_y))
+    z_marker.visualize(translations=mid_z, orientations=quat_w)
 
 
 def main() -> None:
@@ -226,16 +249,26 @@ def main() -> None:
         )
 
     robot: Articulation = scene["robot"]
-    axis_lines: tuple[VisualizationMarkers, VisualizationMarkers, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
-        None
-    )
+    axis_lines: (
+        tuple[
+            VisualizationMarkers,
+            VisualizationMarkers,
+            VisualizationMarkers,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None
+    ) = None
     if not args_cli.no_axes:
         axis_lines = _make_body_axis_lines(sim.device)
 
     print(
         f"[INFO] Drone={args_cli.drone!r}  gravity=off  sky HDR={sky_path}  "
         f"dome_intensity={args_cli.dome_intensity}  "
-        f"axes={'off' if args_cli.no_axes else f'+Z red / +X green ({_AXIS_LINE_LEN_M} m lines)'}"
+        f"axes={'off' if args_cli.no_axes else f'+X blue / +Y green / +Z red ({_AXIS_LINE_LEN_M} m lines)'}"
     )
 
     while simulation_app.is_running():
@@ -243,7 +276,17 @@ def main() -> None:
         sim.step()
         scene.update(sim.get_physics_dt())
         if axis_lines is not None:
-            _update_body_axis_lines(robot, axis_lines[0], axis_lines[1], axis_lines[2], axis_lines[3], axis_lines[4])
+            _update_body_axis_lines(
+                robot,
+                axis_lines[0],
+                axis_lines[1],
+                axis_lines[2],
+                axis_lines[3],
+                axis_lines[4],
+                axis_lines[5],
+                axis_lines[6],
+                axis_lines[7],
+            )
 
 
 if __name__ == "__main__":
