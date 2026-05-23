@@ -29,6 +29,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 # Reuse the rates-PID action term and the anemos drone profiles from racing.
 from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.mdp.actions import QuadcopterRatesActionCfg
@@ -65,22 +66,24 @@ PROFILE = DRONE_PROFILES[DRONE_MODEL]
 #   lin_vel = -0.2,  ang_vel = -0.05,  distance_to_goal = -1.0,
 #   action_magnitude = -0.02,  oversaturation = -0.03,
 #   action_smoothness = -0.02,  crashed = -100.0,  reward_scale = 0.2
-@scale_dataclass_attributes(100.0)
+@scale_dataclass_attributes(50.0)
 @dataclass
 class WaypointRewardWeights:
-    DISTANCE_TO_WAYPOINT: float = 100.0  # -1.0 * 0.2
-    HOVERING_TO_WAYPOINT: float = 100.0  # -0.5 * 0.2
-    LIN_VEL: float = -0.04                 # -0.2 * 0.2
-    ANG_VEL: float = -0.1                 # -0.05 * 0.2
-    ACTION_MAGNITUDE: float = -0.01       # -0.02 * 0.2
-    OVERSATURATION: float = -0.0001         # -0.03 * 0.2
-    ACTION_SMOOTHNESS: float = -0.025      # -0.02 * 0.2
-    CRASH: float = -2000.0 
-    # Waypoint-task extensions (not in the old direct env).
-    WAYPOINT_COLLECTED: float = 1000.0       # sparse bonus on collection
-    HOLDING: float = 2.0                   # optional; safe to comment out
-    #MAX_VELOCITY: float = -100.0           # penalty for max velocity
-    HIGH_THRUST: float = -10000.0             # penalty for scaled thrust above threshold
+    DISTANCE_TO_WAYPOINT: float = 0.0 
+    HOVERING_TO_WAYPOINT: float = 10.0
+    MOVING_TO_TARGET: float = 10.0 
+    LIN_VEL: float = -0.0                 
+    ANG_VEL: float = -0.0             
+
+    CRASH: float = -20.0 
+    GOAL_COLLECTED: float = 10.0
+    HIGH_THRUST: float = -2.0
+    ACTION_OUT_OF_RANGE: float = -0.0
+    ACTION_SMOOTHNESS: float = -0.0
+    ACTION_SMOOTHNESS_L2: float = -0.0
+    RATE_TRACKING: float = -0.0
+    THRUST_SMOOTHNESS: float = -2.0
+    ORIENTATION: float = -1.0
 
 
 @configclass
@@ -122,27 +125,19 @@ class HoveringQuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class ActionsCfg:
     rates: QuadcopterRatesActionCfg = QuadcopterRatesActionCfg(
-        asset_name="robot",
-        # Override two racing-tuned profile values for a hovering task:
-        #
-        # * ``thrust_to_weight``: racing profile is 4.1, so action=0 produces
-        #   2g of thrust and the hover-equilibrium action is ≈ -0.51. With
-        #   ``initial_log_std=1.0`` the early actor centred at action≈0
-        #   climbs at 1g until it crashes the ceiling, never finding the
-        #   hover bonus. T2W=1.9 places hover at action ≈ 0 (matches the old
-        #   direct hovering env exactly).
-        # * ``rate_command_scale``: racing uses 30 rad/s; ±10 is plenty for
-        #   hovering and prevents the yaw axis (very low PID-P on anemos)
-        #   from drifting into a persistent spin.
-        thrust_to_weight=1.9,
-        action_dim=4,
-        body_name=PROFILE.body_name,
-        pid_scales=PROFILE.pid_scales,
-        pid_p=PROFILE.pid_p,
-        pid_i=PROFILE.pid_i,
-        pid_d=PROFILE.pid_d,
-        pid_f=PROFILE.pid_f,
-        rate_command_scale=10.0,
+        body_name="base_link",
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        rate_command_scale=30.0,
+        pid_scales=1.0,
+        # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
+        # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
+        #      D=0: yaw authority is too low for derivative term to add meaningful damping
+        pid_p=(0.517, 0.699, 0.657),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(0.035, 0.047, 0.044),
+        pid_f=(0.0, 0.0, 0.0),
+        iterm_scale = 0.0,
+        feedforward_scale=0.0,
     )
 
 
@@ -163,18 +158,20 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        enable_corruption: bool = False
+        enable_corruption: bool = True
         concatenate_terms: bool = True
         history_length: int = 1
 
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.2, n_max=0.2),
             history_length=history_length,
         )
         base_ang_vel = ObsTerm(
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
             history_length=history_length,
         )
 
@@ -182,11 +179,14 @@ class ObservationsCfg:
         next_waypoints = ObsTerm(
             func=observations.next_waypoints_rel_body,
             params={"num_waypoints": 1},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
             history_length=history_length,
         )
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
-            params={"asset_cfg": SceneEntityCfg("robot")},            history_length=history_length,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=history_length,
         )
         # last_action = ObsTerm(
         #     func=observations.last_action,
@@ -200,9 +200,10 @@ class ObservationsCfg:
 # ---------------------------------------------------------------------------
 # Rewards
 # ---------------------------------------------------------------------------
+@scale_dataclass_attributes(50.0)
 @configclass
 class RewardsCfg:
-    # Mirror of the old direct-env reward set.
+    ###DISTANCE 
     distance_to_waypoint = RewTerm(
         func=rewards.reward_distance_to_waypoint, weight=WaypointRewardWeights.DISTANCE_TO_WAYPOINT
     )
@@ -210,37 +211,48 @@ class RewardsCfg:
         func=rewards.reward_hovering_to_waypoint, weight=WaypointRewardWeights.HOVERING_TO_WAYPOINT
     )
 
+    moving_to_target = RewTerm(
+        func=rewards.moving_to_target, weight=WaypointRewardWeights.MOVING_TO_TARGET,
+        params={"threshold": 0.0}
+    )
 
+    goal_collected = RewTerm(
+        func=rewards.reward_waypoint_collected, weight=WaypointRewardWeights.GOAL_COLLECTED
+    )
+    ###ACTION 
     lin_vel = RewTerm(func=rewards.penalty_lin_vel, weight=WaypointRewardWeights.LIN_VEL)
-    ang_vel = RewTerm(func=rewards.penalty_ang_vel, weight=WaypointRewardWeights.ANG_VEL)
-    action_magnitude = RewTerm(
-        func=rewards.penalty_action_magnitude, weight=WaypointRewardWeights.ACTION_MAGNITUDE
-    )
-    oversaturation = RewTerm(
-        func=rewards.penalty_oversaturation, weight=WaypointRewardWeights.OVERSATURATION
-    )
-    action_smoothness = RewTerm(
-        func=rewards.penalty_action_smoothness, weight=WaypointRewardWeights.ACTION_SMOOTHNESS
-    )
     crash = RewTerm(func=rewards.penalty_crash, weight=WaypointRewardWeights.CRASH)
 
-    # Waypoint-task extensions.
-    waypoint_collected = RewTerm(
-        func=rewards.reward_waypoint_collected, weight=WaypointRewardWeights.WAYPOINT_COLLECTED
-    )
-
-    # max_velocity = RewTerm(
-    #     func=rewards.penalty_max_velocity,
-    #     weight=WaypointRewardWeights.MAX_VELOCITY,
-    #     params={"threshold": 2.0},
-    # )
+    ###ACTION REWARDS
     high_thrust = RewTerm(
         func=rewards.penalty_high_thrust,
         weight=WaypointRewardWeights.HIGH_THRUST,
-        params={"threshold": 0.4},
+        params={"threshold": 0.40},
     )
-    # # Comment this term out to verify the rest of the setup learns on its own.
-    # holding = RewTerm(func=rewards.reward_holding, weight=WaypointRewardWeights.HOLDING)
+    action_out_of_range = RewTerm(
+        func=rewards.penalty_action_out_of_range,
+        weight=WaypointRewardWeights.ACTION_OUT_OF_RANGE,
+        params={"threshold": 1.1},
+    )
+    penalty_action_smoothness_l2 = RewTerm(
+        func=rewards.penalty_action_smoothness_l2, weight=WaypointRewardWeights.ACTION_SMOOTHNESS_L2,
+        params={"threshold": 0.2}
+    )
+    action_smoothness = RewTerm(
+        func=rewards.penalty_action_smoothness_new, weight=WaypointRewardWeights.ACTION_SMOOTHNESS, 
+    )
+    penalty_rate_tracking = RewTerm(
+        func=rewards.penalty_rate_tracking, weight=WaypointRewardWeights.RATE_TRACKING,
+        params={"threshold": 0.2}
+    )
+
+    penalty_thrust_smoothness = RewTerm(
+        func=rewards.penalty_thrust_smoothness, weight=WaypointRewardWeights.THRUST_SMOOTHNESS,
+    )
+    penalty_orientation = RewTerm(
+        func=rewards.penalty_orientation, weight=WaypointRewardWeights.ORIENTATION,
+        params={"threshold": 0.70}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +277,14 @@ class EventsCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
             "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
+        },
+    )
+    randomize_robot_inertia = EventTerm(
+        func=events.randomize_rigid_body_inertia_diagonal,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "inertia_distribution_params": (0.9, 1.1),
         },
     )
     base_external_force_torque = EventTerm(
@@ -339,10 +359,11 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     upside_down_threshold: float = 0.7
 
     # Domain-randomization toggles (all default off).
-    randomize_mass: bool = False
-    randomize_com: bool = False
-    randomize_actuator_gains: bool = False
-    apply_external_disturbances: bool = False
+    randomize_mass: bool = True
+    randomize_com: bool = True
+    randomize_inertia: bool = True
+    randomize_actuator_gains: bool = True
+    apply_external_disturbances: bool = True
 
     # Vis toggle.
     draw_waypoints: bool = True
@@ -354,8 +375,8 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     eval_mode: bool = False
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 50,
-        render_interval=2,
+        dt=1 / 200,
+        render_interval=4,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
@@ -372,6 +393,8 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             self.events.randomize_robot_mass = None
         if not self.randomize_com:
             self.events.randomize_base_com = None
+        if not self.randomize_inertia:
+            self.events.randomize_robot_inertia = None
         if not self.randomize_actuator_gains:
             self.events.randomize_robot_actuator_gains = None
         if not self.apply_external_disturbances:
@@ -409,6 +432,6 @@ class HoveringQuadcopterEnvCfg_PLAY(HoveringQuadcopterEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.scene.num_envs = 1024
-        self.episode_length_s = 30.0
+        self.episode_length_s = 60.0
         self.eval_mode = True
         print("[INFO] Hovering quadcopter — evaluation mode is ON.")

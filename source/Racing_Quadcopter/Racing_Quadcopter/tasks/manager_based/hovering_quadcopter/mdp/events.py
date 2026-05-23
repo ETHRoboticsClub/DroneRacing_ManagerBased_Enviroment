@@ -14,8 +14,54 @@ from __future__ import annotations
 
 import torch
 
+from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.events import *  # noqa: F401, F403
+from isaaclab.managers import SceneEntityCfg
+
+
+# PhysX inertia layout: diagonal entries ixx, iyy, izz at indices 0, 4, 8.
+_INERTIA_DIAG_INDICES = (0, 4, 8)
+
+
+def randomize_rigid_body_inertia_diagonal(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    inertia_distribution_params: tuple[float, float] = (0.9, 1.1),
+) -> None:
+    """Scale body inertia diagonal (Ixx, Iyy, Izz) uniformly per axis on startup.
+
+    Each diagonal entry is multiplied by an independent sample in
+    ``inertia_distribution_params`` (default ±10 % → 0.9–1.1). Off-diagonal
+    terms are left at their default values. Always resets from
+    ``asset.data.default_inertia`` so repeated calls do not compound.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+    else:
+        env_ids = env_ids.cpu()
+
+    if asset_cfg.body_ids == slice(None):
+        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
+    else:
+        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
+
+    low, high = inertia_distribution_params
+    num_envs = env_ids.shape[0]
+    num_bodies = body_ids.shape[0]
+
+    inertias = asset.root_physx_view.get_inertias()
+    default = asset.data.default_inertia[env_ids[:, None], body_ids].clone()
+    inertias[env_ids[:, None], body_ids] = default
+
+    scales = torch.empty(num_envs, num_bodies, 3, device="cpu").uniform_(low, high)
+    scale_9 = torch.ones(num_envs, num_bodies, 9, device="cpu")
+    for k, idx in enumerate(_INERTIA_DIAG_INDICES):
+        scale_9[..., idx] = scales[..., k]
+    inertias[env_ids[:, None], body_ids] = default * scale_9
+    asset.root_physx_view.set_inertias(inertias, env_ids)
 
 
 def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> dict:
@@ -72,7 +118,9 @@ def reset_waypoint_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
 
     env._actions_buf[env_ids] = 0.0
     env._prev_actions[env_ids] = 0.0
+    env._prev_prev_actions[env_ids] = 0.0
     env._unclamped_actions_buf[env_ids] = 0.0
+    env._prev_distance[env_ids] = env._curr_dist_to_waypoint[env_ids]
 
     # Per-episode action-noise bias (zeroed unless DR enabled & per_episode_bias).
     action_noise_cfg = getattr(env.cfg, "action_noise", None)

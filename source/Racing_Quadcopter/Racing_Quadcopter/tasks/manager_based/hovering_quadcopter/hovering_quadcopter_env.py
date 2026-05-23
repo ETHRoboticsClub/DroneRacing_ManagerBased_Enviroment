@@ -50,6 +50,7 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
 
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
+        self._prev_prev_actions = torch.zeros_like(self._actions_buf)
         self._action_noise_bias = torch.zeros_like(self._actions_buf)
         # Raw policy output (pre-clamp, pre-noise) — read by penalty_oversaturation.
         self._unclamped_actions_buf = torch.zeros_like(self._actions_buf)
@@ -68,6 +69,7 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
 
         self._episode_collected_count = torch.zeros(self.num_envs, device=self.device)
         self._curr_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
+        self._prev_distance = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_waypoint_tracks(self) -> None:
         """Generate per-cell tracks (random by default, YAML if ``WAYPOINTS`` set)

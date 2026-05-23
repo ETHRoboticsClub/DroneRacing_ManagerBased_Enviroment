@@ -102,6 +102,8 @@ class QuadcopterMomentsAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         # Save previous applied (delayed) action for smoothness penalty before overwriting.
         if hasattr(self._env, "_prev_actions"):
+            if hasattr(self._env, "_prev_prev_actions") and hasattr(self._env, "_actions_buf"):
+                self._env._prev_prev_actions[:] = self._env._prev_actions
             if hasattr(self._env, "_actions_buf"):
                 self._env._prev_actions[:] = self._env._actions_buf
             else:
@@ -281,6 +283,8 @@ class QuadcopterRatesAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         # Save previous applied (delayed) action for smoothness penalty before overwriting.
         if hasattr(self._env, "_prev_actions"):
+            if hasattr(self._env, "_prev_prev_actions") and hasattr(self._env, "_actions_buf"):
+                self._env._prev_prev_actions[:] = self._env._prev_actions
             if hasattr(self._env, "_actions_buf"):
                 self._env._prev_actions[:] = self._env._actions_buf
             else:
@@ -318,10 +322,17 @@ class QuadcopterRatesAction(ActionTerm):
         self._thrust[:, 0, 2] = 34.192 * thrust_cmd
 
         omega_meas = self._asset.data.root_ang_vel_b
-        omega_des = self._delayed_actions[:, 1:] * self.cfg.rate_command_scale
+
+        omega_des = self._delayed_actions[:, 1:].clone()
+        sc = self.cfg.rate_command_scale
+        omega_des[:, 0] *= sc           # roll
+        omega_des[:, 1] *= sc           # pitch
+        omega_des[:, 2] *= sc / 3.0     # yaw
+
+
         err = omega_des - omega_meas
 
-        dt = self._env.cfg.sim.dt
+        dt = self._env.step_dt 
 
         self._rate_integral = self._rate_integral + err * dt
         ilim = self.cfg.rate_integral_limit
