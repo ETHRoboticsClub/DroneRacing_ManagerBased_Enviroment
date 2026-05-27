@@ -51,8 +51,9 @@ assert DRONE_MODEL in _ALLOWED_DRONE_MODELS, (
     f"Invalid {DRONE_MODEL_ENV_VAR}={DRONE_MODEL!r}. Allowed: {_ALLOWED_DRONE_MODELS}"
 )
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
-
-
+RATES_SCALE = 9.0
+MAXIMUM_THRUST = 0.50
+R_CAPTURE = 0.30    
 # ---------------------------------------------------------------------------
 # Weight dataclass (scaled by 100 so SKRL's rewards_shaper_scale=0.01 restores
 # the human-readable magnitudes — matches the racing convention)
@@ -69,21 +70,16 @@ PROFILE = DRONE_PROFILES[DRONE_MODEL]
 @scale_dataclass_attributes(50.0)
 @dataclass
 class WaypointRewardWeights:
-    DISTANCE_TO_WAYPOINT: float = 0.0 
-    HOVERING_TO_WAYPOINT: float = 10.0
-    MOVING_TO_TARGET: float = 10.0 
-    LIN_VEL: float = -0.0                 
-    ANG_VEL: float = -0.0             
-
-    CRASH: float = -20.0 
-    GOAL_COLLECTED: float = 10.0
-    HIGH_THRUST: float = -2.0
-    ACTION_OUT_OF_RANGE: float = -0.0
-    ACTION_SMOOTHNESS: float = -0.0
-    ACTION_SMOOTHNESS_L2: float = -0.0
-    RATE_TRACKING: float = -0.0
-    THRUST_SMOOTHNESS: float = -2.0
-    ORIENTATION: float = -1.0
+    HOVERING_TO_WAYPOINT: float = 20.0 #To collect the waypoint
+    MOVING_TO_TARGET: float = 20.0     #Better than distance reward, +1 if the distance is getting smaller             
+    ANG_VEL: float = -0.3              #For smoother movements
+    VEL_NEAR_WAYPOINT: float = -0.2    #Settle when close to the target (maybe )
+    CRASH: float = -1000.0 
+    GOAL_COLLECTED: float = 100.0      #Adjust this and decrease ANG_VEL for faster movements
+    HIGH_THRUST: float = -100.0        #To ensure safety 
+    RATE_TRACKING: float = -0.5        #It encourages small error commands of the controller
+    ORIENTATION: float = -0.5          #Unwanted tilts
+    ACTION_SMOOTHNESS: float = -2.0  
 
 
 @configclass
@@ -127,17 +123,20 @@ class ActionsCfg:
     rates: QuadcopterRatesActionCfg = QuadcopterRatesActionCfg(
         body_name="base_link",
         thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
-        rate_command_scale=30.0,
+        rate_command_scale=RATES_SCALE,
         pid_scales=1.0,
         # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
         # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
         #      D=0: yaw authority is too low for derivative term to add meaningful damping
-        pid_p=(0.517, 0.699, 0.657),
+        pid_p=(0.281, 0.281, 0.281), #computed from 
         pid_i=(0.0, 0.0, 0.0),
-        pid_d=(0.035, 0.047, 0.044),
+        pid_d=(0.04, 0.04, 0.04),
         pid_f=(0.0, 0.0, 0.0),
+        pterm_scale = 1.0,
+        dterm_scale = 0.0,
         iterm_scale = 0.0,
         feedforward_scale=0.0,
+        torque_limit=2.0,
     )
 
 
@@ -188,10 +187,7 @@ class ObservationsCfg:
             noise=Unoise(n_min=-0.05, n_max=0.05),
             history_length=history_length,
         )
-        # last_action = ObsTerm(
-        #     func=observations.last_action,
-        #     history_length=history_length,
-        # )
+
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -203,56 +199,56 @@ class ObservationsCfg:
 @scale_dataclass_attributes(50.0)
 @configclass
 class RewardsCfg:
-    ###DISTANCE 
-    distance_to_waypoint = RewTerm(
-        func=rewards.reward_distance_to_waypoint, weight=WaypointRewardWeights.DISTANCE_TO_WAYPOINT
-    )
+
+    # TASK REWARDS
     hovering_to_waypoint = RewTerm(
-        func=rewards.reward_hovering_to_waypoint, weight=WaypointRewardWeights.HOVERING_TO_WAYPOINT
-    )
+        func=rewards.reward_hovering_to_waypoint, weight=WaypointRewardWeights.HOVERING_TO_WAYPOINT,
+        params={"coefficient": 1.0}
+    ) # Distance reward
 
     moving_to_target = RewTerm(
         func=rewards.moving_to_target, weight=WaypointRewardWeights.MOVING_TO_TARGET,
-        params={"threshold": 0.0}
-    )
-
+        params={"factor": 0.00}
+    ) #+1 if distance is getting smaller
     goal_collected = RewTerm(
         func=rewards.reward_waypoint_collected, weight=WaypointRewardWeights.GOAL_COLLECTED
     )
-    ###ACTION 
-    lin_vel = RewTerm(func=rewards.penalty_lin_vel, weight=WaypointRewardWeights.LIN_VEL)
-    crash = RewTerm(func=rewards.penalty_crash, weight=WaypointRewardWeights.CRASH)
 
-    ###ACTION REWARDS
+    # REGULARIZATION & CONTROL REWARDS
+    ang_vel = RewTerm(func=rewards.penalty_ang_vel, weight=WaypointRewardWeights.ANG_VEL)
+    #PENALTIZES HIGH ANGULAR VELOCITY
+
+    vel_near_waypoint = RewTerm(
+        func=rewards.penalty_vel_near_waypoint,
+        weight=WaypointRewardWeights.VEL_NEAR_WAYPOINT,
+        params={"r_threshold": R_CAPTURE, "factor": 5.0},
+    ) #LOW SPEED AT HOVERING
+    
+
     high_thrust = RewTerm(
         func=rewards.penalty_high_thrust,
         weight=WaypointRewardWeights.HIGH_THRUST,
-        params={"threshold": 0.40},
-    )
-    action_out_of_range = RewTerm(
-        func=rewards.penalty_action_out_of_range,
-        weight=WaypointRewardWeights.ACTION_OUT_OF_RANGE,
-        params={"threshold": 1.1},
-    )
-    penalty_action_smoothness_l2 = RewTerm(
-        func=rewards.penalty_action_smoothness_l2, weight=WaypointRewardWeights.ACTION_SMOOTHNESS_L2,
-        params={"threshold": 0.2}
-    )
-    action_smoothness = RewTerm(
-        func=rewards.penalty_action_smoothness_new, weight=WaypointRewardWeights.ACTION_SMOOTHNESS, 
-    )
+        params={"threshold": MAXIMUM_THRUST},
+    ) #PENALTIZES [0,MAXIMUM_THRUST]
+
     penalty_rate_tracking = RewTerm(
         func=rewards.penalty_rate_tracking, weight=WaypointRewardWeights.RATE_TRACKING,
-        params={"threshold": 0.2}
-    )
+        params={"threshold": 1.0, "rate_command_scale": RATES_SCALE}
+    ) #GOOD TO GIVE COMMANDS CLOSE TO OBSERVATIONS
 
-    penalty_thrust_smoothness = RewTerm(
-        func=rewards.penalty_thrust_smoothness, weight=WaypointRewardWeights.THRUST_SMOOTHNESS,
-    )
+    action_smoothness = RewTerm(
+        func=rewards.penalty_action_smoothness, weight=WaypointRewardWeights.ACTION_SMOOTHNESS,
+    ) #FIXES BANG-BANG
+
+    # SAFETY REWARDS
+
     penalty_orientation = RewTerm(
         func=rewards.penalty_orientation, weight=WaypointRewardWeights.ORIENTATION,
         params={"threshold": 0.70}
     )
+
+    crash = RewTerm(func=rewards.penalty_crash, weight=WaypointRewardWeights.CRASH)
+
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +346,8 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     collection_time_s: float = 1.0
 
     # Proximity hysteresis.
-    r_capture: float = 0.20
-    r_hold: float = 0.50
+    r_capture: float = R_CAPTURE
+    r_hold: float = 0.60
 
     # Flight envelope.
     min_height: float = 0.10
@@ -432,6 +428,6 @@ class HoveringQuadcopterEnvCfg_PLAY(HoveringQuadcopterEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.scene.num_envs = 1024
-        self.episode_length_s = 60.0
+        self.episode_length_s = 80.0
         self.eval_mode = True
         print("[INFO] Hovering quadcopter — evaluation mode is ON.")

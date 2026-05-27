@@ -70,6 +70,8 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         self._episode_collected_count = torch.zeros(self.num_envs, device=self.device)
         self._curr_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
         self._prev_distance = torch.zeros(self.num_envs, device=self.device)
+        base_link_ids, _ = self._robot.find_bodies("base_link")
+        self._base_link_body_idx = int(base_link_ids[0])
 
     def _setup_waypoint_tracks(self) -> None:
         """Generate per-cell tracks (random by default, YAML if ``WAYPOINTS`` set)

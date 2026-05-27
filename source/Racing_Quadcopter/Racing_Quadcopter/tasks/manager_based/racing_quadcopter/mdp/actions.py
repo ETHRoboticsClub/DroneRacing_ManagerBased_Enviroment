@@ -16,6 +16,7 @@ from isaaclab.managers import ActionTermCfg
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.buffers.delay_buffer import DelayBuffer
+from isaaclab.utils.math import quat_apply_inverse
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -177,8 +178,13 @@ class QuadcopterRatesAction(ActionTerm):
     Per-axis gains follow Betaflight-style numerators × per-term scales from
     :class:`QuadcopterRatesActionCfg`. Optional ``pid_gain_randomization_frac`` rescales
     coefficients independently per env on each reset.
-    Torque uses :math:`\\tau = K_p e + K_i\\int e\\,dt - K_d \\dot\\omega + K_f \\dot\\omega^{des}`
-    with measured body rate :math:`\\omega` and rate setpoint :math:`\\omega^{des}`.
+    Torque (rate loop, derivative on measurement — no setpoint kick on D):
+
+        e = ω_des − ω
+        τ = Kp·e + Ki·∫e dt − Kd·ω_dot_meas + Kf·(ω_des − ω_des_prev)/Δt
+
+    ``pid_*`` numerators map to N·m via ``pid_scales`` and ``*term_scale`` (set
+    ``dterm_scale=1`` when ``pid_d`` holds physical Kd from ``design_rate_pd_gains.py``).
 
     Uses clamped actions only (no action delay buffer or env ``action_noise`` path).
     """
@@ -327,7 +333,7 @@ class QuadcopterRatesAction(ActionTerm):
         sc = self.cfg.rate_command_scale
         omega_des[:, 0] *= sc           # roll
         omega_des[:, 1] *= sc           # pitch
-        omega_des[:, 2] *= sc / 3.0     # yaw
+        omega_des[:, 2] *= sc    # yaw
 
 
         err = omega_des - omega_meas
@@ -339,21 +345,29 @@ class QuadcopterRatesAction(ActionTerm):
         if ilim is not None and ilim > 0.0:
             self._rate_integral.clamp_(-ilim, ilim)
 
-        omega_dot = torch.zeros_like(omega_meas)
-        omega_des_dot = torch.zeros_like(omega_meas)
-        mask_deriv = ~self._rate_pid_hold_derivative
-        omega_dot[mask_deriv] = (omega_meas[mask_deriv] - self._omega_prev[mask_deriv]) / dt
-        omega_des_dot[mask_deriv] = (omega_des[mask_deriv] - self._omega_des_prev[mask_deriv]) / dt
-        self._omega_prev[:] = omega_meas
+        # D on measured angular acceleration from physics (controller body frame):
+        #   body_ang_acc_w (world) -> selected body frame via body_quat_w[:, body_id]
+        alpha_w = self._asset.data.body_ang_acc_w[:, self._body_id, :]
+        if alpha_w.ndim == 3:
+            alpha_w = alpha_w.squeeze(1)
+        body_quat_w = self._asset.data.body_quat_w[:, self._body_id]
+        omega_dot_meas = quat_apply_inverse(body_quat_w, alpha_w)
+
+
+
+        use_deriv = ~self._rate_pid_hold_derivative
+        omega_des_dot = torch.zeros_like(omega_des)
+        omega_des_dot[use_deriv] = (omega_des[use_deriv] - self._omega_des_prev[use_deriv]) / dt
+
         self._omega_des_prev[:] = omega_des
         self._rate_pid_hold_derivative[:] = False
 
-        tau = (
-            self._kp_rand * self._kp_base * err
-            + self._ki_rand * self._ki_base * self._rate_integral
-            - self._kd_rand * self._kd_base * omega_dot
-            + self._kf_rand * self._kf_base * omega_des_dot
-        )
+        kp = self._kp_rand * self._kp_base
+        ki = self._ki_rand * self._ki_base
+        kd = self._kd_rand * self._kd_base
+        kf = self._kf_rand * self._kf_base
+        tau = kp * err + ki * self._rate_integral - kd * omega_dot_meas + kf * omega_des_dot
+
 
         tlim = self.cfg.torque_limit
         if tlim is not None and tlim > 0.0:

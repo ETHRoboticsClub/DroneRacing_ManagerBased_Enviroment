@@ -15,7 +15,7 @@ plus two new terms for the waypoint-task extension:
     purely additive and intended to be commentable-out without breaking
     learning of the other terms.
 
-Continuous-quantity terms (``lin_vel``, ``ang_vel``, ``distance_to_waypoint``)
+Continuous-quantity terms (``lin_vel``, ``ang_vel``, ``ang_acc``, ``distance_to_waypoint``)
 multiply by ``env.step_dt`` so they integrate to a per-second magnitude
 regardless of policy frequency, matching the original direct env.
 
@@ -33,13 +33,18 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.rewards import *  # noqa: F401, F403
+from isaaclab.utils.math import quat_apply_inverse
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # Mirror of the old direct-env terms (continuous → multiplied by step_dt)
 # ---------------------------------------------------------------------------
 
-def reward_distance_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
+
+def reward_hovering_to_waypoint(env: ManagerBasedRLEnv, coefficient: float = 10.0) -> torch.Tensor:
     """``(d + 2)^3 * step_dt`` for the current target. Matches the old env.
 
     Cubic-shifted form gives a strong gradient even at large distances; the
@@ -48,21 +53,20 @@ def reward_distance_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
     the per-step contribution into a per-second magnitude so the
     integrated penalty over an episode is independent of dt.
     """
-    return torch.exp(-0.5*env._curr_dist_to_waypoint**2) * env.step_dt
-
-
-def reward_hovering_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``(d + 2)^3 * step_dt`` for the current target. Matches the old env.
-
-    Cubic-shifted form gives a strong gradient even at large distances; the
-    +2 shift keeps the derivative finite at d=0 and is more aggressive
-    than a quadratic at every range. Multiplying by ``step_dt`` converts
-    the per-step contribution into a per-second magnitude so the
-    integrated penalty over an episode is independent of dt.
-    """
-    reward = torch.exp(-200*env._curr_dist_to_waypoint**2) + torch.exp(-20*env._curr_dist_to_waypoint**2)
+    reward = torch.exp(-coefficient*env._curr_dist_to_waypoint**2)# + torch.exp(-0.5*env._curr_dist_to_waypoint**2)
     return reward * env.step_dt
 
+
+def penalty_vel_near_waypoint(env: ManagerBasedRLEnv, r_threshold: float = 0.6, factor: float = 5.0) -> torch.Tensor:
+    """``(‖v_b‖² + ‖ω_b‖²) * step_dt`` when distance ≤ *threshold*; else 0.
+
+    Applies only near the active waypoint so the policy can move freely while
+    approaching, then is encouraged to settle once close. Use a negative weight.
+    """
+    near = env._curr_dist_to_waypoint <= r_threshold
+    lin = env._robot.data.root_lin_vel_b.square().sum(dim=1)
+    ang = env._robot.data.root_ang_vel_b.square().sum(dim=1)
+    return (factor*lin + ang) * near.float() * env.step_dt
 
 
 def penalty_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -77,10 +81,29 @@ def penalty_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
 def penalty_ang_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
     """``‖ω_b‖² * step_dt`` — without this the drone learns to circle the goal.
 
-    Comment from the direct-env reward manager: "It learns to circle around
-    when this is too low".
+    ``ω_b`` is body-frame root angular velocity from sim (``root_ang_vel_b``),
+    same signal as the ``base_ang_vel`` observation. Multiplied by ``step_dt``
+    so the term integrates to a per-second magnitude.
     """
     return env._robot.data.root_ang_vel_b.square().sum(dim=1) * env.step_dt
+
+
+def penalty_acceleration(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """``‖α_b‖² * step_dt`` — penalizes body-frame angular acceleration.
+
+    Computes acceleration directly in this reward:
+    PhysX ``body_ang_acc_w`` for the controlled body is rotated from world frame
+    to the same body frame using that body's quaternion.
+    """
+    robot = env._robot
+    alpha_w = robot.data.body_ang_acc_w[:, env._base_link_body_idx, :]
+    if alpha_w.ndim == 3:
+        alpha_w = alpha_w.squeeze(1)
+    body_quat_w = robot.data.body_quat_w[:, env._base_link_body_idx]
+    alpha_b = quat_apply_inverse(body_quat_w, alpha_w)
+    return alpha_b.square().sum(dim=1) * env.step_dt
+
+
 
 
 def penalty_action_magnitude(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -110,20 +133,21 @@ def penalty_rate_tracking(
     env: ManagerBasedRLEnv,
     threshold: float = 0.2,
     rate_command_scale: float = 10.0,
-    yaw_scale_divisor: float = 3.0,
 ) -> torch.Tensor:
     """Penalise body-rate tracking error above *threshold* [rad/s].
 
-    ``ω_des`` matches :class:`QuadcopterRatesAction`` scaling on ``_actions_buf``:
-    roll/pitch × ``rate_command_scale``, yaw × ``rate_command_scale / yaw_scale_divisor``.
+    Uses post-clamp commands from ``_actions_buf`` (written by
+    :class:`QuadcopterRatesAction` as clipped, optionally delayed sticks).
+    ``ω_des``: roll/pitch × ``rate_command_scale``,
+    yaw × ``rate_command_scale / yaw_scale_divisor``.
     Per-axis excess ``max(0, |ω_meas - ω_des| - threshold)`` is squared and summed.
     """
     omega_meas = env._robot.data.root_ang_vel_b
-    omega_des = env._actions_buf[:, 1:].clone()
     sc = rate_command_scale
+    omega_des = env._actions_buf[:, 1:].clamp(-1.0, 1.0).clone()
     omega_des[:, 0] *= sc
     omega_des[:, 1] *= sc
-    omega_des[:, 2] *= sc / yaw_scale_divisor
+    omega_des[:, 2] *= sc 
 
     err = omega_meas - omega_des
     excess = (err.abs() - threshold).clamp(min=0.0)
@@ -148,18 +172,18 @@ def penalty_action_smoothness_l2(env: ManagerBasedRLEnv, threshold:0.2) -> torch
     penalty = ((diff1-diff2).abs()-threshold).clamp(min=0.0)
     return penalty.sum(dim=1) * env.step_dt
 
-def moving_to_target(env: ManagerBasedRLEnv, threshold: float = 0.0) -> torch.Tensor:
+def moving_to_target(env: ManagerBasedRLEnv, factor: float = 0.0) -> torch.Tensor:
     """+1 when approaching the waypoint outside *threshold* m; +1 when inside *threshold* m.
 
     Outside ``threshold``: +1 only if distance decreased since the previous step. Inside: always +1.
     """
     distance = env._curr_dist_to_waypoint
     prev = env._prev_distance
-    reducing = distance < prev
-    within = distance <= threshold
+    reducing = distance < prev - factor 
+
 
     reward = reducing.float()
-    reward[within] = 1.0
+
 
     env._prev_distance[:] = distance
     return reward*env.step_dt
@@ -221,10 +245,9 @@ def penalty_high_thrust(env: ManagerBasedRLEnv, threshold: float = 0.7) -> torch
     """
     thrust_action = env._unclamped_actions_buf[:, 0]
     thrust_scaled = (thrust_action + 1.0) * 0.5
-    thrust_excess = (thrust_scaled - threshold).clamp(min=0.0)
-    #thrust_excess0 = (thrust_action - 0.0).clamp(max=0.0)
-
-    error = thrust_excess.square() #+ thrust_excess0.square()   
+    high_excess = (thrust_scaled - threshold).clamp(min=0.0)
+    low_excess = (0.0 - thrust_scaled).clamp(min=0.0)
+    error = high_excess.square() + low_excess.square()
 
 
 
@@ -242,7 +265,7 @@ def penalty_action_out_of_range(env: ManagerBasedRLEnv, threshold: float = 1.0) 
     return excess.square().sum(dim=1) * env.step_dt
 
 
-def penalty_thrust_smoothness(env: ManagerBasedRLEnv, threshold: float = 0.1) -> torch.Tensor:
+def penalty_thrust_smoothness(env: ManagerBasedRLEnv) -> torch.Tensor:
     """``(a_t - 2 a_{t-1} + a_{t-2})² * step_dt`` on thrust (action 0)."""
     accel = (
         env._actions_buf[:, 0]
@@ -250,8 +273,8 @@ def penalty_thrust_smoothness(env: ManagerBasedRLEnv, threshold: float = 0.1) ->
         + env._prev_prev_actions[:, 0]
     )
 
-    error = (accel.abs()-threshold).clamp(min=0.0)
-    return error.square() * env.step_dt
+    error = accel.square()
+    return error * env.step_dt
 
 def penalty_orientation(env: ManagerBasedRLEnv, threshold: float = 0.90) -> torch.Tensor:
 
