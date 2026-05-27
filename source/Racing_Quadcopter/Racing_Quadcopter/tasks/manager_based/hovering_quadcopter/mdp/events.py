@@ -133,3 +133,59 @@ def reset_waypoint_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
         env._action_noise_bias[env_ids] = torch.rand(n, 4, device=env.device) * (b - a) + a
     else:
         env._action_noise_bias[env_ids] = 0.0
+
+
+def reset_cardinal_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Deterministic cardinal-direction spawn for evaluation.
+
+    Mirrors ``test_controller_offline.py``: drone is placed 1 m from a fixed
+    goal at [0, 0, 1] (cell-local) in one of four cardinal directions, with
+    identity orientation, zero body rates, and a small upward vz seed.
+
+    The per-env spawn offset (E/W/N/S) and the world-frame goal are pre-
+    computed once in ``HoveringQuadcopterRLEnv._setup_cardinal_eval_layout``
+    and read here from ``env._eval_spawn_offset`` / ``env._waypoint_positions``.
+
+    Rationale for the upward vz: at exact rest a hover policy reads the state
+    as "stationary and needs full active support against gravity" and tends to
+    spike thrust on the first tick. A small upward velocity simulates the
+    drone already being supported, so the resulting commands reflect what the
+    policy would command in mid-flight rather than at the instant of liftoff.
+    """
+    if env_ids.numel() == 0:
+        return
+    n = env_ids.shape[0]
+
+    env._current_wp_idx[env_ids] = 0
+    env._holding[env_ids] = False
+    env._collection_timer[env_ids] = 0.0
+    env._all_collected_buf[env_ids] = False
+    env._gates_passed[env_ids] = 0
+    env._collected_step_flag[env_ids] = 0.0
+
+    goal_pos = env._waypoint_positions[env_ids, 0]            # [n, 3]
+    spawn_offset = env._eval_spawn_offset[env_ids]            # [n, 3]
+    start_pos = goal_pos + spawn_offset
+
+    # Identity quaternion (w, x, y, z) — body frame == world frame.
+    start_quat = torch.zeros(n, 4, device=env.device)
+    start_quat[:, 0] = 1.0
+    root_pose = torch.cat([start_pos, start_quat], dim=-1)
+
+    # Linear (vx, vy, vz, wx, wy, wz). Upward vz seed = cfg.eval_initial_vz.
+    root_vel = torch.zeros(n, 6, device=env.device)
+    root_vel[:, 2] = float(env.cfg.eval_initial_vz)
+
+    joint_pos = env._robot.data.default_joint_pos[env_ids]
+    joint_vel = env._robot.data.default_joint_vel[env_ids]
+
+    env._robot.write_root_pose_to_sim(root_pose, env_ids)
+    env._robot.write_root_velocity_to_sim(root_vel, env_ids)
+    env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+    env._actions_buf[env_ids] = 0.0
+    env._prev_actions[env_ids] = 0.0
+    env._prev_prev_actions[env_ids] = 0.0
+    env._unclamped_actions_buf[env_ids] = 0.0
+    env._action_noise_bias[env_ids] = 0.0
+    env._prev_distance[env_ids] = env._curr_dist_to_waypoint[env_ids]

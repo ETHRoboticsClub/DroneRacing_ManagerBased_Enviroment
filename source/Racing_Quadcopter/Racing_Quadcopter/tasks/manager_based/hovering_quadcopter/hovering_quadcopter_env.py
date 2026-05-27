@@ -81,9 +81,6 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         if terrain is None or terrain.cfg.terrain_generator is None:
             raise RuntimeError("Hovering env requires a generator terrain.")
         terrain_cfg = terrain.cfg.terrain_generator
-        # TerrainGenerator places each cell so its CENTRE sits at terrain_origin,
-        # but the cell mesh is built corner-origin → subtract size/2 to bridge.
-        centre_offset = np.array([-terrain_cfg.size[0] / 2.0, -terrain_cfg.size[1] / 2.0, 0.0])
 
         terrain_origins = terrain.terrain_origins
         if terrain_origins is None:
@@ -94,6 +91,14 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
             terrain_origins_t = terrain_origins.to(self.device)
         num_rows, num_cols = terrain_origins_t.shape[:2]
         num_cells = num_rows * num_cols
+
+        if getattr(self.cfg, "eval_cardinal_spawn", False):
+            self._setup_cardinal_eval_layout(terrain_origins_t, num_rows, num_cols)
+            return
+
+        # TerrainGenerator places each cell so its CENTRE sits at terrain_origin,
+        # but the cell mesh is built corner-origin → subtract size/2 to bridge.
+        centre_offset = np.array([-terrain_cfg.size[0] / 2.0, -terrain_cfg.size[1] / 2.0, 0.0])
 
         # YAML override has highest priority.
         yaml_path = os.environ.get(WAYPOINTS_ENV_VAR, self.cfg.waypoint_track_yaml)
@@ -148,6 +153,76 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
                     all_positions.append(local + origin)
             stacked = np.concatenate(all_positions, axis=0)
             # Stash the markers handle so the prim stays alive.
+            self._waypoint_markers = draw_waypoints(stacked, device=self.device)
+
+    # ------------------------------------------------------------------
+    # Cardinal-spawn evaluation layout (mirrors test_controller_offline.py)
+    # ------------------------------------------------------------------
+    # Cell ordering → cardinal direction the drone spawns from, relative to
+    # the cell-local goal at [0, 0, 1]. World frame is FLU (+X east, +Y north).
+    _CARDINAL_OFFSETS: tuple[tuple[float, float, float], ...] = (
+        (+1.0, 0.0, 0.0),  # cell 0 — east   (drone +X of goal)
+        (-1.0, 0.0, 0.0),  # cell 1 — west   (drone −X of goal)
+        (0.0, +1.0, 0.0),  # cell 2 — north  (drone +Y of goal)
+        (0.0, -1.0, 0.0),  # cell 3 — south  (drone −Y of goal)
+    )
+    _CARDINAL_LABELS: tuple[str, ...] = ("east", "west", "north", "south")
+
+    def _setup_cardinal_eval_layout(
+        self,
+        terrain_origins_t: torch.Tensor,
+        num_rows: int,
+        num_cols: int,
+    ) -> None:
+        """Place exactly one waypoint per cell at world position
+        ``terrain_origin + [0, 0, 1]`` and assign each env one of the four
+        cardinal spawn offsets based on ``env_id % 4``.
+
+        Requires ``num_rows * num_cols == 4`` (any 1×4 / 4×1 / 2×2 layout works
+        — the env→cell mapping below uses the same scheme as the random track
+        path so cell_idx is well-defined).
+        """
+        num_cells = num_rows * num_cols
+        assert num_cells == 4, (
+            f"eval_cardinal_spawn requires exactly 4 terrain cells (got "
+            f"{num_rows}×{num_cols}={num_cells})."
+        )
+
+        self._waypoint_positions = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self._waypoint_counts = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
+        self._collection_time = torch.full(
+            (self.num_envs,), float(self.cfg.collection_time_s), device=self.device
+        )
+        self._eval_spawn_offset = torch.zeros(self.num_envs, 3, device=self.device)
+
+        offsets_t = torch.tensor(self._CARDINAL_OFFSETS, device=self.device, dtype=torch.float32)
+        goal_local = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+
+        # Cache per-cell world goal for vis below.
+        cell_goals_world: list[torch.Tensor] = []
+        for cell_idx in range(num_cells):
+            row = cell_idx // num_cols
+            col = cell_idx % num_cols
+            cell_goals_world.append(terrain_origins_t[row, col] + goal_local)
+
+        for env_id in range(self.num_envs):
+            row = (env_id // num_cols) % num_rows
+            col = env_id % num_cols
+            cell_idx = (row * num_cols + col) % num_cells
+            self._waypoint_positions[env_id, 0] = cell_goals_world[cell_idx]
+            self._eval_spawn_offset[env_id] = offsets_t[cell_idx]
+
+        print(
+            "[INFO] Hovering eval (cardinal): "
+            + ", ".join(
+                f"cell{i}={self._CARDINAL_LABELS[i]} @ "
+                f"{cell_goals_world[i].cpu().numpy().round(3).tolist()}"
+                for i in range(num_cells)
+            )
+        )
+
+        if self.cfg.draw_waypoints:
+            stacked = torch.stack(cell_goals_world, dim=0).cpu().numpy()
             self._waypoint_markers = draw_waypoints(stacked, device=self.device)
 
     # ------------------------------------------------------------------

@@ -297,6 +297,16 @@ class EventsCfg:
     reset_waypoint_spawn = EventTerm(func=events.reset_waypoint_spawn, mode="reset")
 
 
+@configclass
+class EvalCardinalEventsCfg(EventsCfg):
+    """Events for the cardinal-spawn eval: same DR fields as the base events
+    (so ``_apply_dr_flags`` can null them) but with the spawn term swapped
+    for ``reset_cardinal_spawn``.
+    """
+
+    reset_waypoint_spawn = EventTerm(func=events.reset_cardinal_spawn, mode="reset")
+
+
 # ---------------------------------------------------------------------------
 # Terminations
 # ---------------------------------------------------------------------------
@@ -370,6 +380,13 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     # Eval flag (used by ``HoveringQuadcopterEnvCfg_PLAY``).
     eval_mode: bool = False
 
+    # Cardinal-spawn eval (used by ``HoveringEvalQuadcopterEnvCfg``). When True
+    # the env replaces random track generation with a single waypoint per cell
+    # at cell-local [0, 0, 1] and assigns each env one of E/W/N/S as the spawn
+    # offset — mirrors ETHRC-Drone-Racing's ``test_controller_offline.py``.
+    eval_cardinal_spawn: bool = False
+    eval_initial_vz: float = 0.5  # m/s, world frame, applied at every reset
+
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200,
         render_interval=4,
@@ -431,3 +448,51 @@ class HoveringQuadcopterEnvCfg_PLAY(HoveringQuadcopterEnvCfg):
         self.episode_length_s = 80.0
         self.eval_mode = True
         print("[INFO] Hovering quadcopter — evaluation mode is ON.")
+
+
+@configclass
+class HoveringEvalQuadcopterEnvCfg(HoveringQuadcopterEnvCfg):
+    """Cardinal-spawn evaluation config (mirror of ``test_controller_offline.py``).
+
+    Layout: exactly 4 terrain cells (1 row × 4 cols). Each cell has one
+    waypoint at cell-local ``[0, 0, 1]``; envs are bound to cells by
+    ``env_id % 4`` and spawn 1 m from the waypoint in the direction
+    determined by ``HoveringQuadcopterRLEnv._CARDINAL_OFFSETS``:
+
+        cell 0 — east  (drone at +X of goal)
+        cell 1 — west  (drone at −X of goal)
+        cell 2 — north (drone at +Y of goal)
+        cell 3 — south (drone at −Y of goal)
+
+    Identity attitude, zero body rates, vz = ``eval_initial_vz`` (m/s, world
+    frame). All domain randomisation / external disturbances disabled, action
+    noise off, so a deterministic policy produces a reproducible trajectory.
+
+    Pair with ``Isaac-Hovering-Eval-Quadcopter-Manager-v0`` via the rsl_rl
+    or skrl play scripts and load a checkpoint to inspect the converged
+    hover behaviour beyond just the first action.
+    """
+
+    # 4 cells in a row.
+    terrain_num_rows: int = 1
+    terrain_num_cols: int = 4
+    cell_size: tuple[float, float] = (6.0, 6.0)
+
+    # One env per cell by default — bump to a multiple of 4 for parallel rollouts.
+    eval_cardinal_spawn: bool = True
+    eval_mode: bool = True
+
+    # Everything off — eval must be deterministic.
+    randomize_mass: bool = False
+    randomize_com: bool = False
+    randomize_inertia: bool = False
+    apply_external_disturbances: bool = False
+
+    events: EvalCardinalEventsCfg = EvalCardinalEventsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.episode_length_s = 10.0
+        self.action_noise.enable = False
+        print("[INFO] Hovering quadcopter — cardinal-spawn evaluation mode is ON.")
