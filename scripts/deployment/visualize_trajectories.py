@@ -46,13 +46,13 @@ QUIVER_LEN_FRAC = 0.06
 # ---------------------------------------------------------------------------
 # IO helpers
 # ---------------------------------------------------------------------------
-def _load_trajectory(path: Path) -> dict[str, np.ndarray]:
+def _load_trajectory(path: Path, key: str = "trajectory") -> dict[str, np.ndarray]:
     with path.open("r") as f:
         data = json.load(f)
-    if "trajectory" not in data or not data["trajectory"]:
-        raise ValueError(f"{path} has no non-empty 'trajectory' field.")
+    if key not in data or not data[key]:
+        raise ValueError(f"{path} has no non-empty '{key}' field.")
 
-    states = data["trajectory"]
+    states = data[key]
     n = len(states)
 
     def stack(key: str, dim: int, default: float = float("nan")) -> np.ndarray:
@@ -110,14 +110,18 @@ def _plot_axis_triplet(ax_triplet, t, vals, *, label: str, color: str, ls: str =
         ax.plot(t, v, color=color, linestyle=ls, linewidth=1.5, label=label)
 
 
-def visualize(real: dict, sim: dict, save: Path | None) -> None:
+def visualize(real: dict, sim: dict | None, save: Path | None) -> None:
+    """Plot ``real`` (and optionally ``sim``). If ``sim`` is None, only the real trajectory is drawn."""
+    has_sim = sim is not None
+    pos_sets = [real["position"]] + ([sim["position"]] if has_sim else [])
+
     # ----- 3D path (own figure, large) -----
     fig3d = plt.figure(figsize=(12, 10))
     ax3d = fig3d.add_subplot(111, projection="3d")
 
-    # Shared color scale for angular-velocity magnitude across both traces.
+    # Shared color scale for angular-velocity magnitude.
     real_w_mag = _vec_mag(real["angular_velocity"])
-    sim_w_mag = _vec_mag(sim["angular_velocity"])
+    sim_w_mag = _vec_mag(sim["angular_velocity"]) if has_sim else np.zeros((0,))
     w_all = np.concatenate([w for w in (real_w_mag, sim_w_mag) if w.size and np.isfinite(w).any()])
     if w_all.size and np.isfinite(w_all).any():
         norm = Normalize(vmin=float(np.nanmin(w_all)), vmax=float(np.nanmax(w_all)) + 1e-9)
@@ -125,29 +129,34 @@ def visualize(real: dict, sim: dict, save: Path | None) -> None:
         norm = Normalize(vmin=0.0, vmax=1.0)
     cmap = "viridis"
 
-    # Path lines colored by |ω|. Same colormap on both so the reader can
-    # compare the angular-rate signature of real vs sim at a glance.
-    lc_real = _add_colored_path(ax3d, real["position"], real_w_mag, cmap=cmap, norm=norm, linewidth=1.6, linestyle="-")
-    lc_sim = _add_colored_path(ax3d, sim["position"], sim_w_mag, cmap=cmap, norm=norm, linewidth=2.6, linestyle="--")
+    # Path lines colored by |ω|.
+    _add_colored_path(ax3d, real["position"], real_w_mag, cmap=cmap, norm=norm, linewidth=1.6, linestyle="-")
+    if has_sim:
+        _add_colored_path(ax3d, sim["position"], sim_w_mag, cmap=cmap, norm=norm, linewidth=2.6, linestyle="--")
 
     # Orientation quivers (body-z axis = thrust direction) at sampled points.
-    box_diag = _bbox_diag(real["position"], sim["position"])
+    box_diag = _bbox_diag(*pos_sets)
     arrow_len = box_diag * QUIVER_LEN_FRAC + 1e-6
     _draw_orientation_quivers(ax3d, real["position"], real["orientation"], color="tab:blue", length=arrow_len)
-    _draw_orientation_quivers(ax3d, sim["position"], sim["orientation"], color="tab:orange", length=arrow_len)
+    if has_sim:
+        _draw_orientation_quivers(ax3d, sim["position"], sim["orientation"], color="tab:orange", length=arrow_len)
 
-    # Start markers + dummy legend handles (Line3DCollection has no nice legend label).
+    # Start markers + dummy legend handles.
     ax3d.scatter(*real["position"][0], color="tab:blue", marker="o", s=60, label="real start")
-    ax3d.scatter(*sim["position"][0], color="tab:orange", marker="o", s=60, label="sim start")
     ax3d.plot([], [], [], color="tab:blue", linewidth=1.6, label="real path (colored by |ω|)")
-    ax3d.plot([], [], [], color="tab:orange", linewidth=2.6, linestyle="--", label="sim path (colored by |ω|)")
+    if has_sim:
+        ax3d.scatter(*sim["position"][0], color="tab:orange", marker="o", s=60, label="sim start")
+        ax3d.plot([], [], [], color="tab:orange", linewidth=2.6, linestyle="--", label="sim path (colored by |ω|)")
 
     ax3d.set_xlabel("x [m]")
     ax3d.set_ylabel("y [m]")
     ax3d.set_zlabel("z [m]")
-    ax3d.set_title("3D trajectory  •  arrows = body-z  •  color = |ω|")
+    title = "3D trajectory  •  arrows = body-z  •  color = |ω|"
+    if not has_sim:
+        title += "  •  real only"
+    ax3d.set_title(title)
     ax3d.legend(loc="upper right", fontsize=8)
-    _equalize_3d_axes(ax3d, real["position"], sim["position"])
+    _equalize_3d_axes(ax3d, *pos_sets)
 
     # Colorbar for |ω|.
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
@@ -161,7 +170,8 @@ def visualize(real: dict, sim: dict, save: Path | None) -> None:
 
     # Position
     _plot_axis_triplet(pos_axes, real["t"], real["position"], label="real", color="tab:blue")
-    _plot_axis_triplet(pos_axes, sim["t"], sim["position"], label="sim", color="tab:orange", ls="--")
+    if has_sim:
+        _plot_axis_triplet(pos_axes, sim["t"], sim["position"], label="sim", color="tab:orange", ls="--")
     for ax, name in zip(pos_axes, ("x", "y", "z")):
         ax.set_ylabel(f"pos {name} [m]")
         ax.grid(True, alpha=0.3)
@@ -169,29 +179,34 @@ def visualize(real: dict, sim: dict, save: Path | None) -> None:
 
     # Linear velocity
     _plot_axis_triplet(vel_axes, real["t"], real["linear_velocity"], label="real", color="tab:blue")
-    _plot_axis_triplet(vel_axes, sim["t"], sim["linear_velocity"], label="sim", color="tab:orange", ls="--")
+    if has_sim:
+        _plot_axis_triplet(vel_axes, sim["t"], sim["linear_velocity"], label="sim", color="tab:orange", ls="--")
     for ax, name in zip(vel_axes, ("x", "y", "z")):
         ax.set_ylabel(f"v{name} [m/s]")
         ax.grid(True, alpha=0.3)
 
     # Orientation (Euler)
     real_rpy = _quat_to_euler_deg(real["orientation"])
-    sim_rpy = _quat_to_euler_deg(sim["orientation"])
     _plot_axis_triplet(rpy_axes, real["t"], real_rpy, label="real", color="tab:blue")
-    _plot_axis_triplet(rpy_axes, sim["t"], sim_rpy, label="sim", color="tab:orange", ls="--")
+    if has_sim:
+        sim_rpy = _quat_to_euler_deg(sim["orientation"])
+        _plot_axis_triplet(rpy_axes, sim["t"], sim_rpy, label="sim", color="tab:orange", ls="--")
     for ax, name in zip(rpy_axes, ("roll", "pitch", "yaw")):
         ax.set_ylabel(f"{name} [deg]")
         ax.set_xlabel("t [s]")
         ax.grid(True, alpha=0.3)
 
-    fig_ts.suptitle("Real vs replayed trajectory — time series", fontsize=14)
+    fig_ts.suptitle(("Real vs replayed trajectory" if has_sim else "Real trajectory") + " — time series", fontsize=14)
     fig_ts.tight_layout(rect=(0, 0, 1, 0.97))
 
     # ----- Optional third figure: body rates -----
-    if not np.isnan(real["angular_velocity"]).all() or not np.isnan(sim["angular_velocity"]).all():
+    real_w_finite = not np.isnan(real["angular_velocity"]).all()
+    sim_w_finite = has_sim and not np.isnan(sim["angular_velocity"]).all()
+    if real_w_finite or sim_w_finite:
         fig_w, axs_w = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
         _plot_axis_triplet(axs_w, real["t"], real["angular_velocity"], label="real", color="tab:blue")
-        _plot_axis_triplet(axs_w, sim["t"], sim["angular_velocity"], label="sim", color="tab:orange", ls="--")
+        if has_sim:
+            _plot_axis_triplet(axs_w, sim["t"], sim["angular_velocity"], label="sim", color="tab:orange", ls="--")
         for ax, name in zip(axs_w, ("ωx (roll)", "ωy (pitch)", "ωz (yaw)")):
             ax.set_ylabel(f"{name} [rad/s]")
             ax.grid(True, alpha=0.3)
@@ -295,16 +310,81 @@ def _equalize_3d_axes(ax, *point_sets: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Visualize real vs replayed drone trajectories.")
-    p.add_argument("--real", type=str, required=True, help="JSON with the recorded (real-world) trajectory.")
-    p.add_argument("--sim", type=str, required=True, help="JSON with the replayed sim trajectory.")
+    p.add_argument(
+        "--real",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON with the recorded (real-world) trajectory. "
+            "If omitted, the visualizer reads the 'reference_trajectory' embedded in --sim "
+            "(written by replay_actions.py, already sliced to the replay window)."
+        ),
+    )
+    p.add_argument(
+        "--sim",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON with the replayed sim trajectory. "
+            "If omitted, only the --real trajectory is plotted (no comparison)."
+        ),
+    )
     p.add_argument("--save", type=str, default=None, help="Optional path to save the main figure (PNG).")
+    p.add_argument(
+        "--start_step",
+        type=int,
+        default=0,
+        help="Plot states starting from this index (applied to both --real and --sim).",
+    )
+    p.add_argument(
+        "--end_step",
+        type=int,
+        default=None,
+        help="Stop plotting at this index (exclusive). Default: end of trajectory.",
+    )
     return p.parse_args()
+
+
+def _slice(traj: dict, start: int, end: int | None) -> dict:
+    """Slice every per-step array in a loaded trajectory dict to ``[start, end)``."""
+    out = dict(traj)
+    for k in ("t", "position", "linear_velocity", "orientation", "angular_velocity"):
+        if k in out and hasattr(out[k], "shape") and out[k].shape[0] > 0:
+            n = out[k].shape[0]
+            s = max(0, min(start, n))
+            e = n if end is None else max(s, min(int(end), n))
+            out[k] = out[k][s:e]
+    return out
 
 
 def main() -> None:
     args = _parse_args()
-    real = _load_trajectory(Path(args.real).resolve())
-    sim = _load_trajectory(Path(args.sim).resolve())
+    if args.real is None and args.sim is None:
+        raise SystemExit("Need at least one of --real or --sim.")
+
+    sim = None
+    if args.sim is not None:
+        sim_path = Path(args.sim).resolve()
+        sim = _load_trajectory(sim_path)
+        print(f"[INFO] Sim trajectory loaded from --sim ({sim['t'].shape[0]} states).")
+
+    if args.real is not None:
+        real = _load_trajectory(Path(args.real).resolve())
+        print(f"[INFO] Real trajectory loaded from --real ({real['t'].shape[0]} states).")
+    else:
+        # Fall back to the reference embedded in the sim file.
+        real = _load_trajectory(Path(args.sim).resolve(), key="reference_trajectory")
+        print(f"[INFO] Real trajectory loaded from --sim's embedded 'reference_trajectory' ({real['t'].shape[0]} states).")
+    if args.start_step != 0 or args.end_step is not None:
+        n_real_before = real["t"].shape[0]
+        real = _slice(real, args.start_step, args.end_step)
+        end_str = str(args.end_step) if args.end_step is not None else "end"
+        msg = f"[INFO] Window [{args.start_step}:{end_str}]: real={real['t'].shape[0]}/{n_real_before}"
+        if sim is not None:
+            n_sim_before = sim["t"].shape[0]
+            sim = _slice(sim, args.start_step, args.end_step)
+            msg += f", sim={sim['t'].shape[0]}/{n_sim_before}"
+        print(msg + " states.")
     save = Path(args.save).resolve() if args.save else None
     visualize(real, sim, save)
 
