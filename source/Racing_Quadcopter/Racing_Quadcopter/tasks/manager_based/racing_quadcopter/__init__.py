@@ -52,3 +52,25 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Isaac-Racing-Quadcopter-Competition-v0",
+    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Isaac-Racing-Quadcopter-Competition-Play-v0",
+    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
+    },
+)

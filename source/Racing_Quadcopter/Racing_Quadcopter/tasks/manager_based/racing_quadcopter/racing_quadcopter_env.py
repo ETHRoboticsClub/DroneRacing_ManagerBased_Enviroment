@@ -151,6 +151,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._episode_lap_count = torch.zeros(self.num_envs, device=self.device)
         self._last_lap_step = torch.zeros(self.num_envs, device=self.device)
 
+        # Top-speed metric. _run_max_speed is each env's peak speed since spawn; it is
+        # folded into the global running max _top_speed ONLY when that env completes a
+        # lap (so speeds from runs that crash/time-out are never counted). Reset per env
+        # at episode end; _top_speed persists for the whole run.
+        self._run_max_speed = torch.zeros(self.num_envs, device=self.device)
+        self._top_speed = torch.zeros((), device=self.device)
+
         # Per-passage quality stats accumulated each gate crossing.
         self._passage_velocity_sum = torch.zeros(self.num_envs, device=self.device)
         self._passage_centering_sum = torch.zeros(self.num_envs, device=self.device)

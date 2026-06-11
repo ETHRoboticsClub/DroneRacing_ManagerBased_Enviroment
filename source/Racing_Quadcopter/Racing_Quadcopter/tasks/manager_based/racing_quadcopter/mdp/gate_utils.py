@@ -203,6 +203,7 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
 
     _refresh_current_gate_cache()
     speed = torch.norm(drone_vel, dim=1)  # [N] m/s
+    env._run_max_speed = torch.maximum(env._run_max_speed, speed)  # peak speed since spawn
 
     # Detect gate crossings and update _current_gate_idx / _gates_passed.
     env._gate_passed_buf, env._wrong_crossing_buf = check_gate_passages(env, drone_pos)
@@ -225,6 +226,15 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
             env._episode_lap_time_sum[lap_envs] += lap_time
             env._episode_lap_count[lap_envs] += 1.0
             env._last_lap_step[lap_envs] = env._episode_step_count[lap_envs]
+            # Lap completed → this run's peak speed is now valid; fold into the global max.
+            # Restrict to origin-spawned drones when configured (stats_origin_only).
+            fold_envs = lap_envs
+            if bool(getattr(env.cfg, "stats_origin_only", False)):
+                origin = getattr(env, "_spawned_at_origin", None)
+                if origin is not None:
+                    fold_envs = lap_envs[origin[lap_envs]]
+            if fold_envs.numel() > 0:
+                env._top_speed = torch.maximum(env._top_speed, env._run_max_speed[fold_envs].max())
 
     refresh_crash_buffers_for_step(env)  # updates _crashed_buf and _collision_termination_buf
 

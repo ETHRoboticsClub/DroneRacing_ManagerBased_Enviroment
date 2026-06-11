@@ -319,6 +319,13 @@ class ActionsCfg:
                 moment_scale=PROFILE.moment_scale,
             )
 
+# Observation history windows. Module-level (not class attributes): the ObservationManager
+# enumerates every attribute in a group's __dict__ as a term, and the name must not be
+# ``history_length`` (the inherited ObsGroup field, which would override every term).
+_OURS_OBS_WINDOW = 3
+_MONORACE_OBS_WINDOW = 1
+
+
 @configclass
 class ObservationsCfg:
     """Policy observations."""
@@ -328,13 +335,12 @@ class ObservationsCfg:
         enable_corruption: bool = False
         concatenate_terms: bool = True
         
-        history_length: int = 3
         
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=drone_noise_model_factory(std_noise=0.05, std_bias=0.01, dropout=0.0),
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
         
         #IMU 
@@ -342,19 +348,19 @@ class ObservationsCfg:
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
 
         #ACTION
         last_action = ObsTerm(
             func=observations.last_action,
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
 
 
@@ -362,12 +368,12 @@ class ObservationsCfg:
         obs_gates = ObsTerm(
             func=observations.compute_next_gates_rel_and_fwd_body,
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
         
         velocity_limit = ObsTerm(
             func=observations.velocity_limit_obs,
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
 
     @configclass
@@ -375,32 +381,31 @@ class ObservationsCfg:
         enable_corruption: bool = False
         concatenate_terms: bool = True
 
-        history_length: int = 1
 
         mono_race_gate_position_velocity_gate_frame = ObsTerm(
             func=observations.mono_race_gate_position_velocity_gate_frame,
-            history_length=history_length,
+            history_length=_MONORACE_OBS_WINDOW,
         )
         mono_race_gate_orientations = ObsTerm(
             func=observations.mono_race_gate_orientations,
-            history_length=history_length,
+            history_length=_MONORACE_OBS_WINDOW,
         )
 
         mono_race_future_gates_pose_in_current_gate_frame = ObsTerm(
             func=observations.mono_race_future_gates_pose_in_current_gate_frame,
-            history_length=history_length,
+            history_length=_MONORACE_OBS_WINDOW,
         )
         base_ang_vel = ObsTerm(
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
             scale= 0.2,
-            history_length=history_length,
+            history_length=_MONORACE_OBS_WINDOW,
         )
 
         motor_speeds = ObsTerm(
             func=observations.motor_speeds_obs,
-            history_length=history_length,
+            history_length=_MONORACE_OBS_WINDOW,
         )
 
 

@@ -146,6 +146,12 @@ class ActionsCfg:
 # ---------------------------------------------------------------------------
 # Observations
 # ---------------------------------------------------------------------------
+# Observation history window. Module-level (not a class attribute): the ObservationManager
+# enumerates every attribute in a group's __dict__ as a term, and the name must not be
+# ``history_length`` (the inherited ObsGroup field, which would override every term).
+_HOVER_OBS_WINDOW = 3
+
+
 @configclass
 class ObservationsCfg:
     """Asymmetric actor-critic obs groups.
@@ -162,33 +168,32 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         enable_corruption: bool = False
         concatenate_terms: bool = True
-        history_length: int = 3
 
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
         base_ang_vel = ObsTerm(
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
         next_waypoints = ObsTerm(
             func=observations.next_waypoints_rel_body,
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
         collection_time_const = ObsTerm(
             func=observations.collection_time_const,
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
         collection_progress = ObsTerm(
             func=observations.collection_progress,
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
         last_action = ObsTerm(
             func=observations.last_action,
-            history_length=history_length,
+            history_length=_HOVER_OBS_WINDOW,
         )
 
     @configclass
@@ -197,14 +202,11 @@ class ObservationsCfg:
         enable_corruption: bool = False
 
         # Privileged signal: true body-frame linear velocity. Not available
-        # to the actor (mocap deployment constraint).
-        # Same history_length as PolicyCfg (3). Hardcoded rather than
-        # referencing PolicyCfg.history_length because the enclosing class
-        # name isn't yet in scope inside this nested class body.
+        # to the actor (mocap deployment constraint). Same window as the actor.
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            history_length=3,
+            history_length=_HOVER_OBS_WINDOW,
         )
 
     policy: PolicyCfg = PolicyCfg()

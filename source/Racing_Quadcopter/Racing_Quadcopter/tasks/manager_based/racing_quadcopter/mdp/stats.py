@@ -120,10 +120,13 @@ def step_stats(env: ManagerBasedRLEnv) -> None:
         f"{env._total_lap_time_sum / env._total_lap_count:.1f} s"
         if env._total_lap_count > 0 else "n/a"
     )
+    top_speed  = float(getattr(env, "_top_speed", 0.0))
+    top_str    = f"{top_speed * 3.6:.1f} km/h" if top_speed > 0.0 else "n/a"
 
     _tqdm_write(
         f"[{_stats_mode(env)} Stats | n={len(rw)}] "
-        f"Speed: {speed_str}  |  "
+        f"Avg speed: {speed_str}  |  "
+        f"Top speed: {top_str}  |  "
         f"Gates/ep: {mean_gates}  |  "
         f"Lap%: {lap_pct}  |  "
         f"Lap time: {lap_str}"
@@ -165,7 +168,6 @@ def accumulate_episode_stats(
         if reset_terminated is not None
         else [False] * len(laps_list)
     )
-
     for speed, laps, gp, gc, is_term in zip(speed_list, laps_list, gates_list, gc_list, term_list):
         env._speed_window.append(speed)
 

@@ -27,46 +27,53 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     if env_ids_tensor.numel() == 0:
         return gate_log
 
-    gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[env_ids_tensor].float().mean().item()
-
-    step_counts = env._episode_step_count[env_ids_tensor]
-    valid_steps = step_counts > 0
-    if valid_steps.any():
-        mean_vel = (
-            env._episode_velocity_sum[env_ids_tensor][valid_steps] / step_counts[valid_steps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_velocity"] = mean_vel
+    # Restrict all stats to drones that spawned at the offset origin (when configured). The
+    # curriculum snapshots and buffer zeroing further below still apply to ALL resetting envs.
+    if bool(getattr(env.cfg, "stats_origin_only", False)) and hasattr(env, "_spawned_at_origin"):
+        stats_ids = env_ids_tensor[env._spawned_at_origin[env_ids_tensor]]
     else:
-        gate_log["Episode_Metrics/mean_velocity"] = 0.0
+        stats_ids = env_ids_tensor
 
-    gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[env_ids_tensor].mean().item()
+    # Overall (run-wide) peak speed over any completed run; folded origin-only in gate_utils.
+    gate_log["Episode_Metrics/top_speed"] = env._top_speed.item()
 
-    lap_counts = env._episode_lap_count[env_ids_tensor]
-    has_laps = lap_counts > 0
-    if has_laps.any():
-        mean_lap_time = (
-            env._episode_lap_time_sum[env_ids_tensor][has_laps] / lap_counts[has_laps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_lap_time_s"] = mean_lap_time
-        env._total_lap_time_sum += float(env._episode_lap_time_sum[env_ids_tensor][has_laps].sum().item())
-        env._total_lap_count += int(lap_counts[has_laps].sum().item())
+    if stats_ids.numel() > 0:
+        gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[stats_ids].float().mean().item()
 
-    # Per-env episode mean speed: zero for envs that had no steps.
-    step_counts_all = env._episode_step_count[env_ids_tensor]
-    episode_mean_speed = torch.where(
-        step_counts_all > 0,
-        env._episode_velocity_sum[env_ids_tensor] / step_counts_all.clamp(min=1),
-        torch.zeros_like(step_counts_all),
-    )
+        step_counts = env._episode_step_count[stats_ids]
+        valid_steps = step_counts > 0
+        if valid_steps.any():
+            gate_log["Episode_Metrics/mean_velocity"] = (
+                env._episode_velocity_sum[stats_ids][valid_steps] / step_counts[valid_steps]
+            ).mean().item()
+        else:
+            gate_log["Episode_Metrics/mean_velocity"] = 0.0
 
-    accumulate_episode_stats(
-        env,
-        env_ids_tensor,
-        env._gates_passed[env_ids_tensor],
-        lap_counts,
-        env._gate_counts[env_ids_tensor],
-        episode_mean_speed,
-    )
+        gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[stats_ids].mean().item()
+
+        lap_counts = env._episode_lap_count[stats_ids]
+        has_laps = lap_counts > 0
+        if has_laps.any():
+            gate_log["Episode_Metrics/mean_lap_time_s"] = (
+                env._episode_lap_time_sum[stats_ids][has_laps] / lap_counts[has_laps]
+            ).mean().item()
+            env._total_lap_time_sum += float(env._episode_lap_time_sum[stats_ids][has_laps].sum().item())
+            env._total_lap_count += int(lap_counts[has_laps].sum().item())
+
+        step_counts_all = env._episode_step_count[stats_ids]
+        episode_mean_speed = torch.where(
+            step_counts_all > 0,
+            env._episode_velocity_sum[stats_ids] / step_counts_all.clamp(min=1),
+            torch.zeros_like(step_counts_all),
+        )
+        accumulate_episode_stats(
+            env,
+            stats_ids,
+            env._gates_passed[stats_ids],
+            lap_counts,
+            env._gate_counts[stats_ids],
+            episode_mean_speed,
+        )
 
     # Save passage-quality averages for the curriculum check in the NEXT episode.
     # _last_episode_* persist across resets; the live accumulators are zeroed below.
@@ -93,6 +100,7 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     env._episode_lap_time_sum[env_ids_tensor] = 0.0
     env._episode_lap_count[env_ids_tensor] = 0.0
     env._last_lap_step[env_ids_tensor] = 0.0
+    env._run_max_speed[env_ids_tensor] = 0.0  # discard peak speed of the (now-ended) run
 
     return gate_log
 
@@ -152,14 +160,39 @@ def _write_spawn_state(
 def _sample_spawn_gate(
     env: ManagerBasedRLEnv, env_ids: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample a uniformly random gate index per env and return (spawn_idx, gate_pos, gate_ori).
+    """Sample a gate index per env and return (spawn_idx, gate_pos, gate_ori).
 
-    Each env draws from [0, gate_count-1] independently so multi-difficulty grids
-    (which have different gate counts per row) are handled correctly.
+    The distribution over gates is controlled by ``cfg.spawn_gate_bias`` (a power-law
+    exponent on each gate's rank from the end of the track)::
+
+        weight(gate i) ∝ (gate_count - i) ** spawn_gate_bias
+
+    - ``bias = 0`` → uniform over [0, gate_count-1] (default; original behaviour).
+    - ``bias = 1`` → linear, favouring earlier gates; the first:last spawn ratio is
+      ``gate_count : 1`` (e.g. 6:1 on a 6-gate track → gate 0 ≈ 28.6 %, last ≈ 4.8 %).
+    - higher values steepen the bias toward the first gate.
+
+    Earlier gates are favoured because a drone spawned at gate i also flies the
+    downstream gates once competent, so late gates accrue pass-through coverage;
+    the non-zero tail still gives the final segments direct spawns early in training.
+
+    Each env draws independently so multi-difficulty grids (different gate counts
+    per row) are handled correctly.
     """
     n = len(env_ids)
     gate_counts = env._gate_counts[env_ids].float()  # [N]
-    spawn_idx = (torch.rand(n, device=env.device) * gate_counts).long()  # [N] in [0, count-1]
+    bias = float(getattr(env.cfg, "spawn_gate_bias", 0.0))
+
+    if bias == 0.0:
+        spawn_idx = (torch.rand(n, device=env.device) * gate_counts).long()  # [N] in [0, count-1]
+    else:
+        max_count = int(env._gate_counts[env_ids].max().item())
+        idx = torch.arange(max_count, device=env.device).unsqueeze(0)  # [1, max_count]
+        rank_from_end = gate_counts.unsqueeze(1) - idx                  # [N, max_count]; >0 for valid gates
+        weights = torch.where(
+            rank_from_end > 0, rank_from_end.pow(bias), torch.zeros_like(rank_from_end)
+        )
+        spawn_idx = torch.multinomial(weights, num_samples=1).squeeze(1)  # [N] in [0, count-1]
 
     idx_pos = spawn_idx.view(n, 1, 1).expand(n, 1, 3)
     gate_pos = env._gate_positions[env_ids].gather(1, idx_pos).squeeze(1)  # [N, 3]
