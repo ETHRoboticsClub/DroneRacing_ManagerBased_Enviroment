@@ -96,10 +96,12 @@ def reset_waypoint_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
     # Spawn pose: small jitter above the first waypoint to avoid all drones
     # stacking on the exact point.
     first_wp = env._waypoint_positions[env_ids, 0]  # [n, 3]
+    xy_jitter = float(getattr(env.cfg, "spawn_xy_jitter", 0.3))
+    z_low, z_high = getattr(env.cfg, "spawn_z_jitter", (-0.1, 0.1))
     jitter = torch.zeros(n, 3, device=env.device)
-    jitter[:, 0].uniform_(-0.3, 0.3)
-    jitter[:, 1].uniform_(-0.3, 0.3)
-    jitter[:, 2].uniform_(-0.1, 0.1)
+    jitter[:, 0].uniform_(-xy_jitter, xy_jitter)
+    jitter[:, 1].uniform_(-xy_jitter, xy_jitter)
+    jitter[:, 2].uniform_(float(z_low), float(z_high))
     start_pos = first_wp + jitter
     start_pos[:, 2] = start_pos[:, 2].clamp(min=env.cfg.min_height + 0.1)
 

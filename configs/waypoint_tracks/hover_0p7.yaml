@@ -1,0 +1,8 @@
+# Fixed single-point hover target used for SITL policy bringup.
+#
+# Coordinates are cell-local corner-origin. With the default 15x15 m terrain
+# cells, [7.5, 7.5, 0.7] is the centre of each cell at 0.7 m altitude.
+
+collection_time_s: 999.0
+waypoint_track:
+  - position: [7.5, 7.5, 0.7]

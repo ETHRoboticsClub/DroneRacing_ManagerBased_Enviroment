@@ -375,6 +375,11 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     r_capture: float = R_CAPTURE
     r_hold: float = 0.60
 
+    # Reset distribution around waypoint 0. The defaults preserve the previous
+    # near-target spawn behaviour; sweeps can widen z to train takeoff-to-hover.
+    spawn_xy_jitter: float = 0.3
+    spawn_z_jitter: tuple[float, float] = (-0.1, 0.1)
+
     # Flight envelope.
     min_height: float = 0.10
     max_height: float = 5.0
