@@ -79,3 +79,10 @@ ANEMOS_DRONE_CFG_URDF = ArticulationCfg(
         ),
     },
 )
+
+
+ANEMOS_SITL_DRONE_CFG_URDF = ANEMOS_DRONE_CFG_URDF.replace(
+    spawn=ANEMOS_DRONE_CFG_URDF.spawn.replace(
+        asset_path=os.path.join(_ANEMOS_DIR, "anemos_sitl.urdf"),
+    )
+)

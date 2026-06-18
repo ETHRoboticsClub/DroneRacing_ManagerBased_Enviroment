@@ -29,7 +29,7 @@ from Racing_Quadcopter.terrains.racing_terrain import create_fixed_track_terrain
 from isaaclab.utils import configclass
 
 from isaaclab_assets import CRAZYFLIE_CFG
-from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF
+from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF, ANEMOS_SITL_DRONE_CFG_URDF
 
 from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
 from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterMomentsActionCfg
@@ -157,6 +157,22 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
         pid_d=(32.0, 34.0, 0.45),
+        pid_f=(0.0, 0.0, 0.0),
+    ),
+    "anemos_sitl": _make_profile(
+        ANEMOS_SITL_DRONE_CFG_URDF,
+        body_name="base_link",
+        thrust_to_weight=4.0,
+        moment_scale=(1.16, 1.40, 0.020),
+        motor_k_t=8.1896182,
+        motor_k_d=0.00125,
+        motor_arm_length_m=0.110,
+        motor_omega_max_rad_s=1.0,
+        rate_command_scale=9.0,
+        pid_scales=1.0,
+        pid_p=(0.281, 0.281, 0.281),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(0.04, 0.04, 0.04),
         pid_f=(0.0, 0.0, 0.0),
     ),
 }

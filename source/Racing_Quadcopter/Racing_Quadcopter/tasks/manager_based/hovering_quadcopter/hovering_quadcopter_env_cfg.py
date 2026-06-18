@@ -32,7 +32,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 # Reuse the rates-PID action term and the anemos drone profiles from racing.
-from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.mdp.actions import QuadcopterRatesActionCfg
+from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.mdp.actions import BetaflightSitlSurrogateActionCfg
 from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.racing_quadcopter_env_cfg import DRONE_PROFILES
 
 from .mdp import events, observations, rewards, terminations, scale_dataclass_attributes
@@ -45,15 +45,20 @@ from .terrain import create_waypoint_terrain
 DRONE_MODEL_ENV_VAR = "HOVERING_DRONE_MODEL"
 WAYPOINTS_ENV_VAR = "WAYPOINTS"
 
-_ALLOWED_DRONE_MODELS = ("anemos_usd", "anemos_urdf")
-DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_usd")
+_ALLOWED_DRONE_MODELS = ("anemos_sitl", "anemos_usd", "anemos_urdf")
+DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_sitl")
 assert DRONE_MODEL in _ALLOWED_DRONE_MODELS, (
     f"Invalid {DRONE_MODEL_ENV_VAR}={DRONE_MODEL!r}. Allowed: {_ALLOWED_DRONE_MODELS}"
 )
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 RATES_SCALE = 9.0
-MAXIMUM_THRUST = 0.50
+MAXIMUM_THRUST = 0.60
 R_CAPTURE = 0.30    
+SITL_ACTUATOR_CALIBRATION_PATH = _os.path.join(
+    _os.path.dirname(__file__),
+    "config",
+    "sitl_actuator_calibration.json",
+)
 # ---------------------------------------------------------------------------
 # Weight dataclass (scaled by 100 so SKRL's rewards_shaper_scale=0.01 restores
 # the human-readable magnitudes — matches the racing convention)
@@ -120,10 +125,12 @@ class HoveringQuadcopterSceneCfg(InteractiveSceneCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class ActionsCfg:
-    rates: QuadcopterRatesActionCfg = QuadcopterRatesActionCfg(
+    rates: BetaflightSitlSurrogateActionCfg = BetaflightSitlSurrogateActionCfg(
         body_name="base_link",
-        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        thrust_to_weight=4.0,
         rate_command_scale=RATES_SCALE,
+        thrust_command_limit=MAXIMUM_THRUST,
+        sitl_calibration_path=SITL_ACTUATOR_CALIBRATION_PATH,
         pid_scales=1.0,
         # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
         # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
@@ -157,7 +164,7 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        enable_corruption: bool = True
+        enable_corruption: bool = False
         concatenate_terms: bool = True
         history_length: int = 1
 
@@ -364,12 +371,12 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     max_height: float = 5.0
     upside_down_threshold: float = 0.7
 
-    # Domain-randomization toggles (all default off).
-    randomize_mass: bool = True
-    randomize_com: bool = True
-    randomize_inertia: bool = True
-    randomize_actuator_gains: bool = True
-    apply_external_disturbances: bool = True
+    # SITL parity defaults are deterministic; re-enable these only after parity is measured.
+    randomize_mass: bool = False
+    randomize_com: bool = False
+    randomize_inertia: bool = False
+    randomize_actuator_gains: bool = False
+    apply_external_disturbances: bool = False
 
     # Vis toggle.
     draw_waypoints: bool = True
