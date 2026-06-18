@@ -85,6 +85,8 @@ class WaypointRewardWeights:
     RATE_TRACKING: float = -0.5        #It encourages small error commands of the controller
     ORIENTATION: float = -0.5          #Unwanted tilts
     ACTION_SMOOTHNESS: float = -2.0  
+    ACTION_MAGNITUDE: float = -0.02
+    ACTION_OUT_OF_RANGE: float = -50.0
 
 
 @configclass
@@ -246,6 +248,13 @@ class RewardsCfg:
     action_smoothness = RewTerm(
         func=rewards.penalty_action_smoothness, weight=WaypointRewardWeights.ACTION_SMOOTHNESS,
     ) #FIXES BANG-BANG
+    action_magnitude = RewTerm(
+        func=rewards.penalty_action_magnitude, weight=WaypointRewardWeights.ACTION_MAGNITUDE,
+    )
+    action_out_of_range = RewTerm(
+        func=rewards.penalty_action_out_of_range, weight=WaypointRewardWeights.ACTION_OUT_OF_RANGE,
+        params={"threshold": 0.95},
+    )
 
     # SAFETY REWARDS
 
