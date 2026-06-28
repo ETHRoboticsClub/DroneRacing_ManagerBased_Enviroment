@@ -16,6 +16,83 @@ from isaaclab.utils.math import quat_apply
 from .stats import accumulate_episode_stats
 
 
+def _sample_uniform(
+    shape: tuple[int, ...],
+    low: float,
+    high: float,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(shape, device=device, dtype=torch.float32).uniform_(low, high)
+
+
+def randomize_rigid_body_inertia(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg,
+    inertia_distribution_params: tuple[float, float] = (0.8, 1.2),
+    operation: str = "scale",
+    distribution: str = "uniform",
+) -> None:
+    """Randomize rigid-body inertias if the Isaac/PhysX runtime exposes inertia tensors.
+
+    Isaac Lab provides a stock mass randomizer, but not every installed version exposes a
+    matching inertia event. This helper mirrors the mass-randomization pattern while staying
+    defensive: if the current runtime lacks ``get_inertias``/``set_inertias``, the event
+    prints one warning and otherwise leaves the simulation unchanged.
+    """
+    if env_ids is None or isinstance(env_ids, slice):
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    else:
+        env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    if distribution != "uniform":
+        raise ValueError(f"Unsupported inertia distribution {distribution!r}; only 'uniform' is implemented.")
+    if operation != "scale":
+        raise ValueError(f"Unsupported inertia operation {operation!r}; only 'scale' is implemented.")
+
+    env_ids_cpu = env_ids.to(device="cpu")
+
+    asset = env.scene[asset_cfg.name]
+    physx_view = asset.root_physx_view
+    if not hasattr(physx_view, "get_inertias") or not hasattr(physx_view, "set_inertias"):
+        if not getattr(env, "_warned_missing_inertia_randomization", False):
+            print("[WARN] Inertia randomization requested, but this Isaac runtime has no PhysX inertia API.")
+            env._warned_missing_inertia_randomization = True
+        return
+
+    cache_name = f"_default_inertias_{asset_cfg.name}"
+    default_inertias = getattr(env, cache_name, None)
+    if default_inertias is None:
+        default_inertias = physx_view.get_inertias().clone()
+        setattr(env, cache_name, default_inertias)
+
+    inertias = default_inertias.clone()
+    selected = inertias[env_ids_cpu]
+    inertia_device = selected.device
+    body_ids = getattr(asset_cfg, "body_ids", slice(None))
+    if body_ids is None:
+        body_ids = slice(None)
+    if isinstance(body_ids, int):
+        body_ids = [body_ids]
+
+    body_selected = selected[:, body_ids]
+    low, high = inertia_distribution_params
+    multiplier_shape = body_selected.shape[:2] + (1,) * max(body_selected.ndim - 2, 0)
+    multipliers = _sample_uniform(multiplier_shape, float(low), float(high), inertia_device).to(
+        body_selected.dtype
+    )
+    selected[:, body_ids] = body_selected * multipliers
+
+    try:
+        physx_view.set_inertias(selected, indices=env_ids_cpu)
+    except (TypeError, RuntimeError):
+        inertias[env_ids_cpu] = selected
+        try:
+            physx_view.set_inertias(inertias, indices=env_ids_cpu)
+        except TypeError:
+            physx_view.set_inertias(inertias, env_ids_cpu)
+
+
 def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor: torch.Tensor) -> dict:
     """Snapshot episode stats into _last_episode_* and zero accumulators for the next episode.
 
@@ -48,6 +125,20 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
             ).mean().item()
         else:
             gate_log["Episode_Metrics/mean_velocity"] = 0.0
+
+        has_passages_stats = env._passage_count[stats_ids] > 0
+        if has_passages_stats.any():
+            gate_log["Episode_Metrics/mean_passage_center_offset"] = (
+                env._passage_centering_sum[stats_ids][has_passages_stats]
+                / env._passage_count[stats_ids][has_passages_stats]
+            ).mean().item()
+            gate_log["Episode_Metrics/mean_passage_velocity"] = (
+                env._passage_velocity_sum[stats_ids][has_passages_stats]
+                / env._passage_count[stats_ids][has_passages_stats]
+            ).mean().item()
+        else:
+            gate_log["Episode_Metrics/mean_passage_center_offset"] = 0.0
+            gate_log["Episode_Metrics/mean_passage_velocity"] = 0.0
 
         gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[stats_ids].mean().item()
 

@@ -8,7 +8,7 @@ from ``racing_quadcopter``:
 * competition gate geometry: 1.5 x 1.5 m inner aperture, frame extending only
   OUTWARD (0.6 m per side -> 2.7 m outer), 0.26 m deep,
 * a custom racing-drone profile (``COMPETITION_PROFILE``), flown with the
-  collective-thrust + body-rates action (inner-loop PID -> body torques),
+  collective-thrust + second-order body-rates action,
 * a (24 + 25*k)-dim observation: pose, body velocities, current + next gate inner corners, and
   last action (49 per-frame channels; the stacked terms carry a k-step history),
 * collision termination always active (no curriculum gate) and episode
@@ -27,21 +27,23 @@ import trimesh
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import matrix_from_quat, quat_apply
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse
 
 from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_URDF
 from Racing_Quadcopter.terrains import load_gates_from_yaml
 from Racing_Quadcopter.terrains.racing_gates_cfg import MeshFixedGatesTerrainCfg
 
 from .mdp import events, observations
-from .mdp.actions import QuadcopterRatesActionCfg
+from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterSecondOrderRatesActionCfg
 from .mdp.noise import drone_noise_model_factory
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, TRACK_YAML_ENV_VAR, _make_profile
 
@@ -70,6 +72,10 @@ _GATE_FRAME_WIDTH = (COMPETITION_GATE_OUTER_SIZE - COMPETITION_GATE_INNER_SIZE) 
 COMPETITION_TILE_SIZE = (175.0, 28.0)  # (x, y) tile [m]; contains the full course
 
 COMPETITION_PHYSICS_HZ = 120.0  # PhysX rate fixed by the competition; not configurable
+COMPETITION_TARGET_HOVER_ACTION = 0.276
+COMPETITION_TARGET_THRUST_TO_WEIGHT = 1.0 / COMPETITION_TARGET_HOVER_ACTION # 2.0 / (1.0 + COMPETITION_TARGET_HOVER_ACTION)
+
+COMPETITION_MAX_BODY_RATE_COMMAND = 6.5 # rad/s
 
 _REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
@@ -126,20 +132,20 @@ def create_competition_gate_frame(
 # ---------------------------------------------------------------------------
 # Custom racing-drone profile.
 # A ~0.85 kg 5"-class racing airframe (Anemos URDF, converted on the fly). The
-# control parameters are tuned for that airframe; the env consumes
-# ``thrust_to_weight`` + the body-rate PID gains for the collective-thrust /
-# body-rates action (no direct motor mixing is used here).
+# control parameters are tuned for that airframe; the competition env consumes
+# ``thrust_to_weight`` + body-rate command limits for the collective-thrust /
+# second-order body-rates action (no direct motor mixing is used here).
 # ---------------------------------------------------------------------------
 COMPETITION_PROFILE = _make_profile(
     ANEMOS_DRONE_CFG_URDF,
     body_name="base_link",
-    thrust_to_weight=4.1056,
+    thrust_to_weight=COMPETITION_TARGET_THRUST_TO_WEIGHT,
     moment_scale=(1.16, 1.40, 0.020),  # unused by the rates action; kept for completeness
     motor_k_t=8.54858e-6,
     motor_k_d=1e-8,
     motor_arm_length_m=0.110,
     motor_omega_max_rad_s=1000.0,
-    rate_command_scale=30.0,           # full stick -> 30 rad/s body-rate setpoint
+    rate_command_scale=COMPETITION_MAX_BODY_RATE_COMMAND,          
     pid_scales=0.005,
     pid_p=(45.0, 47.0, 0.64),
     pid_i=(0.0, 0.0, 0.0),
@@ -212,10 +218,37 @@ def gate_inner_corners_track_frame(env: ManagerBasedRLEnv, gate_offset: int = 0)
     return corners_track.reshape(env.num_envs, 12)
 
 
+def gate_inner_corners_body_frame(env: ManagerBasedRLEnv, gate_offset: int = 0) -> torch.Tensor:
+    """Inner-corner positions (NW, NE, SE, SW) of the gate at ``current + gate_offset``,
+    expressed in drone body frame and flattened [N, 12].
+
+    The index is clamped at the final gate (no wrap-around): on a point-to-point
+    course the "next" gate of the last gate is the last gate itself.
+    """
+    idx = torch.minimum(env._current_gate_idx + gate_offset, env._gate_counts - 1)
+    env_ids = torch.arange(env.num_envs, device=env.device)
+    gate_pos = env._gate_positions[env_ids, idx]        # [N, 3] world
+    gate_ori = env._gate_orientations[env_ids, idx]     # [N, 4] wxyz
+    half = (env._gate_sizes * 0.5).unsqueeze(-1)        # [N, 1] inner half-aperture
+
+    signs = torch.tensor(_CORNER_SIGNS, device=env.device)         # [4, 2]
+    corners_local = torch.zeros(env.num_envs, 4, 3, device=env.device)
+    corners_local[:, :, 0] = signs[:, 0] * half                    # X (right)
+    corners_local[:, :, 2] = signs[:, 1] * half                    # Z (up)
+
+    quat_exp = gate_ori.unsqueeze(1).expand(-1, 4, -1)             # [N, 4, 4]
+    corners_w = gate_pos.unsqueeze(1) + quat_apply(quat_exp, corners_local)
+    drone_pos_w = env._robot.data.root_pos_w
+    drone_quat_w = env._robot.data.root_quat_w
+    corners_rel_w = corners_w - drone_pos_w.unsqueeze(1)
+    drone_quat_exp = drone_quat_w.unsqueeze(1).expand(-1, 4, -1)
+    corners_body = quat_apply_inverse(drone_quat_exp, corners_rel_w)
+    return corners_body.reshape(env.num_envs, 12)
+
 # Observation history window. Module-level on purpose: a class-body attribute named
 # ``history_length`` would set the inherited ObsGroup field and override every term's window
 # (including the gate corners), and any other class-body var is mis-read as an observation term.
-_OBS_WINDOW = 3
+_OBS_WINDOW = 1
 
 
 @configclass
@@ -227,17 +260,12 @@ class CompetitionObservationsCfg:
         enable_corruption: bool = False  # toggles to True (activates noise) if domain_randomization is on
         concatenate_terms: bool = True
 
-        # (3) absolute position, track frame (NWU = value - COMPETITION_TRACK_OFFSET)
-        position = ObsTerm(
-            func=position_track_frame,
-            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.01, dropout=0.0),
-            history_length=_OBS_WINDOW,
-        )
+        # absolute position removed; current gate corners are provided directly in body frame
         # (9) body-to-world rotation matrix
-        rotation_matrix = ObsTerm(
-            func=rotation_matrix_obs,
-            history_length=_OBS_WINDOW,
-        )
+        # rotation_matrix = ObsTerm(
+        #     func=rotation_matrix_obs,
+        #     history_length=_OBS_WINDOW,
+        # )
         # (3) body-frame linear velocity
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
@@ -259,18 +287,18 @@ class CompetitionObservationsCfg:
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
             history_length=_OBS_WINDOW,
         )
-        # (12) inner corners of the current gate (NW, NE, SE, SW), track frame
+        # (12) inner corners of the current gate (NW, NE, SE, SW), body frame
         current_gate_corners = ObsTerm(
-            func=gate_inner_corners_track_frame,
+            func=gate_inner_corners_body_frame,
             params={"gate_offset": 0},
             history_length=1,  # Keep at 1, breaks otherwise (positions jump with gate passages)
         )
-        # (12) inner corners of the next gate, track frame
-        next_gate_corners = ObsTerm(
-            func=gate_inner_corners_track_frame,
-            params={"gate_offset": 1},
-            history_length=1,  # Keep at 1, breaks otherwise (positions jump with gate passages)
-        )
+        # (12) inner corners of the next gate, body frame
+        # next_gate_corners = ObsTerm(
+        #     func=gate_inner_corners_body_frame,
+        #     params={"gate_offset": 1},
+        #     history_length=1,  # Keep at 1, breaks otherwise (positions jump with gate passages)
+        # )
         # (4) previous action
         last_action = ObsTerm(
             func=observations.last_action,
@@ -309,15 +337,131 @@ def upside_down(env: ManagerBasedRLEnv) -> torch.Tensor:
 # Curriculum
 # ---------------------------------------------------------------------------
 
+class adaptive_reward_scale_from_lap_completion_ratio(ManagerTermBase):
+    """Windowed curriculum controller based on lap-completion ratio.
+
+    Every ``eval_interval_s`` seconds, computes:
+      lap_complete_ratio = (# resets terminated by lap_complete) / (# resets in window)
+
+    Then updates a shared scale for ``action_smoothness`` and ``gate_centering``:
+      - if ratio < low_ratio_threshold: scale *= (1 - scale_step_fraction)
+      - if ratio > high_ratio_threshold: scale *= (1 + scale_step_fraction)
+      - else: keep scale unchanged
+
+    Scale is clipped to ``[min_scale, max_scale]``.
+    """
+
+    def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._smoothness_cfg = env.reward_manager.get_term_cfg("action_smoothness")
+        self._centering_cfg = env.reward_manager.get_term_cfg("gate_centering")
+        self._base_smoothness_weight = float(self._smoothness_cfg.weight)
+        self._base_centering_weight = float(self._centering_cfg.weight)
+        self._scale_smoothness = 1.0
+        self._scale_centering = 1.0
+        self._window_lap_complete_resets = 0.0
+        self._window_total_resets = 0.0
+        self._last_eval_step = int(env.common_step_counter)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids,
+        lap_complete_term: str = "lap_complete",
+        eval_interval_s: float = 120.0,
+        low_ratio_threshold: float = 0.50,
+        high_ratio_threshold: float = 0.75,
+        scale_step_fraction: float = 0.10,
+        min_scale: float = 1.0,
+        max_scale_smoothness: float = 50.0,
+        max_scale_centering: float = 5.0,
+    ) -> dict[str, float]:
+        # Accumulate reset statistics for this call.
+        env_ids_tensor = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
+        if env_ids_tensor.numel() > 0:
+            lap_complete_mask = env.termination_manager.get_term(lap_complete_term)[env_ids_tensor]
+            self._window_lap_complete_resets += float(lap_complete_mask.float().sum().item())
+            self._window_total_resets += float(env_ids_tensor.numel())
+
+        # Evaluate at fixed wall-time in simulation seconds (using RL-step timebase).
+        interval_steps = max(1, int(round(float(eval_interval_s) / float(env.step_dt))))
+        curr_step = int(env.common_step_counter)
+        updated = 0.0
+        ratio = (
+            self._window_lap_complete_resets / self._window_total_resets
+            if self._window_total_resets > 0.0
+            else 0.0
+        )
+        if (curr_step - self._last_eval_step) >= interval_steps:
+            step_frac = max(0.0, float(scale_step_fraction))
+            lo = float(min_scale)
+            hi_smoothness = float(max_scale_smoothness)
+            hi_centering = float(max_scale_centering)
+            if hi_smoothness < lo:
+                hi_smoothness = lo
+            if hi_centering < lo:
+                hi_centering = lo
+
+            if ratio < float(low_ratio_threshold):
+                self._scale_smoothness *= step_frac/(1+step_frac)
+            elif ratio > float(high_ratio_threshold):
+                self._scale_smoothness *= (1.0 + step_frac)
+            self._scale_smoothness = float(max(lo, min(hi_smoothness, self._scale_smoothness)))
+            
+            if ratio < float(low_ratio_threshold):
+                self._scale_centering *= step_frac/(1+step_frac)
+            elif ratio > float(high_ratio_threshold):
+                self._scale_centering *= (1.0 + step_frac)
+            self._scale_centering = float(max(lo, min(hi_centering, self._scale_centering)))
+
+            self._smoothness_cfg.weight = self._base_smoothness_weight * self._scale_smoothness
+            self._centering_cfg.weight = self._base_centering_weight * self._scale_centering
+            env.reward_manager.set_term_cfg("action_smoothness", self._smoothness_cfg)
+            env.reward_manager.set_term_cfg("gate_centering", self._centering_cfg)
+            updated = 1.0
+
+            print(
+                "[CompetitionCurriculum] Window update: "
+                f"lap_complete_ratio={ratio:.3f}, "
+                f"scale smoothness={self._scale_smoothness:.3f}, "
+                f"scale centering={self._scale_centering:.3f}, "
+                f"new_action_smoothness_weight={self._smoothness_cfg.weight:.6f}, "
+                f"new_gate_centering_weight={self._centering_cfg.weight:.6f}"
+            )
+
+            self._window_lap_complete_resets = 0.0
+            self._window_total_resets = 0.0
+            self._last_eval_step = curr_step
+
+        return {
+            "lap_complete_ratio_window": ratio,
+            "window_total_resets": self._window_total_resets,
+            "window_lap_complete_resets": self._window_lap_complete_resets,
+            "updated": updated,
+            "reward_scale_smoothness": self._scale_smoothness,
+            "reward_scale_centering": self._scale_centering,
+            "smoothness_weight": float(self._smoothness_cfg.weight),
+            "centering_weight": float(self._centering_cfg.weight),
+        }
+
+
 @configclass
 class CompetitionCurriculumCfg:
-    """No staged curriculum — the competition trains in a single fixed regime.
+    """Competition curriculum: periodic reward-scale adaptation from lap-completion ratio."""
 
-    Removing the staged terms decouples the env from ``_curriculum_stage``: there is
-    no stage-0/1/2 progression, no reward-weight boosting, and no recovery spawns turning
-    on mid-training. Collision termination is instead made always-on directly (via the
-    trivial curriculum_* thresholds set in __post_init__), independent of this manager.
-    """
+    precision_after_lap_completion_windowed = CurrTerm(
+        func=adaptive_reward_scale_from_lap_completion_ratio,
+        params={
+            "lap_complete_term": "lap_complete",
+            "eval_interval_s": 60.0,
+            "low_ratio_threshold": 0.50,
+            "high_ratio_threshold": 0.75,
+            "scale_step_fraction": 2.00,
+            "min_scale": 1.0,
+            "max_scale_smoothness": 200.0,
+            "max_scale_centering": 5.0,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +579,28 @@ class CompetitionEventsCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.9, 1.1),
+            "mass_distribution_params": (0.75, 1.25),
             "operation": "scale",
             "distribution": "uniform",
             "recompute_inertia": True,
+        },
+    )
+    randomize_base_com = EventTerm(
+        func=events.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "com_range": {"x": (-0.04, 0.04), "y": (-0.04, 0.04), "z": (-0.03, 0.03)},
+        },
+    )
+    randomize_robot_inertia = EventTerm(
+        func=events.randomize_rigid_body_inertia,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "inertia_distribution_params": (0.6, 1.6),
+            "operation": "scale",
+            "distribution": "uniform",
         },
     )
     randomize_robot_actuator_gains = EventTerm(
@@ -458,8 +620,8 @@ class CompetitionEventsCfg:
         interval_range_s=(3.0, 10.0),
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
-            "force_range": (-0.02, 0.02),
-            "torque_range": (-0.02, 0.02),
+            "force_range": (-0.8, 0.8),
+            "torque_range": (-0.04, 0.04),
         },
     )
 
@@ -504,7 +666,7 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
 
     # Policy (action) rate [Hz]. Physics runs at the competition-fixed COMPETITION_PHYSICS_HZ;
     # decimation = COMPETITION_PHYSICS_HZ / control_hz, so control_hz must divide it evenly.
-    # The rates-PID integrates at the physics step, so changing this may need PID re-tuning.
+    # The second-order rate model integrates at the physics step.
     control_hz: float = 60.0   # decimation = 120 / 60 = 2
 
     def __post_init__(self) -> None:
@@ -515,12 +677,15 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
         self.motor_arm_length_m = COMPETITION_PROFILE.motor_arm_length_m
         self.motor_omega_max_rad_s = COMPETITION_PROFILE.motor_omega_max_rad_s
 
-        # --- collective-thrust + body-rates action (inner-loop PID), no moments ---
+        # --- collective-thrust + PID-less second-order body-rates action ---
         self.actions.moments = None
-        self.actions.rates = QuadcopterRatesActionCfg(
+        # self.actions.rates = QuadcopterRatesActionCfg(
+        self.actions.rates = QuadcopterSecondOrderRatesActionCfg (
             asset_name="robot",
             thrust_to_weight=COMPETITION_PROFILE.thrust_to_weight,
             action_dim=4,
+            min_delay=0,
+            max_delay=2,
             body_name=COMPETITION_PROFILE.body_name,
             pid_scales=COMPETITION_PROFILE.pid_scales,
             pid_p=COMPETITION_PROFILE.pid_p,
@@ -528,7 +693,32 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
             pid_d=COMPETITION_PROFILE.pid_d,
             pid_f=COMPETITION_PROFILE.pid_f,
             rate_command_scale=COMPETITION_PROFILE.rate_command_scale,
+            pid_gain_randomization_frac=None,
+            thrust_to_weight_randomization_frac=None,
+            aero_randomization_enable=False,
+            aero_randomization_frac=0.1,
+            linear_drag_coeff=(0.08, 0.08, 0.12),
+            quadratic_drag_coeff=(0.010, 0.010, 0.018),
+            angular_drag_coeff=(0.0020, 0.0020, 0.0012),
+            
+            rate_filter_enable=True,
+            rate_filter_natural_frequency_hz=(7.5, 7.5, 4.5),
+            rate_filter_natural_frequency_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_damping_ratio=(0.75, 0.75, 0.90),
+            rate_filter_damping_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_command_gain=(1.0, 1.0, 1.0),
+            rate_filter_command_gain_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_max_command_rad_s=COMPETITION_PROFILE.rate_command_scale,
         )
+
+        # Action-level perturbations model command transport, calibration drift, and actuator
+        # uncertainty before the target simulator's hidden rate controller receives commands.
+        self.action_noise.enable = self.domain_randomization
+        self.action_noise.per_episode_bias = True
+        self.action_noise.gaussian_std = 0.015
+        self.action_noise.bias_range = (-0.03, 0.03)
+        self.action_noise.lpf_alpha = 0.85
+        self.action_noise.clip_actions = True
 
         # --- always-on collision termination ---
         # collision_termination fires when (contact > threshold) AND the per-env
@@ -605,8 +795,19 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
         # --- standalone domain randomization (no base _apply_dr_flags) ---
         if not self.domain_randomization:
             self.events.randomize_robot_mass = None
+            self.events.randomize_base_com = None
+            self.events.randomize_robot_inertia = None
             self.events.randomize_robot_actuator_gains = None
             self.events.base_external_force_torque = None
+            self.action_noise.enable = False
+            self.actions.rates.min_delay = 0
+            self.actions.rates.max_delay = 0
+            self.actions.rates.pid_gain_randomization_frac = None
+            self.actions.rates.thrust_to_weight_randomization_frac = None
+            self.actions.rates.rate_filter_natural_frequency_randomization_frac = None
+            self.actions.rates.rate_filter_damping_randomization_frac = None
+            self.actions.rates.rate_filter_command_gain_randomization_frac = None
+            self.actions.rates.aero_randomization_frac = None
         self.observations.policy.enable_corruption = self.domain_randomization
 
 

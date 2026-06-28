@@ -191,7 +191,7 @@ _ACTION_TYPES = ("rates", "moments")
 _OBSERVATION_SPACES = ("mono_race", "ours")
 
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
-ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "moments")
+ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "rates")
 OBSERVATION_SPACE = _os.environ.get(OBSERVATION_SPACE_ENV_VAR, "ours")
 
 _REPO_ROOT = _os.path.normpath(
@@ -211,26 +211,25 @@ assert OBSERVATION_SPACE in _OBSERVATION_SPACES, (
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
 
-# SKRL additionally applies rewards_shaper_scale=0.01 on top.
-@scale_dataclass_attributes(100.0)
+# @scale_dataclass_attributes(1.0)
 @dataclass
 class RewardWeights:
     GATE_PASSAGE: float = 250.0
     GATE_PROGRESS: float = 20.0
-    GATE_CENTERING: float = 0.5
+    GATE_CENTERING: float = 4.0
     VELOCITY_TOWARD_GATE: float = 2.0
-    VELOCITY_LIMIT: float = -0.05
+    VELOCITY_LIMIT: float = -0.5
     PERCEPTION: float = -0.01
     ORIENTATION: float = -0.005
-    ANGULAR_VELOCITY: float = -0.001
-    ACTION_SMOOTHNESS: float = -0.0001
-    ACTION_RATE_THRESH: float = -0.0005
-    LOW_ACTION: float = -0.001
-    ACTION_MAGNITUDE: float = -0.001
+    ANGULAR_VELOCITY: float = -0.03
+    ACTION_SMOOTHNESS: float = -5.0
+    ACTION_MAGNITUDE: float = -1.0
     CRASH: float = -50.0
     WRONG_SIDE: float = -0.1
     
     # Currently not in use
+    # ACTION_RATE_THRESH: float = -0.005
+    # LOW_ACTION: float = -0.001
     # WRONG_DIRECTION: float = -50.0
 
 
@@ -322,7 +321,7 @@ class ActionsCfg:
 # Observation history windows. Module-level (not class attributes): the ObservationManager
 # enumerates every attribute in a group's __dict__ as a term, and the name must not be
 # ``history_length`` (the inherited ObsGroup field, which would override every term).
-_OURS_OBS_WINDOW = 3
+_OURS_OBS_WINDOW = 1
 _MONORACE_OBS_WINDOW = 1
 
 
@@ -439,7 +438,12 @@ class RewardsCfg:
     )
 
     action_magnitude = RewTerm(
-        func=rewards.penalty_action_magnitude, weight=RewardWeights.ACTION_MAGNITUDE
+        func=rewards.penalty_action_magnitude,
+        weight=RewardWeights.ACTION_MAGNITUDE,
+        params={
+            "clip_threshold": 1.0,
+            "clip_excess_multiplier": 100.0,
+        },
     )
     crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
     wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)

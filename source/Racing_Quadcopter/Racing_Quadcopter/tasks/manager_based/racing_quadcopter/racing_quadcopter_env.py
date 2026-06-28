@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+import math
+import time
 
 import numpy as np
 import torch
@@ -69,10 +71,19 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
 
         init_stats(self)
+        self._action_config_log_interval_s = 120.0
+        self._last_action_config_log_wall_time = 0.0
 
         # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
+        # [N, 4] physically scaled command vector: [thrust_N, cmd_x, cmd_y, cmd_z].
+        # cmd_{x,y,z} are body-rate commands for rates control and body moments for moments control.
+        self._physical_scaled_actions = torch.zeros_like(self._actions_buf)
+        self._prev_physical_scaled_actions = torch.zeros_like(self._actions_buf)
+        # Raw policy output (before action manager processing) and one-step lag.
+        self._policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
         # Action-noise per-env bias (sampled at reset if enabled)
         self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
 
@@ -367,9 +378,16 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 intensity=self.cfg.demo_drone_glow_intensity,
             )
 
+        self._log_action_configuration(reason="startup")
+        self._last_action_config_log_wall_time = time.time()
+
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        # Keep a copy of raw network actions before the action manager transforms/clips them.
+        self._prev_policy_raw_actions[:] = self._policy_raw_actions
+        self._policy_raw_actions[:] = action.to(self.device)
+
         # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
-        self.action_manager.process_action(action.to(self.device))
+        self.action_manager.process_action(self._policy_raw_actions)
 
         self.recorder_manager.record_pre_step()
 
@@ -450,6 +468,11 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        # Action diagnostics for evaluation: per-dimension abs-command and abs-command-rate stats
+        # for both raw policy output and scaled/applied commands.
+        self._update_action_diagnostics_log()
+        self._maybe_log_action_configuration()
+
         # Second obs pass: the "real" obs returned to the policy, with history update.
         # Runs after resets so freshly-spawned envs contribute correct observations.
         self.obs_buf = self.observation_manager.compute(update_history=True)
@@ -505,3 +528,186 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 elif isinstance(value, (float, int, bool)):
                     log_tensors[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
             self.extras["log"] = log_tensors
+
+        # Keep raw-action lag buffer aligned with reset state to avoid artificial first-step spikes.
+        self._policy_raw_actions[env_ids_tensor].zero_()
+        self._prev_policy_raw_actions[env_ids_tensor].zero_()
+        self._physical_scaled_actions[env_ids_tensor].zero_()
+        self._prev_physical_scaled_actions[env_ids_tensor].zero_()
+
+    @staticmethod
+    def _p95_per_dim(x: torch.Tensor) -> torch.Tensor:
+        """Compute per-dimension 95th percentile along env dimension."""
+        n = x.shape[0]
+        if n == 0:
+            return torch.zeros(x.shape[1], device=x.device, dtype=x.dtype)
+        k = max(1, int(math.ceil(0.95 * n)))
+        return x.kthvalue(k, dim=0).values
+
+    def _log_action_vector_stats(self, tensor_abs: torch.Tensor, prefix: str) -> None:
+        """Log mean/std/p95 of absolute values for each action dimension."""
+        dim_names = ("thrust", "roll", "pitch", "yaw")
+        means = tensor_abs.mean(dim=0)
+        stds = tensor_abs.std(dim=0, unbiased=False)
+        p95 = self._p95_per_dim(tensor_abs)
+
+        log_dict = self.extras.setdefault("log", {})
+        for i, name in enumerate(dim_names):
+            log_dict[f"ActionStats/{prefix}/mean/{name}"] = means[i]
+            log_dict[f"ActionStats/{prefix}/std/{name}"] = stds[i]
+            log_dict[f"ActionStats/{prefix}/p95/{name}"] = p95[i]
+
+    def _update_action_diagnostics_log(self) -> None:
+        """Log raw, normalized, and physically scaled command diagnostics."""
+        raw_cmd_abs = self._policy_raw_actions.abs()
+        raw_rate_abs = (self._policy_raw_actions - self._prev_policy_raw_actions).abs()
+        normalized_cmd_abs = self._actions_buf.abs()
+        normalized_rate_abs = (self._actions_buf - self._prev_actions).abs()
+
+        self._prev_physical_scaled_actions[:] = self._physical_scaled_actions
+        self._physical_scaled_actions[:] = self._get_physical_scaled_command_vector()
+        physical_scaled_cmd_abs = self._physical_scaled_actions.abs()
+        physical_scaled_rate_abs = (self._physical_scaled_actions - self._prev_physical_scaled_actions).abs()
+
+        self._log_action_vector_stats(raw_cmd_abs, "raw_cmd_abs")
+        self._log_action_vector_stats(raw_rate_abs, "raw_rate_abs")
+        self._log_action_vector_stats(normalized_cmd_abs, "normalized_cmd_abs")
+        self._log_action_vector_stats(normalized_rate_abs, "normalized_rate_abs")
+        self._log_action_vector_stats(physical_scaled_cmd_abs, "physical_scaled_cmd_abs")
+        self._log_action_vector_stats(physical_scaled_rate_abs, "physical_scaled_rate_abs")
+
+    def _get_physical_scaled_command_vector(self) -> torch.Tensor:
+        """Return [thrust_N, cmd_x, cmd_y, cmd_z] after task-specific scaling."""
+        cmd = torch.zeros_like(self._actions_buf)
+        if len(self.action_manager.active_terms) == 0:
+            return cmd
+
+        term = self.action_manager.get_term(self.action_manager.active_terms[0])
+
+        # Thrust is already converted from normalized command into Newtons in the action term.
+        if hasattr(term, "_thrust"):
+            cmd[:, 0] = term._thrust[:, 0, 2]
+
+        if hasattr(term.cfg, "rate_command_scale") and hasattr(term, "_delayed_actions"):
+            # Rates controllers: convert normalized rate commands into body-rate setpoints [rad/s].
+            rate_scale = torch.as_tensor(term.cfg.rate_command_scale, device=self.device, dtype=cmd.dtype)
+            if rate_scale.ndim == 0:
+                rate_scale = rate_scale.repeat(3)
+            cmd[:, 1:] = term._delayed_actions[:, 1:] * rate_scale.view(1, 3)
+        elif hasattr(term, "_moment"):
+            # Moments controller: post-scaling moments [N*m].
+            cmd[:, 1:] = term._moment[:, 0, :]
+        else:
+            # Fallback for unknown action terms: keep normalized command semantics.
+            cmd[:] = self._actions_buf
+
+        return cmd
+
+    @staticmethod
+    def _format_config_value(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        if isinstance(value, (tuple, list)):
+            return "(" + ", ".join(RacingQuadcopterRLEnv._format_config_value(v) for v in value) + ")"
+        return str(value)
+
+    def _log_action_configuration(self, reason: str) -> None:
+        """Print and log the current action-noise / corruption / randomization config."""
+        action_noise_cfg = getattr(self.cfg, "action_noise", None)
+        observations_cfg = getattr(self.cfg, "observations", None)
+        policy_obs_cfg = getattr(observations_cfg, "policy", None)
+        actions_cfg = getattr(self.cfg, "actions", None)
+        rates_cfg = getattr(actions_cfg, "rates", None)
+        moments_cfg = getattr(actions_cfg, "moments", None)
+        action_cfg = rates_cfg if rates_cfg is not None else moments_cfg
+        action_type = "rates" if rates_cfg is not None else ("moments" if moments_cfg is not None else "none")
+
+        fields: dict[str, object] = {
+            "domain_randomization": getattr(self.cfg, "domain_randomization", "n/a"),
+            "observation_noise_enable": getattr(self.cfg, "observation_noise_enable", "n/a"),
+            "observations.policy.enable_corruption": getattr(policy_obs_cfg, "enable_corruption", "n/a"),
+            "action_noise.enable": getattr(action_noise_cfg, "enable", "n/a"),
+            "action_noise.per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", "n/a"),
+            "action_noise.gaussian_std": getattr(action_noise_cfg, "gaussian_std", "n/a"),
+            "action_noise.bias_range": getattr(action_noise_cfg, "bias_range", "n/a"),
+            "action_noise.lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", "n/a"),
+            "action_noise.clip_actions": getattr(action_noise_cfg, "clip_actions", "n/a"),
+            "action_type": action_type,
+        }
+        if action_cfg is not None:
+            fields["action_cfg.max_delay"] = getattr(action_cfg, "max_delay", "n/a")
+
+        if rates_cfg is not None:
+            fields.update(
+                {
+                    "action_cfg.pid_gain_randomization_frac": getattr(rates_cfg, "pid_gain_randomization_frac", "n/a"),
+                    "action_cfg.thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", "n/a"),
+                    "action_cfg.aero_randomization_frac": getattr(rates_cfg, "aero_randomization_frac", "n/a"),
+                }
+            )
+
+        summary = " ".join(f"{key}={self._format_config_value(value)}" for key, value in fields.items())
+        print(f"[ACTION_CFG][{reason}] {summary}")
+
+        log_dict = self.extras.setdefault("log", {})
+        scalar_fields = {
+            "Config/domain_randomization": getattr(self.cfg, "domain_randomization", None),
+            "Config/observation_noise_enable": getattr(self.cfg, "observation_noise_enable", None),
+            "Config/observations_policy_enable_corruption": getattr(policy_obs_cfg, "enable_corruption", None),
+            "Config/action_noise_enable": getattr(action_noise_cfg, "enable", None),
+            "Config/action_noise_per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", None),
+            "Config/action_noise_gaussian_std": getattr(action_noise_cfg, "gaussian_std", None),
+            "Config/action_noise_lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", None),
+            "Config/action_noise_clip_actions": getattr(action_noise_cfg, "clip_actions", None),
+            "Config/action_cfg_max_delay": getattr(action_cfg, "max_delay", None) if action_cfg is not None else None,
+            "Config/action_type_is_rates": 1.0 if rates_cfg is not None else 0.0,
+            "Config/action_type_is_moments": 1.0 if moments_cfg is not None else 0.0,
+        }
+        if rates_cfg is not None:
+            scalar_fields.update(
+                {
+                    "Config/action_cfg_pid_gain_randomization_frac": getattr(
+                        rates_cfg, "pid_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", None),
+                }
+            )
+
+        for key, value in scalar_fields.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            elif isinstance(value, (int, float)):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+
+    def _maybe_log_action_configuration(self) -> None:
+        now = time.time()
+        if now - self._last_action_config_log_wall_time < self._action_config_log_interval_s:
+            return
+        self._last_action_config_log_wall_time = now
+        self._log_action_configuration(reason="heartbeat")

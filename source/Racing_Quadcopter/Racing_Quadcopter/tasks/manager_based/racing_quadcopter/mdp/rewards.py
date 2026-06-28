@@ -101,14 +101,35 @@ def penalty_angular_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def penalty_action_smoothness(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Sum of squared action deltas between consecutive steps. Discourages jitter."""
+    """Sum of squared action deltas between consecutive steps. Discourages jitter.
+
+    The first step after reset is excluded to avoid comparing against a reset/placeholder
+    previous action value.
+    """
     action_diff = env._actions_buf - env._prev_actions  # [N, 4]
-    return action_diff.square().sum(dim=1)
+    penalty = action_diff.square().sum(dim=1)
+    valid = (env.episode_length_buf > 1).to(penalty.dtype)
+    return penalty * valid
 
 
-def penalty_action_magnitude(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Sum of squared action values. Mild regulariser to prevent saturating actuators."""
-    return env._actions_buf.square().sum(dim=1)
+def penalty_action_magnitude(
+    env: ManagerBasedRLEnv, clip_threshold: float = 1.0, clip_excess_multiplier: float = 100.0
+) -> torch.Tensor:
+    """Action-magnitude regularizer with extra penalty when raw commands exceed a threshold.
+
+    Base term is the squared norm of normalized applied commands (``_actions_buf``). If raw
+    policy output exceeds ``clip_threshold`` in any action dimension for an env, the full
+    magnitude penalty for that env is multiplied by ``clip_excess_multiplier``.
+    """
+    raw_policy_actions = env._policy_raw_actions
+    base_penalty = raw_policy_actions.square().sum(dim=1)
+    exceeds = raw_policy_actions.abs().max(dim=1).values > float(clip_threshold)
+    scale = torch.where(
+        exceeds,
+        torch.full_like(base_penalty, float(clip_excess_multiplier)),
+        torch.ones_like(base_penalty),
+    )
+    return base_penalty * scale
 
 
 def penalty_crash(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -183,4 +204,3 @@ def penalty_low_action(env: ManagerBasedRLEnv, low_floor_norm: float = 0.5) -> t
     omega_max = env.cfg.motor_omega_max_rad_s
     w = env._motor_speeds / omega_max
     return (low_floor_norm - w).clamp(min=0.0).sum(dim=1)
-

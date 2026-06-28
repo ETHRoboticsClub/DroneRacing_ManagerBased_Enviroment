@@ -23,8 +23,6 @@ Each function returns the **unweighted** factor for that term — shape [N].
 ``RewardManager`` multiplies by the configured weight from
 :class:`WaypointRewardWeights`. Each weight in the cfg is the original
 direct-env weight × the old env's ``reward_scale=0.2``; the
-``@scale_dataclass_attributes(100.0)`` decorator scales by 100 so SKRL's
-``rewards_shaper_scale=0.01`` produces the original effective magnitudes.
 """
 
 from __future__ import annotations
