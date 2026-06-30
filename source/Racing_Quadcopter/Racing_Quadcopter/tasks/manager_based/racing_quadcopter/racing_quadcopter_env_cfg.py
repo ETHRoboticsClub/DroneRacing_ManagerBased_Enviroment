@@ -254,7 +254,8 @@ class ActionNoiseCfg:
 
     - gaussian_std: per-step additive noise on actions
     - per_episode_bias: sampled bias added to actions each episode
-    - lpf_alpha: first-order low-pass applied to actions (1.0=no smoothing)
+    - lpf_alpha: scalar fallback low-pass coefficient (1.0=no smoothing)
+    - lpf_alpha_range: per-episode sampled LPF coefficient range (low, high)
     """
 
     enable: bool = False
@@ -262,6 +263,8 @@ class ActionNoiseCfg:
     gaussian_std: float = 0.0
     bias_range: tuple[float, float] = (-0.0, 0.0)
     lpf_alpha: float = 1.0 # No lag; set <1.0 to simulate actuator lag.
+    per_episode_lpf_alpha: bool = True
+    lpf_alpha_range: tuple[float, float] = (1.0, 1.0)
     clip_actions: bool = True
 
 

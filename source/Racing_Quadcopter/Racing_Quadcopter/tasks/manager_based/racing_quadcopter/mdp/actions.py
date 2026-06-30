@@ -122,8 +122,14 @@ class QuadcopterMomentsAction(ActionTerm):
             if getattr(noise_cfg, "per_episode_bias", False) and hasattr(self._env, "_action_noise_bias"):
                 cmd = cmd + self._env._action_noise_bias
 
-            alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
-            if alpha < 1.0:
+            alpha_tensor = getattr(self._env, "_action_noise_lpf_alpha", None)
+            if isinstance(alpha_tensor, torch.Tensor):
+                alpha = alpha_tensor
+            else:
+                alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
+            if isinstance(alpha, torch.Tensor):
+                cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
+            elif alpha < 1.0:
                 cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
 
             if getattr(noise_cfg, "clip_actions", True):
@@ -324,8 +330,14 @@ class QuadcopterRatesAction(ActionTerm):
             if getattr(noise_cfg, "per_episode_bias", False) and hasattr(self._env, "_action_noise_bias"):
                 cmd = cmd + self._env._action_noise_bias
 
-            alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
-            if alpha < 1.0:
+            alpha_tensor = getattr(self._env, "_action_noise_lpf_alpha", None)
+            if isinstance(alpha_tensor, torch.Tensor):
+                alpha = alpha_tensor
+            else:
+                alpha = float(getattr(noise_cfg, "lpf_alpha", 1.0))
+            if isinstance(alpha, torch.Tensor):
+                cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
+            elif alpha < 1.0:
                 cmd = alpha * cmd + (1.0 - alpha) * prev_cmd
 
             if getattr(noise_cfg, "clip_actions", True):

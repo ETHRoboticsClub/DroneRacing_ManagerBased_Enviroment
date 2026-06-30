@@ -86,6 +86,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
         # Action-noise per-env bias (sampled at reset if enabled)
         self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
+        # Action-noise per-env LPF alpha (sampled at reset if enabled).
+        self._action_noise_lpf_alpha = torch.ones(self.num_envs, 1, device=self.device)
 
         # Per-drone motor speeds [N, 4] (one element per impeller); updated elsewhere as needed.
         self._motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
@@ -516,6 +518,18 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         else:
             self._action_noise_bias[env_ids_tensor] = 0.0
 
+        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_lpf_alpha", False):
+            a, b = getattr(action_noise_cfg, "lpf_alpha_range", (1.0, 1.0))
+            low = min(float(a), float(b))
+            high = max(float(a), float(b))
+            low = max(0.0, min(1.0, low))
+            high = max(0.0, min(1.0, high))
+            self._action_noise_lpf_alpha[env_ids_tensor] = torch.rand(n, 1, device=self.device) * (high - low) + low
+        else:
+            alpha = float(getattr(action_noise_cfg, "lpf_alpha", 1.0)) if action_noise_cfg else 1.0
+            alpha = max(0.0, min(1.0, alpha))
+            self._action_noise_lpf_alpha[env_ids_tensor] = alpha
+
         if gate_log:
             self.extras["log"].update(gate_log)
 
@@ -618,19 +632,55 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         policy_obs_cfg = getattr(observations_cfg, "policy", None)
         actions_cfg = getattr(self.cfg, "actions", None)
         rates_cfg = getattr(actions_cfg, "rates", None)
+        if hasattr(self, "action_manager"):
+            try:
+                rates_cfg = self.action_manager.get_term("rates").cfg
+            except Exception:
+                pass
         moments_cfg = getattr(actions_cfg, "moments", None)
         action_cfg = rates_cfg if rates_cfg is not None else moments_cfg
         action_type = "rates" if rates_cfg is not None else ("moments" if moments_cfg is not None else "none")
+
+        policy_term_cfgs = {}
+        if hasattr(self, "observation_manager"):
+            term_names = self.observation_manager._group_obs_term_names.get("policy", [])
+            term_cfgs = self.observation_manager._group_obs_term_cfgs.get("policy", [])
+            policy_term_cfgs = {name: cfg for name, cfg in zip(term_names, term_cfgs)}
+
+        def _obs_noise_attr(term_name: str, attr: str, default: object = "n/a") -> object:
+            term_cfg = policy_term_cfgs.get(term_name, None)
+            if term_cfg is None:
+                return default
+            noise_cfg = getattr(term_cfg, "noise", None)
+            if noise_cfg is None:
+                return default
+            obj = noise_cfg
+            for name in attr.split("."):
+                obj = getattr(obj, name, None)
+                if obj is None:
+                    return default
+            return obj
 
         fields: dict[str, object] = {
             "domain_randomization": getattr(self.cfg, "domain_randomization", "n/a"),
             "observation_noise_enable": getattr(self.cfg, "observation_noise_enable", "n/a"),
             "observations.policy.enable_corruption": getattr(policy_obs_cfg, "enable_corruption", "n/a"),
+            "obs_cfg.policy.base_lin_vel.noise.enable": _obs_noise_attr("base_lin_vel", "enable"),
+            "obs_cfg.policy.base_lin_vel.noise.std": _obs_noise_attr("base_lin_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_lin_vel.bias.std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.noise.enable": _obs_noise_attr("base_ang_vel", "enable"),
+            "obs_cfg.policy.base_ang_vel.noise.std": _obs_noise_attr("base_ang_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.bias.std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.noise.enable": _obs_noise_attr("projected_gravity", "enable"),
+            "obs_cfg.policy.projected_gravity.noise.std": _obs_noise_attr("projected_gravity", "noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.bias.std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std"),
             "action_noise.enable": getattr(action_noise_cfg, "enable", "n/a"),
             "action_noise.per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", "n/a"),
             "action_noise.gaussian_std": getattr(action_noise_cfg, "gaussian_std", "n/a"),
             "action_noise.bias_range": getattr(action_noise_cfg, "bias_range", "n/a"),
             "action_noise.lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", "n/a"),
+            "action_noise.per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", "n/a"),
+            "action_noise.lpf_alpha_range": getattr(action_noise_cfg, "lpf_alpha_range", "n/a"),
             "action_noise.clip_actions": getattr(action_noise_cfg, "clip_actions", "n/a"),
             "action_type": action_type,
         }
@@ -666,10 +716,20 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             "Config/domain_randomization": getattr(self.cfg, "domain_randomization", None),
             "Config/observation_noise_enable": getattr(self.cfg, "observation_noise_enable", None),
             "Config/observations_policy_enable_corruption": getattr(policy_obs_cfg, "enable_corruption", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_enable": _obs_noise_attr("base_lin_vel", "enable", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_std": _obs_noise_attr("base_lin_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_lin_vel_bias_std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_enable": _obs_noise_attr("base_ang_vel", "enable", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_std": _obs_noise_attr("base_ang_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_bias_std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_enable": _obs_noise_attr("projected_gravity", "enable", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_std": _obs_noise_attr("projected_gravity", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_bias_std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std", None),
             "Config/action_noise_enable": getattr(action_noise_cfg, "enable", None),
             "Config/action_noise_per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", None),
             "Config/action_noise_gaussian_std": getattr(action_noise_cfg, "gaussian_std", None),
             "Config/action_noise_lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", None),
+            "Config/action_noise_per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", None),
             "Config/action_noise_clip_actions": getattr(action_noise_cfg, "clip_actions", None),
             "Config/action_cfg_max_delay": getattr(action_cfg, "max_delay", None) if action_cfg is not None else None,
             "Config/action_type_is_rates": 1.0 if rates_cfg is not None else 0.0,

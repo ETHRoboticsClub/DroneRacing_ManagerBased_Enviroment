@@ -195,7 +195,7 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
     speed = torch.norm(drone_vel, dim=1)  # [N] m/s
     env._run_max_speed = torch.maximum(env._run_max_speed, speed)  # peak speed since spawn
 
-    # Detect gate crossings and update _current_gate_idx / _gates_passed.
+    # Detect gate crossings
     passed, env._wrong_crossing_buf = check_gate_passages(env, drone_pos)
     
     env._gate_passed_buf = passed.float()
