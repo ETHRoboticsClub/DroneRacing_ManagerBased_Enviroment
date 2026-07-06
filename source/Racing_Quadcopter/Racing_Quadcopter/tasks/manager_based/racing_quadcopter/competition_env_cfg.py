@@ -716,8 +716,8 @@ class CompetitionCurriculumCfg:
             "min_scale": 1.0,
             "max_scale_default": 5.0,
             "max_scale_by_term": {
-                "action_smoothness": 200.0,
-                "gate_centering": 20.0,
+                "action_smoothness": 400.0,
+                "gate_centering": 40.0,
             },
         },
     )
@@ -725,10 +725,10 @@ class CompetitionCurriculumCfg:
         func=adaptive_randomization_from_lap_completion_ratio,
         params={
             "lap_complete_term": "lap_complete",
-            "eval_interval_s": 60.0,
+            "eval_interval_s": 40.0,
             "low_ratio_threshold": 0.5,
             "high_ratio_threshold": 0.75,
-            "scale_step_fraction": 0.1,
+            "scale_step_fraction": 0.08,
             "min_noise_scale": 0.0,
             "max_noise_scale": 1.0,
             "initial_noise_scale": 0.0,
@@ -796,7 +796,7 @@ class CompetitionCurriculumCfg:
                     "target_type": "env_cfg",
                     "attr_path": "action_noise.lpf_alpha_range",
                     "mode": "lerp",
-                    "start_value": (1.0, 1.0),
+                    "start_value": (0.9, 1.0),
                     "target_value": (0.8, 1.0),
                 },
                 {
@@ -817,7 +817,7 @@ class CompetitionCurriculumCfg:
                     "attr_path": "rate_filter_natural_frequency_randomization_frac",
                     "mode": "lerp",
                     "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.25, 0.25, 0.25),
+                    "target_value": (0.3, 0.3, 0.3),
                 },
                 {
                     "name": "rates_filter_zeta_rand_frac",
@@ -826,7 +826,7 @@ class CompetitionCurriculumCfg:
                     "attr_path": "rate_filter_damping_randomization_frac",
                     "mode": "lerp",
                     "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.25, 0.25, 0.25),
+                    "target_value": (0.3, 0.3, 0.3),
                 },
                 {
                     "name": "rates_filter_gain_rand_frac",
@@ -1308,6 +1308,9 @@ class CompetitionEnvCfg_PLAY(CompetitionEnvCfg):
         self.eval_mode = True
         self.fixed_spawn = True
         self.stats_warmup_s = 5.0
+        # disable curriculum
+        self.curriculum.precision_after_lap_completion_windowed = None
+        self.curriculum.randomization_progressive = None
         # Test mode spawns at the (offset) track origin instead of behind gate 0.
         self.events.reset_racing_spawn = EventTerm(func=reset_competition_origin_spawn, mode="reset")
         print("[INFO] Competition evaluation mode is ON.")

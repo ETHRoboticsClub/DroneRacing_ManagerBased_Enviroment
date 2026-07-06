@@ -1,5 +1,5 @@
 
-TASK=Isaac-Racing-Quadcopter-Competition-Play-RNN-v0
+TASK=Isaac-Racing-Quadcopter-Competition-RNN-Play-v0
 DRONE_MODEL=anemos_urdf
 
 RL_LIBRARY=rsl_rl

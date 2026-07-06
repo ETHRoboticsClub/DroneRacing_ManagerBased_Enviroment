@@ -172,10 +172,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
     if version.parse(installed_version) >= version.parse("4.0.0"):
+        print(f"[INFO] NEW Exporting trained policy to: {export_model_dir}")
         # use the new export functions for rsl-rl >= 4.0.0
         runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
         runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
     else:
+        print(f"[INFO] OLD Exporting trained policy to: {export_model_dir}")
         # extract the neural network for rsl-rl < 4.0.0
         if version.parse(installed_version) >= version.parse("2.3.0"):
             policy_nn = runner.alg.policy
