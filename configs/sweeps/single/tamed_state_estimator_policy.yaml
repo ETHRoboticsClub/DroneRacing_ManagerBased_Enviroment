@@ -1,0 +1,39 @@
+# Tamed Policy Sweep Config for State Estimator Stability
+# Usage:
+#   make submit CONFIG=configs/sweeps/single/tamed_state_estimator_policy.yaml S3_KEY=runs/2026-07-22/tamed_policy/sweep.yaml
+
+task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
+task_play:  Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
+
+extra_train_args:
+  - --headless
+extra_play_args:
+  - --headless
+
+sweep_mode: sequential
+
+num_envs: 8192
+train_iterations: 417
+eval_steps: 3000
+
+param_grid:
+  recovery_spawn_prob:
+    - 0.2
+  velocity_limit:
+    - 10.0
+  action_noise.enable:
+    - true
+  action_noise.gaussian_std:
+    - 0.015
+  action_noise.bias_range:
+    - "(-0.02, 0.02)"
+  action_noise.lpf_alpha:
+    - 0.85
+  rewards.angular_velocity.weight:
+    - -0.02
+  rewards.orientation.weight:
+    - -0.03
+  rewards.action_smoothness.weight:
+    - -0.003
+  rewards.velocity_limit.weight:
+    - -0.25

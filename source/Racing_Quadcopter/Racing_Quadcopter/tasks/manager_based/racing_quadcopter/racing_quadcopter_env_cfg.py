@@ -219,12 +219,12 @@ class RewardWeights:
     GATE_PROGRESS: float = 20.0
     GATE_CENTERING: float = 0.5
     VELOCITY_TOWARD_GATE: float = 2.0
-    VELOCITY_LIMIT: float = -0.05
+    VELOCITY_LIMIT: float = -0.25
     PERCEPTION: float = -0.01
-    ORIENTATION: float = -0.005
-    ANGULAR_VELOCITY: float = -0.001
-    ACTION_SMOOTHNESS: float = -0.0001
-    ACTION_RATE_THRESH: float = -0.0005
+    ORIENTATION: float = -0.03
+    ANGULAR_VELOCITY: float = -0.02
+    ACTION_SMOOTHNESS: float = -0.003
+    ACTION_RATE_THRESH: float = -0.001
     LOW_ACTION: float = -0.001
     ACTION_MAGNITUDE: float = -0.001
     CRASH: float = -50.0
