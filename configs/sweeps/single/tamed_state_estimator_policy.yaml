@@ -37,3 +37,5 @@ param_grid:
     - -0.003
   rewards.velocity_limit.weight:
     - -0.25
+  rewards.perception.weight:
+    - -0.05
