@@ -18,6 +18,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import *
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul
+from Racing_Quadcopter.tasks.manager_based.shared_features import speed_limits_obs
 
 # Divide world-frame gate offsets (metres) by this before feeding to the network.
 # Keeps inputs in roughly [-1, 1] for gates up to ~10 m away.
@@ -185,15 +186,6 @@ def mono_race_gate_orientations(env: ManagerBasedRLEnv) -> torch.Tensor:
     q_bg = quat_mul(quat_inv(q_g0), q_bw)
     phi, theta, psi = euler_xyz_from_quat(q_bg, wrap_to_2pi=False)
     return torch.stack([phi, theta, psi], dim=-1) / _REL_ATTITUDE_SCALE
-
-
-def velocity_limit_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Per-env velocity limit ``[N, 1]``.
-
-    Exposes the per-env speed cap to the policy so it can adapt its behaviour
-    when the cap is randomised across episodes (curriculum).
-    """
-    return env._velocity_limit.unsqueeze(-1)
 
 
 def motor_speeds_obs(env: ManagerBasedRLEnv) -> torch.Tensor:

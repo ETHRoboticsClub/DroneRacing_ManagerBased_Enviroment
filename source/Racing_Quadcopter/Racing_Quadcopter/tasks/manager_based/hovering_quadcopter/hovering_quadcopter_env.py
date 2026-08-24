@@ -16,6 +16,18 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
+from isaaclab.utils.math import quat_apply_inverse
+
+from Racing_Quadcopter.tasks.manager_based.action_diagnostics import ActionDiagnostics
+from Racing_Quadcopter.tasks.manager_based.route_progress import (
+    begin_hovering_routes,
+    initialize_route_progress,
+)
+from Racing_Quadcopter.tasks.manager_based.shared_features import (
+    initialize_action_noise,
+    initialize_speed_limits,
+    validate_shared_feature_events,
+)
 
 from .hovering_quadcopter_env_cfg import HoveringQuadcopterEnvCfg, WAYPOINTS_ENV_VAR
 from .mdp.events import collect_episode_metrics_before_reset
@@ -46,15 +58,22 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
     # Task preparation
     # ------------------------------------------------------------------
     def _prepare_waypoint_task(self) -> None:
+        validate_shared_feature_events(self.cfg)
         self._robot = self.scene["robot"]
 
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
-        self._action_noise_bias = torch.zeros_like(self._actions_buf)
-        # Raw policy output (pre-clamp, pre-noise) — read by penalty_oversaturation.
+        initialize_action_noise(self, action_dim=4)
+        initialize_speed_limits(self)
+        # Raw policy output (pre-clamp, pre-noise), used by the shared
+        # raw-action magnitude penalty and optional action diagnostics.
         self._unclamped_actions_buf = torch.zeros_like(self._actions_buf)
+        self._policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._action_diagnostics = ActionDiagnostics(self)
 
         self._setup_waypoint_tracks()
+        initialize_route_progress(self, self._waypoint_positions.shape[1] + 1)
 
         # Per-env state for proximity hysteresis / dwell counting.
         self._current_wp_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -63,11 +82,25 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         self._collected_step_flag = torch.zeros(self.num_envs, device=self.device)
         self._all_collected_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # Aliased name kept for parity with the racing event helpers we re-use.
-        self._gates_passed = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-
         self._episode_collected_count = torch.zeros(self.num_envs, device=self.device)
+        # Per-episode collection-gate diagnostics, reported on reset.
+        self._hold_capture_steps = torch.zeros(self.num_envs, device=self.device)
+        self._hold_linear_ok_capture_steps = torch.zeros(self.num_envs, device=self.device)
+        self._hold_angular_ok_capture_steps = torch.zeros(self.num_envs, device=self.device)
+        self._hold_tilt_ok_capture_steps = torch.zeros(self.num_envs, device=self.device)
+        self._hold_stable_capture_steps = torch.zeros(self.num_envs, device=self.device)
+        self._hold_timer_reset_count = torch.zeros(self.num_envs, device=self.device)
+        self._hold_dwell_time_s = torch.zeros(self.num_envs, device=self.device)
         self._curr_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
+        # Kept separate because collection advances the public target before
+        # rewards are evaluated.
+        self._previous_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
+        self._reward_previous_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
+        self._reward_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
+        # Deployable velocity estimate: finite-difference mocap positions,
+        # low-pass filtered and expressed in the current body frame.
+        self._mocap_prev_pos_w = self._robot.data.root_pos_w.clone()
+        self._mocap_lin_vel_b = torch.zeros(self.num_envs, 3, device=self.device)
 
     def _setup_waypoint_tracks(self) -> None:
         """Generate per-cell tracks (random by default, YAML if ``WAYPOINTS`` set)
@@ -151,11 +184,13 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
     # ------------------------------------------------------------------
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         # Snapshot the raw policy output BEFORE the action term clamps and
-        # applies noise/lag, so penalty_oversaturation can compare the raw
-        # request against its clamped version.
+        # applies noise/lag, so the shared action penalty can distinguish the
+        # raw request from the clipped command actually sent to the controller.
         action_dev = action.to(self.device)
+        self._prev_policy_raw_actions[:] = self._policy_raw_actions
+        self._policy_raw_actions[:] = action_dev
         self._unclamped_actions_buf[:] = action_dev
-        self.action_manager.process_action(action_dev)
+        self.action_manager.process_action(self._policy_raw_actions)
         self.recorder_manager.record_pre_step()
 
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
@@ -171,6 +206,7 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
             self.scene.update(dt=self.physics_dt)
 
         # Refresh per-env waypoint state before terminations / rewards.
+        self._update_mocap_velocity_estimate()
         update_waypoint_state(self)
 
         self.episode_length_buf += 1
@@ -200,8 +236,18 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        self._action_diagnostics.update_if_due()
         self.obs_buf = self.observation_manager.compute(update_history=True)
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    def _update_mocap_velocity_estimate(self) -> None:
+        """Update the actor-visible finite-difference mocap velocity."""
+        pos_w = self._robot.data.root_pos_w
+        raw_vel_w = (pos_w - self._mocap_prev_pos_w) / self.step_dt
+        alpha = float(self.cfg.mocap_velocity_filter_alpha)
+        raw_vel_b = quat_apply_inverse(self._robot.data.root_quat_w, raw_vel_w)
+        self._mocap_lin_vel_b.lerp_(raw_vel_b, alpha)
+        self._mocap_prev_pos_w.copy_(pos_w)
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
@@ -210,6 +256,10 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         log_extra = collect_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
+        begin_hovering_routes(self, env_ids_tensor)
+        self._policy_raw_actions[env_ids_tensor] = 0.0
+        self._prev_policy_raw_actions[env_ids_tensor] = 0.0
+        self._action_diagnostics.reset(env_ids_tensor)
 
         if log_extra:
             self.extras.setdefault("log", {})

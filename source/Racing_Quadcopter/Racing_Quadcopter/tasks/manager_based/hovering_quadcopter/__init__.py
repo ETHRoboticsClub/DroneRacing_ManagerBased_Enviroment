@@ -30,3 +30,18 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
+
+for _id, _cfg in (
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-v0", "HoveringQuadcopterEnvCfg"),
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-Play-v0", "HoveringQuadcopterEnvCfg_PLAY"),
+):
+    gym.register(
+        id=_id,
+        entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:{_cfg}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterRecurrentPPORunnerCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        },
+    )

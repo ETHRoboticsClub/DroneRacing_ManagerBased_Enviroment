@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-import math
 import time
 
 import numpy as np
@@ -21,6 +20,16 @@ from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
 
 from Racing_Quadcopter.terrains import get_gate_registry
+from Racing_Quadcopter.tasks.manager_based.action_diagnostics import ActionDiagnostics
+from Racing_Quadcopter.tasks.manager_based.route_progress import (
+    begin_racing_routes,
+    initialize_route_progress,
+)
+from Racing_Quadcopter.tasks.manager_based.shared_features import (
+    initialize_action_noise,
+    initialize_speed_limits,
+    validate_shared_feature_events,
+)
 from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.gate_utils import update_racing_state
@@ -63,12 +72,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
     def _prepare_racing_task(self) -> None:
         """Allocate all racing-specific GPU buffers before managers are built."""
+        validate_shared_feature_events(self.cfg)
         self._robot = self.scene["robot"]
         self._contact_sensor = self.scene.sensors["contact_sensor"]
         self._setup_gate_tracking()
+        initialize_route_progress(self, self._gate_positions.shape[1] + 1)
 
-        # Per-env speed cap; re-sampled each episode if cfg.randomize_velocity_limit.
-        self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
+        initialize_speed_limits(self)
 
         init_stats(self)
         self._action_config_log_interval_s = 120.0
@@ -77,17 +87,11 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
-        # [N, 4] physically scaled command vector: [thrust_N, cmd_x, cmd_y, cmd_z].
-        # cmd_{x,y,z} are body-rate commands for rates control and body moments for moments control.
-        self._physical_scaled_actions = torch.zeros_like(self._actions_buf)
-        self._prev_physical_scaled_actions = torch.zeros_like(self._actions_buf)
         # Raw policy output (before action manager processing) and one-step lag.
         self._policy_raw_actions = torch.zeros_like(self._actions_buf)
         self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
-        # Action-noise per-env bias (sampled at reset if enabled)
-        self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
-        # Action-noise per-env LPF alpha (sampled at reset if enabled).
-        self._action_noise_lpf_alpha = torch.ones(self.num_envs, 1, device=self.device)
+        self._action_diagnostics = ActionDiagnostics(self)
+        initialize_action_noise(self, action_dim=4)
 
         # Per-drone motor speeds [N, 4] (one element per impeller); updated elsewhere as needed.
         self._motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
@@ -470,9 +474,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
-        # Action diagnostics for evaluation: per-dimension abs-command and abs-command-rate stats
-        # for both raw policy output and scaled/applied commands.
-        self._update_action_diagnostics_log()
+        self._action_diagnostics.update_if_due()
         self._maybe_log_action_configuration()
 
         # Second obs pass: the "real" obs returned to the policy, with history update.
@@ -493,6 +495,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         gate_log = collect_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
+        begin_racing_routes(self, env_ids_tensor)
 
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
@@ -506,29 +509,6 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 print("DEBUG_TERRAIN: first_gate_pos_after_reset_sample=", first_pos[:5])
             except Exception as e:
                 print("DEBUG_TERRAIN: reset debug error", e)
-
-        # Sample per-episode biases for action noise (if enabled).
-        # These buffers were pre-allocated in _prepare_racing_task.
-        n = env_ids_tensor.shape[0]
-
-        action_noise_cfg = getattr(self.cfg, "action_noise", None)
-        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_bias", False):
-            a, b = action_noise_cfg.bias_range
-            self._action_noise_bias[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
-        else:
-            self._action_noise_bias[env_ids_tensor] = 0.0
-
-        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_lpf_alpha", False):
-            a, b = getattr(action_noise_cfg, "lpf_alpha_range", (1.0, 1.0))
-            low = min(float(a), float(b))
-            high = max(float(a), float(b))
-            low = max(0.0, min(1.0, low))
-            high = max(0.0, min(1.0, high))
-            self._action_noise_lpf_alpha[env_ids_tensor] = torch.rand(n, 1, device=self.device) * (high - low) + low
-        else:
-            alpha = float(getattr(action_noise_cfg, "lpf_alpha", 1.0)) if action_noise_cfg else 1.0
-            alpha = max(0.0, min(1.0, alpha))
-            self._action_noise_lpf_alpha[env_ids_tensor] = alpha
 
         if gate_log:
             self.extras["log"].update(gate_log)
@@ -546,76 +526,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # Keep raw-action lag buffer aligned with reset state to avoid artificial first-step spikes.
         self._policy_raw_actions[env_ids_tensor].zero_()
         self._prev_policy_raw_actions[env_ids_tensor].zero_()
-        self._physical_scaled_actions[env_ids_tensor].zero_()
-        self._prev_physical_scaled_actions[env_ids_tensor].zero_()
-
-    @staticmethod
-    def _p95_per_dim(x: torch.Tensor) -> torch.Tensor:
-        """Compute per-dimension 95th percentile along env dimension."""
-        n = x.shape[0]
-        if n == 0:
-            return torch.zeros(x.shape[1], device=x.device, dtype=x.dtype)
-        k = max(1, int(math.ceil(0.95 * n)))
-        return x.kthvalue(k, dim=0).values
-
-    def _log_action_vector_stats(self, tensor_abs: torch.Tensor, prefix: str) -> None:
-        """Log mean/std/p95 of absolute values for each action dimension."""
-        dim_names = ("thrust", "roll", "pitch", "yaw")
-        means = tensor_abs.mean(dim=0)
-        stds = tensor_abs.std(dim=0, unbiased=False)
-        p95 = self._p95_per_dim(tensor_abs)
-
-        log_dict = self.extras.setdefault("log", {})
-        for i, name in enumerate(dim_names):
-            log_dict[f"ActionStats/{prefix}/mean/{name}"] = means[i]
-            log_dict[f"ActionStats/{prefix}/std/{name}"] = stds[i]
-            log_dict[f"ActionStats/{prefix}/p95/{name}"] = p95[i]
-
-    def _update_action_diagnostics_log(self) -> None:
-        """Log raw, normalized, and physically scaled command diagnostics."""
-        raw_cmd_abs = self._policy_raw_actions.abs()
-        raw_rate_abs = (self._policy_raw_actions - self._prev_policy_raw_actions).abs()
-        normalized_cmd_abs = self._actions_buf.abs()
-        normalized_rate_abs = (self._actions_buf - self._prev_actions).abs()
-
-        self._prev_physical_scaled_actions[:] = self._physical_scaled_actions
-        self._physical_scaled_actions[:] = self._get_physical_scaled_command_vector()
-        physical_scaled_cmd_abs = self._physical_scaled_actions.abs()
-        physical_scaled_rate_abs = (self._physical_scaled_actions - self._prev_physical_scaled_actions).abs()
-
-        self._log_action_vector_stats(raw_cmd_abs, "raw_cmd_abs")
-        self._log_action_vector_stats(raw_rate_abs, "raw_rate_abs")
-        self._log_action_vector_stats(normalized_cmd_abs, "normalized_cmd_abs")
-        self._log_action_vector_stats(normalized_rate_abs, "normalized_rate_abs")
-        self._log_action_vector_stats(physical_scaled_cmd_abs, "physical_scaled_cmd_abs")
-        self._log_action_vector_stats(physical_scaled_rate_abs, "physical_scaled_rate_abs")
-
-    def _get_physical_scaled_command_vector(self) -> torch.Tensor:
-        """Return [thrust_N, cmd_x, cmd_y, cmd_z] after task-specific scaling."""
-        cmd = torch.zeros_like(self._actions_buf)
-        if len(self.action_manager.active_terms) == 0:
-            return cmd
-
-        term = self.action_manager.get_term(self.action_manager.active_terms[0])
-
-        # Thrust is already converted from normalized command into Newtons in the action term.
-        if hasattr(term, "_thrust"):
-            cmd[:, 0] = term._thrust[:, 0, 2]
-
-        if hasattr(term.cfg, "rate_command_scale") and hasattr(term, "_delayed_actions"):
-            # Rates controllers: convert normalized rate commands into body-rate setpoints [rad/s].
-            rate_scale = torch.as_tensor(term.cfg.rate_command_scale, device=self.device, dtype=cmd.dtype)
-            if rate_scale.ndim == 0:
-                rate_scale = rate_scale.repeat(3)
-            cmd[:, 1:] = term._delayed_actions[:, 1:] * rate_scale.view(1, 3)
-        elif hasattr(term, "_moment"):
-            # Moments controller: post-scaling moments [N*m].
-            cmd[:, 1:] = term._moment[:, 0, :]
-        else:
-            # Fallback for unknown action terms: keep normalized command semantics.
-            cmd[:] = self._actions_buf
-
-        return cmd
+        self._action_diagnostics.reset(env_ids_tensor)
 
     @staticmethod
     def _format_config_value(value: object) -> str:

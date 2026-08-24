@@ -66,7 +66,8 @@ class QuadcopterMomentsAction(ActionTerm):
         self._gravity_mag = torch.tensor(env.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (masses * self._gravity_mag).item()
         self._moment_scale = torch.tensor(self.cfg.moment_scale, device=self.device, dtype=torch.float32)
-        self.actions_delay_buffer = DelayBuffer(self.cfg.max_delay, env.num_envs, device=self.device)
+        buffer_max_lag = max(int(self.cfg.max_delay), int(self.cfg.delay_buffer_max_lag))
+        self.actions_delay_buffer = DelayBuffer(buffer_max_lag, env.num_envs, device=self.device)
 
     @property
     def action_dim(self) -> int:
@@ -81,6 +82,16 @@ class QuadcopterMomentsAction(ActionTerm):
         return self._processed_actions
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        ids = (
+            torch.arange(self._env.num_envs, device=self.device, dtype=torch.long)
+            if env_ids is None or isinstance(env_ids, slice)
+            else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        )
+        self._raw_actions[ids] = 0.0
+        self._processed_actions[ids] = 0.0
+        self._delayed_actions[ids] = 0.0
+        self._thrust[ids] = 0.0
+        self._moment[ids] = 0.0
         if env_ids is None or isinstance(env_ids, slice):
             num_envs = self._env.num_envs
         else:
@@ -173,6 +184,8 @@ class QuadcopterMomentsActionCfg(ActionTermCfg):
     action_dim: int = 4
     min_delay: int = 0
     max_delay: int = 0
+    # Reserve capacity for progressive curricula while keeping the active delay at zero.
+    delay_buffer_max_lag: int = 2
     body_name: str = "body"  # base_link for anemos (gets overridden by env cfg)
 
 
@@ -231,7 +244,8 @@ class QuadcopterRatesAction(ActionTerm):
         self._resample_pid_gain_randomization(None)
         self._resample_thrust_randomization(None)
         self._resample_aero_randomization(None)
-        self.actions_delay_buffer = DelayBuffer(self.cfg.max_delay, env.num_envs, device=self.device)
+        buffer_max_lag = max(int(self.cfg.max_delay), int(self.cfg.delay_buffer_max_lag))
+        self.actions_delay_buffer = DelayBuffer(buffer_max_lag, env.num_envs, device=self.device)
 
     def _env_ids_tensor(self, env_ids: Sequence[int] | None) -> torch.Tensor:
         return (
@@ -364,6 +378,12 @@ class QuadcopterRatesAction(ActionTerm):
         return self._processed_actions
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        ids = self._env_ids_tensor(env_ids)
+        self._raw_actions[ids] = 0.0
+        self._processed_actions[ids] = 0.0
+        self._delayed_actions[ids] = 0.0
+        self._thrust[ids] = 0.0
+        self._moment[ids] = 0.0
         if env_ids is None or env_ids == slice(None):
             self._omega_prev.zero_()
             self._omega_des_prev.zero_()
@@ -409,7 +429,9 @@ class QuadcopterRatesAction(ActionTerm):
         omega_des = delayed_actions[:, 1:] * self.cfg.rate_command_scale
         err = omega_des - omega_meas
 
-        dt = self._env.cfg.sim.dt
+        # process_actions runs once per policy/control step, not once per
+        # physics substep, so PID integration and derivatives use control dt.
+        dt = self._env.step_dt
 
         self._rate_integral = self._rate_integral + err * dt
         ilim = self.cfg.rate_integral_limit
@@ -479,6 +501,8 @@ class QuadcopterRatesActionCfg(ActionTermCfg):
     action_dim: int = 4
     min_delay: int = 0
     max_delay: int = 0
+    # Reserve capacity for progressive curricula while keeping the active delay at zero.
+    delay_buffer_max_lag: int = 2
     body_name: str = "body"  # base_link for anemos (gets overridden by env cfg)
 
     #: Maps normalized rate sticks ``[-1, 1]`` to desired body angular rates [rad/s].

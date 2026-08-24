@@ -18,7 +18,6 @@ from ``racing_quadcopter``:
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Tuple
 
 import numpy as np
 import os
@@ -30,7 +29,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
@@ -40,13 +38,29 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse
 
 from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_URDF
+from Racing_Quadcopter.tasks.manager_based.adaptive_curriculums import (
+    AdaptiveRandomizationFromRouteProgress,
+    AdaptiveRewardScaleFromRouteProgress,
+    get_randomization_profile,
+)
+from Racing_Quadcopter.tasks.manager_based import shared_features
+from Racing_Quadcopter.tasks.manager_based.noise import drone_noise_model_factory
+from Racing_Quadcopter.tasks.manager_based.shared_features import SpeedLimitsCfg
 from Racing_Quadcopter.terrains import load_gates_from_yaml
 from Racing_Quadcopter.terrains.racing_gates_cfg import MeshFixedGatesTerrainCfg
 
 from .mdp import events, observations
 from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterSecondOrderRatesActionCfg
-from .mdp.noise import drone_noise_model_factory
+from .competition_randomization import (
+    register_competition_randomization_profile,
+)
 from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, TRACK_YAML_ENV_VAR, _make_profile
+
+
+register_competition_randomization_profile()
+COMPETITION_RANDOMIZATION = get_randomization_profile("competition")
+
+
 
 # ---------------------------------------------------------------------------
 # Track frame
@@ -258,7 +272,8 @@ class CompetitionObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        enable_corruption: bool = False  # toggles to True (activates noise) if domain_randomization is on
+        # Per-term noise controls activation; retain its config even when DR is off.
+        enable_corruption: bool = True
         concatenate_terms: bool = True
 
         # absolute position removed; current gate corners are provided directly in body frame
@@ -271,21 +286,30 @@ class CompetitionObservationsCfg:
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.05, std_bias=0.01, dropout=0.0),
+            noise=drone_noise_model_factory(
+                std_noise=COMPETITION_RANDOMIZATION.linear_velocity_noise[0],
+                std_bias=COMPETITION_RANDOMIZATION.linear_velocity_noise[1],
+            ),
             history_length=_OBS_WINDOW,
         )
         # (3) body-frame angular velocity
         base_ang_vel = ObsTerm(
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            noise=drone_noise_model_factory(
+                std_noise=COMPETITION_RANDOMIZATION.angular_velocity_noise[0],
+                std_bias=COMPETITION_RANDOMIZATION.angular_velocity_noise[1],
+            ),
             history_length=_OBS_WINDOW,
         )
         # (3) gravity direction in body frame
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            noise=drone_noise_model_factory(
+                std_noise=COMPETITION_RANDOMIZATION.gravity_noise[0],
+                std_bias=COMPETITION_RANDOMIZATION.gravity_noise[1],
+            ),
             history_length=_OBS_WINDOW,
         )
         # (12) inner corners of the current gate (NW, NE, SE, SW), body frame
@@ -304,6 +328,10 @@ class CompetitionObservationsCfg:
         last_action = ObsTerm(
             func=observations.last_action,
             history_length=_OBS_WINDOW,
+        )
+
+        speed_limits = ObsTerm(
+            func=observations.speed_limits_obs,
         )
 
     policy: PolicyCfg = PolicyCfg()
@@ -338,377 +366,21 @@ def upside_down(env: ManagerBasedRLEnv) -> torch.Tensor:
 # Curriculum
 # ---------------------------------------------------------------------------
 
-class adaptive_reward_scale_from_lap_completion_ratio(ManagerTermBase):
-    """Windowed curriculum controller that scales selected reward-term weights by name."""
-
-    def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self._reward_term_names = tuple(cfg.params["reward_term_names"])
-        self._reward_term_cfgs = {
-            term_name: env.reward_manager.get_term_cfg(term_name) for term_name in self._reward_term_names
-        }
-        self._base_weights = {term_name: float(term_cfg.weight) for term_name, term_cfg in self._reward_term_cfgs.items()}
-        self._term_scales = {term_name: 1.0 for term_name in self._reward_term_names}
-        self._window_lap_complete_resets = 0.0
-        self._window_total_resets = 0.0
-        self._last_eval_step = int(env.common_step_counter)
-
-    def __call__(
-        self,
-        env: ManagerBasedRLEnv,
-        env_ids,
-        lap_complete_term: str = "lap_complete",
-        reward_term_names: tuple[str, ...] = ("action_smoothness", "gate_centering"),
-        eval_interval_s: float = 120.0,
-        low_ratio_threshold: float = 0.50,
-        high_ratio_threshold: float = 0.75,
-        scale_step_fraction: float = 0.10,
-        min_scale: float = 1.0,
-        max_scale_default: float = 5.0,
-        max_scale_by_term: dict[str, float] | None = None,
-    ) -> dict[str, float]:
-        # Keep run-time params and constructor-time term set aligned.
-        if tuple(reward_term_names) != self._reward_term_names:
-            raise ValueError(
-                "reward_term_names changed after initialization. "
-                f"Initialized with {self._reward_term_names}, received {tuple(reward_term_names)}."
-            )
-
-        # Accumulate reset statistics for this call.
-        env_ids_tensor = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
-        if env_ids_tensor.numel() > 0:
-            lap_complete_mask = env.termination_manager.get_term(lap_complete_term)[env_ids_tensor]
-            self._window_lap_complete_resets += float(lap_complete_mask.float().sum().item())
-            self._window_total_resets += float(env_ids_tensor.numel())
-
-        # Evaluate at fixed wall-time in simulation seconds (using RL-step timebase).
-        interval_steps = max(1, int(round(float(eval_interval_s) / float(env.step_dt))))
-        curr_step = int(env.common_step_counter)
-        updated = 0.0
-        ratio = (
-            self._window_lap_complete_resets / self._window_total_resets
-            if self._window_total_resets > 0.0
-            else 0.0
-        )
-        reported_total_resets = self._window_total_resets
-        reported_lap_complete_resets = self._window_lap_complete_resets
-        if (curr_step - self._last_eval_step) >= interval_steps:
-            step_frac = max(0.0, float(scale_step_fraction))
-            lo = float(min_scale)
-            decision = "hold"
-            if ratio < float(low_ratio_threshold):
-                scale_factor = max(0.0, 1.0/(1+step_frac))
-                decision = "decrease"
-            elif ratio > float(high_ratio_threshold):
-                scale_factor = 1.0 + step_frac
-                decision = "increase"
-            else:
-                scale_factor = 1.0
-
-            max_by_term = {} if max_scale_by_term is None else {k: float(v) for k, v in max_scale_by_term.items()}
-            for term_name in self._reward_term_names:
-                prev_scale = self._term_scales[term_name]
-                hi = max(lo, max_by_term.get(term_name, float(max_scale_default)))
-                new_scale = float(max(lo, min(hi, prev_scale * scale_factor)))
-                self._term_scales[term_name] = new_scale
-                term_cfg = self._reward_term_cfgs[term_name]
-                term_cfg.weight = self._base_weights[term_name] * new_scale
-                env.reward_manager.set_term_cfg(term_name, term_cfg)
-
-            updated = 1.0
-
-            term_scale_summary = ", ".join(f"{k}={v:.3f}" for k, v in self._term_scales.items())
-            print(
-                "[CompetitionCurriculum] Window update: "
-                f"lap_complete_ratio={ratio:.3f}, "
-                f"window_lap_complete_resets={reported_lap_complete_resets:.0f}, "
-                f"window_total_resets={reported_total_resets:.0f}, "
-                f"decision={decision}, "
-                f"reward_scales={{ {term_scale_summary} }}"
-            )
-
-            self._window_lap_complete_resets = 0.0
-            self._window_total_resets = 0.0
-            self._last_eval_step = curr_step
-
-        out = {
-            "lap_complete_ratio_window": ratio,
-            "window_total_resets": reported_total_resets,
-            "window_lap_complete_resets": reported_lap_complete_resets,
-            "updated": updated,
-        }
-        for term_name in self._reward_term_names:
-            out[f"reward_scale/{term_name}"] = self._term_scales[term_name]
-            out[f"reward_weight/{term_name}"] = float(self._reward_term_cfgs[term_name].weight)
-        return out
-
-
-class adaptive_randomization_from_lap_completion_ratio(ManagerTermBase):
-    """Windowed curriculum controller that applies generic, config-defined parameter scaling."""
-
-    def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self._window_lap_complete_resets = 0.0
-        self._window_total_resets = 0.0
-        self._last_eval_step = int(env.common_step_counter)
-        self._target_specs = tuple(cfg.params["targets"])
-        self._bindings: list[dict[str, object]] = []
-        self._initialize_bindings(env, self._target_specs)
-        self._noise_scale = float(cfg.params["initial_noise_scale"])
-        self._apply_scale_to_bindings(self._noise_scale)
-
-    @staticmethod
-    def _get_attr_path(root_obj: object, attr_path: str) -> object:
-        obj = root_obj
-        for name in attr_path.split("."):
-            obj = getattr(obj, name)
-        return obj
-
-    @staticmethod
-    def _set_attr_path(root_obj: object, attr_path: str, value: object) -> None:
-        parts = attr_path.split(".")
-        obj = root_obj
-        for name in parts[:-1]:
-            obj = getattr(obj, name)
-        setattr(obj, parts[-1], value)
-
-    @staticmethod
-    def _resolve_target_root(env: ManagerBasedRLEnv, spec: dict[str, object]) -> tuple[object, callable | None]:
-        target_type = str(spec["target_type"])
-        if target_type == "env_cfg":
-            return env.cfg, None
-        if target_type == "reward_term_cfg":
-            term_name = str(spec["term_name"])
-            term_cfg = env.reward_manager.get_term_cfg(term_name)
-            return term_cfg, lambda cfg_obj: env.reward_manager.set_term_cfg(term_name, cfg_obj)
-        if target_type == "action_term_cfg":
-            term_name = str(spec["term_name"])
-            # IMPORTANT: bind to the live action term cfg (ActionManager deep-copies cfg at init),
-            # otherwise mutating env.cfg.actions.<term> won't affect the running term.
-            action_term = env.action_manager.get_term(term_name)
-            root_obj = action_term.cfg
-            return root_obj, None
-        if target_type == "observation_group_cfg":
-            group_name = str(spec["group_name"])
-            obs_cfg = env.observation_manager.cfg
-            if isinstance(obs_cfg, dict):
-                if group_name not in obs_cfg:
-                    raise ValueError(
-                        f"Observation group '{group_name}' not found. Available groups: {tuple(obs_cfg.keys())}."
-                    )
-                return obs_cfg[group_name], None
-            if not hasattr(obs_cfg, group_name):
-                raise ValueError(
-                    f"Observation group '{group_name}' not found. "
-                    f"Available groups: {tuple(k for k in obs_cfg.__dict__.keys() if not k.startswith('_'))}."
-                )
-            return getattr(obs_cfg, group_name), None
-        if target_type == "observation_term_cfg":
-            group_name = str(spec["group_name"])
-            term_name = str(spec["term_name"])
-            group_term_names = env.observation_manager._group_obs_term_names.get(group_name, [])
-            if term_name not in group_term_names:
-                raise ValueError(
-                    f"Observation term '{term_name}' not found in group '{group_name}'. "
-                    f"Available terms: {tuple(group_term_names)}."
-                )
-            term_idx = group_term_names.index(term_name)
-            return env.observation_manager._group_obs_term_cfgs[group_name][term_idx], None
-        raise ValueError(f"Unknown randomization target_type '{target_type}'.")
-
-    @staticmethod
-    def _is_sequence(value: object) -> bool:
-        return isinstance(value, (tuple, list))
-
-    @staticmethod
-    def _lerp_scalar(start: float, target: float, scale: float) -> float:
-        return float(start) + float(scale) * (float(target) - float(start))
-
-    def _scale_value(self, spec: dict[str, object], scale: float, start_value: object, target_value: object) -> object:
-        mode = spec["mode"]
-        value: object
-        if isinstance(target_value, bool):
-            threshold = float(spec["bool_threshold"])
-            value = bool(target_value) if float(scale) >= threshold else bool(start_value)
-        elif self._is_sequence(target_value):
-            start_seq = tuple(float(v) for v in (start_value if self._is_sequence(start_value) else target_value))
-            target_seq = tuple(float(v) for v in target_value)
-            if mode != "lerp":
-                raise ValueError(f"Unsupported mode '{mode}' for sequence target.")
-            value = tuple(self._lerp_scalar(s, t, scale) for s, t in zip(start_seq, target_seq, strict=True))
-        elif isinstance(target_value, (int, float)):
-            s = float(start_value)
-            t = float(target_value)
-            if mode == "lerp":
-                value = self._lerp_scalar(s, t, scale)
-            elif mode == "mul":
-                value = t * float(scale)
-            else:
-                raise ValueError(f"Unsupported numeric mode '{mode}'.")
-        else:
-            raise TypeError(f"Unsupported target value type: {type(target_value)}")
-
-        if "clamp_min" in spec and isinstance(value, (int, float)):
-            value = max(float(spec["clamp_min"]), float(value))
-        if "clamp_max" in spec and isinstance(value, (int, float)):
-            value = min(float(spec["clamp_max"]), float(value))
-        if "dtype" in spec and str(spec["dtype"]) == "int":
-            value = int(round(float(value)))
-        return value
-
-    def _initialize_bindings(self, env: ManagerBasedRLEnv, target_specs: tuple[dict[str, object], ...]) -> None:
-        for idx, spec in enumerate(target_specs):
-            root_obj, post_apply_hook = self._resolve_target_root(env, spec)
-            attr_path = str(spec["attr_path"])
-            current_value = self._get_attr_path(root_obj, attr_path)
-            target_value = spec["target_value"]
-            start_value = spec["start_value"]
-            if start_value is None:
-                if isinstance(target_value, bool):
-                    start_value = False
-                elif self._is_sequence(target_value):
-                    start_value = tuple(0.0 for _ in target_value)
-                elif isinstance(target_value, (int, float)):
-                    start_value = 0.0
-                else:
-                    start_value = target_value
-            self._bindings.append(
-                {
-                    "name": str(spec.get("name", f"target_{idx}")),
-                    "spec": spec,
-                    "root_obj": root_obj,
-                    "post_apply_hook": post_apply_hook,
-                    "attr_path": attr_path,
-                    "start_value": start_value,
-                    "target_value": target_value,
-                    "last_value": current_value,
-                }
-            )
-
-    def _apply_scale_to_bindings(self, scale: float) -> None:
-        for binding in self._bindings:
-            spec = binding["spec"]
-            root_obj = binding["root_obj"]
-            attr_path = binding["attr_path"]
-            value = self._scale_value(spec, scale, binding["start_value"], binding["target_value"])
-            self._set_attr_path(root_obj, attr_path, value)
-            post_apply_hook = binding["post_apply_hook"]
-            if post_apply_hook is not None:
-                post_apply_hook(root_obj)
-            binding["last_value"] = value
-
-    def __call__(
-        self,
-        env: ManagerBasedRLEnv,
-        env_ids,
-        lap_complete_term: str = "lap_complete",
-        eval_interval_s: float = 120.0,
-        low_ratio_threshold: float = 0.50,
-        high_ratio_threshold: float = 0.75,
-        scale_step_fraction: float = 0.10,
-        min_noise_scale: float = 0.05,
-        max_noise_scale: float = 1.0,
-        initial_noise_scale: float = 0.20,
-        targets: Tuple[Dict[str, Any]] = tuple()
-    ) -> dict[str, float]:
-        del initial_noise_scale  # consumed in __init__
-        del targets # consumed in __init__
-        env_ids_tensor = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
-        if env_ids_tensor.numel() > 0:
-            lap_complete_mask = env.termination_manager.get_term(lap_complete_term)[env_ids_tensor]
-            self._window_lap_complete_resets += float(lap_complete_mask.float().sum().item())
-            self._window_total_resets += float(env_ids_tensor.numel())
-
-        interval_steps = max(1, int(round(float(eval_interval_s) / float(env.step_dt))))
-        curr_step = int(env.common_step_counter)
-        updated = 0.0
-        ratio = (
-            self._window_lap_complete_resets / self._window_total_resets
-            if self._window_total_resets > 0.0
-            else 0.0
-        )
-        reported_total_resets = self._window_total_resets
-        reported_lap_complete_resets = self._window_lap_complete_resets
-
-        if (curr_step - self._last_eval_step) >= interval_steps:
-            step_frac = max(0.0, float(scale_step_fraction))
-            lo = float(min_noise_scale)
-            hi = float(max_noise_scale)
-            if hi < lo:
-                hi = lo
-
-            prev_scale = self._noise_scale
-            decision = "hold"
-            # Additive growth avoids the absorbing-zero bug of pure multiplicative updates.
-            additive_scale_update = step_frac * (1.0 - self._noise_scale)
-            if ratio < float(low_ratio_threshold):
-                self._noise_scale -= max(0.0, additive_scale_update)
-                decision = "decrease"
-            elif ratio > float(high_ratio_threshold):
-                self._noise_scale += additive_scale_update
-                decision = "increase"
-            self._noise_scale = float(max(lo, min(hi, self._noise_scale)))
-            self._apply_scale_to_bindings(self._noise_scale)
-            updated = 1.0
-
-            sampled = []
-            sample_names = {
-                "action_noise_enable",
-                "action_noise_gaussian_std",
-                "action_noise_bias_range",
-                "obs_base_lin_vel_enable",
-                "obs_base_lin_vel_std",
-                "obs_base_lin_vel_bias_std",
-                "obs_base_ang_vel_enable",
-                "obs_base_ang_vel_std",
-                "obs_base_ang_vel_bias_std",
-                "obs_gravity_enable",
-                "obs_gravity_std",
-                "obs_gravity_bias_std",
-            }
-            for binding in self._bindings:
-                if binding["name"] in sample_names:
-                    sampled.append(f"{binding['name']}={binding['last_value']}")
-            sample_summary = ", ".join(sampled)
-            print(
-                "[CompetitionNoiseCurriculum] Window update: "
-                f"lap_complete_ratio={ratio:.3f}, "
-                f"window_lap_complete_resets={reported_lap_complete_resets:.0f}, "
-                f"window_total_resets={reported_total_resets:.0f}, "
-                f"decision={decision}, "
-                f"noise_scale={prev_scale:.3f}->{self._noise_scale:.3f}, "
-                f"targets=[{sample_summary}]"
-            )
-
-            self._window_lap_complete_resets = 0.0
-            self._window_total_resets = 0.0
-            self._last_eval_step = curr_step
-
-        out = {
-            "lap_complete_ratio_window": ratio,
-            "window_total_resets": reported_total_resets,
-            "window_lap_complete_resets": reported_lap_complete_resets,
-            "updated": updated,
-            "randomization_noise_scale": self._noise_scale,
-        }
-        for binding in self._bindings:
-            value = binding["last_value"]
-            if isinstance(value, bool):
-                out[f"target/{binding['name']}"] = float(value)
-            elif isinstance(value, (int, float)):
-                out[f"target/{binding['name']}"] = float(value)
-        return out
-
-
 @configclass
 class CompetitionCurriculumCfg:
-    """Competition curriculum: periodic reward-scale adaptation from lap-completion ratio."""
+    """Competition curriculum driven by shared normalized route progress."""
 
-    precision_after_lap_completion_windowed = CurrTerm(
-        func=adaptive_reward_scale_from_lap_completion_ratio,
+    route_progress_rewards = CurrTerm(
+        func=AdaptiveRewardScaleFromRouteProgress,
         params={
-            "lap_complete_term": "lap_complete",
-            "reward_term_names": ("action_smoothness", "gate_centering"),
+            "completion_term": "lap_complete",
+            "reward_term_names": (
+                "action_smoothness",
+                "gate_centering",
+                "velocity_limit",
+                "angular_velocity_limit",
+            ),
+            "increase_only_term_names": ("velocity_limit", "angular_velocity_limit"),
             "eval_interval_s": 120.0,
             "low_ratio_threshold": 0.50,
             "high_ratio_threshold": 0.75,
@@ -718,13 +390,15 @@ class CompetitionCurriculumCfg:
             "max_scale_by_term": {
                 "action_smoothness": 400.0,
                 "gate_centering": 40.0,
+                "velocity_limit": 20.0,
+                "angular_velocity_limit": 20.0,
             },
         },
     )
     randomization_progressive = CurrTerm(
-        func=adaptive_randomization_from_lap_completion_ratio,
+        func=AdaptiveRandomizationFromRouteProgress,
         params={
-            "lap_complete_term": "lap_complete",
+            "completion_term": "lap_complete",
             "eval_interval_s": 40.0,
             "low_ratio_threshold": 0.5,
             "high_ratio_threshold": 0.75,
@@ -732,217 +406,8 @@ class CompetitionCurriculumCfg:
             "min_noise_scale": 0.0,
             "max_noise_scale": 1.0,
             "initial_noise_scale": 0.0,
-            "targets": (
-                {
-                    "name": "action_noise_enable",
-                    "target_type": "env_cfg",
-                    "attr_path": "action_noise.enable",
-                    "mode": "lerp",
-                    "start_value": False,
-                    "target_value": True,
-                    "bool_threshold": 1.0e-6,
-                },
-                {
-                    "name": "obs_base_lin_vel_enable",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_lin_vel",
-                    "attr_path": "noise.enable",
-                    "mode": "lerp",
-                    "start_value": False,
-                    "target_value": True,
-                    "bool_threshold": 1.0e-6,
-                },
-                {
-                    "name": "obs_base_ang_vel_enable",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_ang_vel",
-                    "attr_path": "noise.enable",
-                    "mode": "lerp",
-                    "start_value": False,
-                    "target_value": True,
-                    "bool_threshold": 1.0e-6,
-                },
-                {
-                    "name": "obs_gravity_enable",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "projected_gravity",
-                    "attr_path": "noise.enable",
-                    "mode": "lerp",
-                    "start_value": False,
-                    "target_value": True,
-                    "bool_threshold": 1.0e-6,
-                },
-                {
-                    "name": "action_noise_gaussian_std",
-                    "target_type": "env_cfg",
-                    "attr_path": "action_noise.gaussian_std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.02,
-                },
-                {
-                    "name": "action_noise_bias_range",
-                    "target_type": "env_cfg",
-                    "attr_path": "action_noise.bias_range",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0),
-                    "target_value": (-0.05, 0.05),
-                },
-                {
-                    "name": "action_noise_lpf_alpha_range",
-                    "target_type": "env_cfg",
-                    "attr_path": "action_noise.lpf_alpha_range",
-                    "mode": "lerp",
-                    "start_value": (0.9, 1.0),
-                    "target_value": (0.8, 1.0),
-                },
-                {
-                    "name": "rates_max_delay",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "max_delay",
-                    "mode": "lerp",
-                    "start_value": 0,
-                    "target_value": 2,
-                    "dtype": "int",
-                    "clamp_min": 0,
-                },
-                {
-                    "name": "rates_filter_wn_rand_frac",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "rate_filter_natural_frequency_randomization_frac",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.3, 0.3, 0.3),
-                },
-                {
-                    "name": "rates_filter_zeta_rand_frac",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "rate_filter_damping_randomization_frac",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.3, 0.3, 0.3),
-                },
-                {
-                    "name": "rates_filter_gain_rand_frac",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "rate_filter_command_gain_randomization_frac",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.2, 0.2, 0.2),
-                },
-                {
-                    "name": "rates_thrust_to_weight_rand_frac",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "thrust_to_weight_randomization_frac",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.05,
-                },
-                {
-                    "name": "rates_aero_randomization_frac",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "aero_randomization_frac",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.1,
-                },
-                {
-                    "name": "rates_linear_drag_coeff",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "linear_drag_coeff",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.08, 0.08, 0.12),
-                },
-                {
-                    "name": "rates_quadratic_drag_coeff",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "quadratic_drag_coeff",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.010, 0.010, 0.018),
-                },
-                {
-                    "name": "rates_angular_drag_coeff",
-                    "target_type": "action_term_cfg",
-                    "term_name": "rates",
-                    "attr_path": "angular_drag_coeff",
-                    "mode": "lerp",
-                    "start_value": (0.0, 0.0, 0.0),
-                    "target_value": (0.0020, 0.0020, 0.0012),
-                },
-                {
-                    "name": "obs_base_lin_vel_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_lin_vel",
-                    "attr_path": "noise.noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.2,
-                },
-                {
-                    "name": "obs_base_lin_vel_bias_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_lin_vel",
-                    "attr_path": "noise.bias_noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 1.0,
-                },
-                {
-                    "name": "obs_base_ang_vel_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_ang_vel",
-                    "attr_path": "noise.noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.05,
-                },
-                {
-                    "name": "obs_base_ang_vel_bias_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "base_ang_vel",
-                    "attr_path": "noise.bias_noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.2,
-                },
-                {
-                    "name": "obs_gravity_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "projected_gravity",
-                    "attr_path": "noise.noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.02,
-                },
-                {
-                    "name": "obs_gravity_bias_std",
-                    "target_type": "observation_term_cfg",
-                    "group_name": "policy",
-                    "term_name": "projected_gravity",
-                    "attr_path": "noise.bias_noise_cfg.std",
-                    "mode": "lerp",
-                    "start_value": 0.0,
-                    "target_value": 0.04,
-                },
-            ),
+            "randomization_profile": "competition",
+            "activate_speed_limits_on_increase": True,
         },
     )
 
@@ -984,6 +449,8 @@ def _spawn_at_offset_origin(env: ManagerBasedRLEnv, env_ids: torch.Tensor, speed
 
     offset = torch.tensor(COMPETITION_TRACK_OFFSET, device=env.device, dtype=torch.float32)
     start_pos = _track_origin_w(env)[env_ids] + offset       # world position of the (offset) origin
+    env._curriculum_route_start_w[env_ids] = start_pos
+    env._curriculum_route_has_start[env_ids] = True
     start_quat = env._gate_orientations[env_ids, 0]          # face down-track, like gate 0
     root_vel = torch.zeros(n, 6, device=env.device)
     if speed > 0.0:
@@ -1016,6 +483,11 @@ def reset_competition_training_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tens
     """
     if env_ids is None or len(env_ids) == 0:
         return
+    # The curriculum route is always the official start followed by gate
+    # centres, even when this training episode starts near a later gate.
+    offset = torch.tensor(COMPETITION_TRACK_OFFSET, device=env.device, dtype=torch.float32)
+    env._curriculum_route_start_w[env_ids] = _track_origin_w(env)[env_ids] + offset
+    env._curriculum_route_has_start[env_ids] = True
     # Origin slot disabled → plain per-gate uniform spawn (the known-working start).
     if not bool(getattr(env.cfg, "origin_spawn_in_training", True)):
         _set_spawned_at_origin(env, env_ids, False)
@@ -1055,6 +527,8 @@ class CompetitionEventsCfg:
     # Training spawn: warm offset-origin (top-weighted slot, moving toward gate 0) + per-gate
     # power-law. The Play cfg overrides this with reset_competition_origin_spawn (cold, at rest).
     reset_racing_spawn = EventTerm(func=reset_competition_training_spawn, mode="reset")
+    reset_action_noise = EventTerm(func=shared_features.reset_action_noise, mode="reset")
+    randomize_speed_limits = EventTerm(func=shared_features.randomize_speed_limits, mode="reset")
 
     # --- domain randomization (toggled in __post_init__) ---
     randomize_robot_mass = EventTerm(
@@ -1119,6 +593,13 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
 
     gate_track_yaml: str = COMPETITION_TRACK_YAML
 
+    # Competition explicitly conditions the policy on episode speed limits.
+    speed_limits: SpeedLimitsCfg = SpeedLimitsCfg(
+        enabled=True,
+        linear_range=(2.0, 15.0),
+        angular_range=(1.0, 8.0),
+    )
+
     # Standalone observation + event pipelines (override the base configs).
     observations: CompetitionObservationsCfg = CompetitionObservationsCfg()
     events: CompetitionEventsCfg = CompetitionEventsCfg()
@@ -1168,7 +649,7 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
             thrust_to_weight=COMPETITION_PROFILE.thrust_to_weight,
             action_dim=4,
             min_delay=0,
-            max_delay=2,
+            max_delay=COMPETITION_RANDOMIZATION.max_delay,
             body_name=COMPETITION_PROFILE.body_name,
             pid_scales=COMPETITION_PROFILE.pid_scales,
             pid_p=COMPETITION_PROFILE.pid_p,
@@ -1177,20 +658,20 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
             pid_f=COMPETITION_PROFILE.pid_f,
             rate_command_scale=COMPETITION_PROFILE.rate_command_scale,
             pid_gain_randomization_frac=None,
-            thrust_to_weight_randomization_frac=0.05,
+            thrust_to_weight_randomization_frac=COMPETITION_RANDOMIZATION.thrust_fraction,
             aero_randomization_enable=True,
-            aero_randomization_frac=0.1,
-            linear_drag_coeff=(0.08, 0.08, 0.12),
-            quadratic_drag_coeff=(0.010, 0.010, 0.018),
-            angular_drag_coeff=(0.0020, 0.0020, 0.0012),
+            aero_randomization_frac=COMPETITION_RANDOMIZATION.aero_fraction,
+            linear_drag_coeff=COMPETITION_RANDOMIZATION.linear_drag,
+            quadratic_drag_coeff=COMPETITION_RANDOMIZATION.quadratic_drag,
+            angular_drag_coeff=COMPETITION_RANDOMIZATION.angular_drag,
             
             rate_filter_enable=True,
             rate_filter_natural_frequency_hz=(7.5, 7.5, 4.5),
-            rate_filter_natural_frequency_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_natural_frequency_randomization_frac=COMPETITION_RANDOMIZATION.filter_frequency_fraction,
             rate_filter_damping_ratio=(0.75, 0.75, 0.90),
-            rate_filter_damping_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_damping_randomization_frac=COMPETITION_RANDOMIZATION.filter_damping_fraction,
             rate_filter_command_gain=(1.0, 1.0, 1.0),
-            rate_filter_command_gain_randomization_frac=(0.1, 0.1, 0.1),
+            rate_filter_command_gain_randomization_frac=COMPETITION_RANDOMIZATION.filter_gain_fraction,
             rate_filter_max_command_rad_s=COMPETITION_PROFILE.rate_command_scale,
         )
 
@@ -1198,11 +679,11 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
         # uncertainty before the target simulator's hidden rate controller receives commands.
         self.action_noise.enable = self.domain_randomization
         self.action_noise.per_episode_bias = True
-        self.action_noise.gaussian_std = 0.015
-        self.action_noise.bias_range = (-0.03, 0.03)
+        self.action_noise.gaussian_std = COMPETITION_RANDOMIZATION.action_gaussian_std
+        self.action_noise.bias_range = COMPETITION_RANDOMIZATION.action_bias_range
         self.action_noise.per_episode_lpf_alpha = True
-        self.action_noise.lpf_alpha = 0.85
-        self.action_noise.lpf_alpha_range = (0.85, 1.0)
+        self.action_noise.lpf_alpha = COMPETITION_RANDOMIZATION.action_lpf_range[0]
+        self.action_noise.lpf_alpha_range = COMPETITION_RANDOMIZATION.action_lpf_range
         self.action_noise.clip_actions = True
 
         # --- always-on collision termination ---
@@ -1293,23 +774,28 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
             self.actions.rates.rate_filter_damping_randomization_frac = None
             self.actions.rates.rate_filter_command_gain_randomization_frac = None
             self.actions.rates.aero_randomization_frac = None
-        self.observations.policy.enable_corruption = self.domain_randomization
+        self.observations.policy.enable_corruption = True
 
 
 @configclass
 class CompetitionEnvCfg_PLAY(CompetitionEnvCfg):
-    """Evaluation config: eval_mode on, all drones spawn at the track origin, no randomization."""
+    """Evaluation config with optional randomized episode speed limits."""
 
     domain_randomization: bool = False
+    play_speed_limits_enabled: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.scene.num_envs = 1024
         self.eval_mode = True
+        if not self.play_speed_limits_enabled:
+            self.speed_limits.enabled = False
+            self.speed_limits.linear_range = (0.0, 0.0)
+            self.speed_limits.angular_range = (0.0, 0.0)
         self.fixed_spawn = True
         self.stats_warmup_s = 5.0
         # disable curriculum
-        self.curriculum.precision_after_lap_completion_windowed = None
+        self.curriculum.route_progress_rewards = None
         self.curriculum.randomization_progressive = None
         # Test mode spawns at the (offset) track origin instead of behind gate 0.
         self.events.reset_racing_spawn = EventTerm(func=reset_competition_origin_spawn, mode="reset")

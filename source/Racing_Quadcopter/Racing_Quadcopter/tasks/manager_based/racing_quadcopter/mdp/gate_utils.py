@@ -203,6 +203,7 @@ def update_racing_state(env: ManagerBasedRLEnv) -> None:
     passed_mask = env._gate_passed_buf > 0.5
     if passed_mask.any():
         env._gates_passed[passed] += 1
+        env._route_confirmed_segments[passed] += 1
         # Accumulate passage-quality stats (velocity + lateral offset) for curriculum.
         env._passage_velocity_sum[passed_mask] += speed[passed_mask]
         env._passage_centering_sum[passed_mask] += env._curr_dist_to_gate_lateral[passed_mask]

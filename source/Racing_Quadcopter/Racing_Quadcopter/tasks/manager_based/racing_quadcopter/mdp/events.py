@@ -13,6 +13,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.events import *
 from isaaclab.utils.math import quat_apply
 
+from Racing_Quadcopter.tasks.manager_based.route_progress import snapshot_episode_route_progress
+
 from .stats import accumulate_episode_stats
 
 
@@ -103,6 +105,10 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     gate_log: dict = {}
     if env_ids_tensor.numel() == 0:
         return gate_log
+
+    # This task-independent score is additional to all existing lap/gate
+    # statistics. Curriculum controllers consume it on the ensuing reset.
+    gate_log.update(snapshot_episode_route_progress(env, env_ids_tensor))
 
     # Restrict all stats to drones that spawned at the offset origin (when configured). The
     # curriculum snapshots and buffer zeroing further below still apply to ALL resetting envs.
@@ -229,6 +235,7 @@ def _write_spawn_state(
     env._robot.write_root_pose_to_sim(root_poses, env_ids)
     env._robot.write_root_velocity_to_sim(root_vel, env_ids)
     env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+    env._route_episode_start_position[env_ids] = start_pos
 
     # Sync _prev_drone_pos to the new spawn position so the first step's gate-progress
     # reward computes a valid (zero) distance reduction rather than a garbage delta.
@@ -465,9 +472,3 @@ def reset_racing_spawn(
         mask = torch.rand(n, device=env.device) < recovery_prob
         if mask.any():
             _apply_recovery_override(env, env_ids[mask])
-
-    if env.cfg.randomize_velocity_limit:
-        # Re-sample per-env speed cap from the configured range each episode.
-        # The new limit is also written into the observation so the policy can adapt.
-        lo, hi = env.cfg.velocity_limit_range
-        env._velocity_limit[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo
