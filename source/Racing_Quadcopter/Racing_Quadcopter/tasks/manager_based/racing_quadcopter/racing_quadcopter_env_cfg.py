@@ -486,6 +486,7 @@ class RewardsCfg:
     # wrong_direction = RewTerm(func=rewards.penalty_wrong_direction, weight=RewardWeights.WRONG_DIRECTION)
 
     # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+    perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
 
 
 @configclass
