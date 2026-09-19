@@ -33,46 +33,49 @@ High-level inspiration is aligned with robust racing pipelines (for example SWIF
 
 ## 2) Implementation Map
 
+The implementation is deliberately split into two layers:
+
+- Shared behavior lives in `tasks/manager_based/shared_features.py` and
+  `tasks/manager_based/adaptive_curriculums.py`.  Those modules allocate,
+  reset, sample, observe, penalize, and progressively scale the features for
+  every manager-based task.
+- Each task configuration is only a client: it enables or disables the shared
+  features, declares local limits/reward policy, and selects one named
+  randomization profile.  Base racing and hovering default to disabled zero
+  values; competition opts in.
+
+Each task keeps its profile declarations beside its task code:
+
+- `racing_quadcopter/racing_randomization.py`
+- `racing_quadcopter/competition_randomization.py`
+- `hovering_quadcopter/hovering_randomization.py`
+
+Profiles contain values and typed bindings only.  They do not implement
+randomization, speed-limit, or curriculum behavior.
+
 ## 2.1 Observation Randomization (State Estimation)
 
 ### Files
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/observations.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_env_cfg.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_env.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/noise.py`
+- each task's observation configuration
 
 ### How it works
-Observation corruption is applied through `_apply_obs_noise(...)` in `mdp/observations.py`.
+Observation corruption is applied through Isaac Lab observation-term noise models.
 
 Corruption components:
 1. **Per-episode bias** (optional): sampled once at reset and held constant for that episode.
 2. **Per-step Gaussian noise**: i.i.d. additive perturbation every step.
 3. **Per-step dropout** (optional): entire term for an environment may be masked by a Bernoulli gate.
 
-### Terms currently corrupted
-- `base_lin_vel` (wrapper)
-- `base_ang_vel` (wrapper)
-- `projected_gravity` (wrapper)
-- `last_action` (wrapper)
-- `obs_gates` (local gate observation function)
-- `velocity_limit` (local observation function)
-
-### Wrapper strategy
-For IsaacLab MDP terms imported from `isaaclab.envs.mdp`, wrappers are used:
-- `wrap_base_lin_vel`
-- `wrap_base_ang_vel`
-- `wrap_projected_gravity`
-- `wrap_last_action`
-
-These wrappers:
-- call the original IsaacLab function,
-- then apply `_apply_obs_noise(...)`.
-
-`_lookup_mdp_term(...)` uses `@lru_cache(maxsize=256)` to avoid repeated import/attribute lookup overhead.
+The shared adaptive target builders can enable and scale compatible terms in any
+task. Racing configures linear velocity, angular velocity, and gravity; hovering
+configures angular velocity and gravity.
 
 ## 2.2 Action Randomization (Control Channel)
 
 ### File
 - `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/actions.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/shared_features.py`
 
 ### Where applied
 In `QuadcopterThrustAction.process_actions(...)`, before converting action commands to thrust and moments.
@@ -109,19 +112,38 @@ This is important: randomization is done in the action term itself, so it affect
 ## 2.3 Dynamics Randomization
 
 ### Files
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_env_cfg.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/events.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/route_progress.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/adaptive_curriculums.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/shared_features.py`
+- each task's environment configuration
 
 ### Mechanisms
 1. **Startup mass randomization** (`randomize_robot_mass` EventTerm)
 2. **Startup actuator gain randomization** (`randomize_robot_actuator_gains` EventTerm)
-3. **Per-episode velocity limit randomization** (`randomize_velocity_limit` + `velocity_limit_range`)
+3. **Curriculum-latched speed limits** (`speed_limits.enabled`)
 
-Velocity limit is re-sampled on reset in `mdp/events.py` and exposed to policy via `velocity_limit_obs`.
+Disabled speed limits are a true no-op: zero buffers, no observation columns, and zero
+penalties. When enabled, the policy sees both limits from episode zero; they stay at the
+maxima until curriculum activation.
+After activation, the reset `randomize_speed_limits` event samples both per environment and never
+deactivates if later normalized route progress falls.
+The competition reward curriculum also scales `velocity_limit` and
+`angular_velocity_limit` upward on successful route-progress windows (up to 5× their
+base weights). Unlike centering and action-smoothness scales, these two scales never
+decrease during a later low-progress window.
+
+Curriculum performance is continuous geometry rather than an integer gate count. The
+episode's first and last drone positions are projected onto the closest points of an
+ordered polyline. Racing supplies gate centers (with the official start prepended for
+the competition); hovering supplies ordered target-pose centers. Covered arc length is
+divided by the distance physically reachable from the episode's linear limit and full
+time budget. Hovering additionally removes required pose dwell time from the travel
+budget. Existing lap- and waypoint-completion metrics remain unchanged and separately logged.
 
 ## 3) Configuration Reference
 
-All key knobs live in `racing_quadcopter_env_cfg.py`.
+Shared knobs live in `tasks/manager_based/shared_features.py`; each task owns only
+its selected targets, ranges, reward weights, and opt-in flags.
 
 ## 3.1 `ObservationNoiseCfg`
 
@@ -134,13 +156,11 @@ All key knobs live in `racing_quadcopter_env_cfg.py`.
 | `gaussian_std_base_ang_vel` | Std for angular velocity obs | `0.02` |
 | `gaussian_std_projected_gravity` | Std for projected gravity obs | `0.01` |
 | `gaussian_std_obs_gates` | Std for gate observation vector | `0.02` |
-| `gaussian_std_velocity_limit` | Std for velocity-limit obs | `0.0` |
 | `gaussian_std_last_action` | Std for last-action obs | `0.0` |
 | `bias_range_base_lin_vel` | Uniform bias range | `(-0.05, 0.05)` |
 | `bias_range_base_ang_vel` | Uniform bias range | `(-0.02, 0.02)` |
 | `bias_range_projected_gravity` | Uniform bias range | `(-0.01, 0.01)` |
 | `bias_range_obs_gates` | Uniform bias range | `(-0.1, 0.1)` |
-| `bias_range_velocity_limit` | Uniform bias range | `(-0.5, 0.5)` |
 | `bias_range_last_action` | Uniform bias range | `(-0.05, 0.05)` |
 | `dropout_prob` | Per-step term dropout probability | `0.0` |
 
@@ -148,7 +168,7 @@ All key knobs live in `racing_quadcopter_env_cfg.py`.
 
 | Field | Meaning | Default |
 |---|---|---|
-| `enable` | Master switch for action randomization | `True` (train cfg) |
+| `enable` | Master switch for action randomization | `False` (shared default) |
 | `per_episode_bias` | Enable per-episode action bias | `True` |
 | `gaussian_std` | Action Gaussian std | `0.015` |
 | `bias_range` | Uniform action bias range | `(-0.05, 0.05)` |
@@ -159,16 +179,16 @@ All key knobs live in `racing_quadcopter_env_cfg.py`.
 
 | Field | Meaning | Default |
 |---|---|---|
-| `events.randomize_robot_mass` | Startup mass randomization term | enabled (train cfg) |
-| `events.randomize_robot_actuator_gains` | Startup gain randomization term | enabled (train cfg) |
-| `randomize_velocity_limit` | Per-episode speed-cap randomization | `False` |
-| `velocity_limit_range` | Speed-cap sampling range | `(8.0, 15.0)` |
+| `adaptive_curriculum_enabled` | Route-progress reward/noise/dynamics curriculum | `False` outside competition |
+| `speed_limits.enabled` | Add both observations and curriculum-latched randomization | `False` |
+| `speed_limits.linear_range` | Linear speed-limit sampling range (m/s) | `(0.0, 0.0)` when disabled |
+| `speed_limits.angular_range` | Angular speed-limit sampling range (rad/s) | `(0.0, 0.0)` when disabled |
 
 ## 4) Train vs Eval Behavior
 
-By default:
-- `RacingQuadcopterEnvCfg` (train): observation/action randomization enabled.
-- `RacingQuadcopterEnvCfg_PLAY` and `RacingQuadcopterEnvCfg_FIXED_PLAY`: observation/action randomization disabled, mass/gain randomization disabled.
+By default, general racing, fixed-track racing, and hovering expose the shared
+terms but keep adaptive curriculum and speed limits disabled. Competition enables
+paired limits and its route-progress curricula; its play config disables curriculum.
 
 This explicit split is conventional and recommended:
 - training with noise,
@@ -199,7 +219,8 @@ Use a staged schedule rather than maximum randomization from step 0.
 - Add small per-episode biases.
 
 ### Phase C: Hardening
-- Turn on velocity-limit randomization if policy can already track trajectories.
+- Enable paired speed limits when the policy should observe episode-conditioned constraints;
+  fixed maximum-limit penalties still apply before curriculum-latched sampling begins.
 - Widen mass/gain distributions only after stable convergence.
 - Keep distribution physically plausible.
 
@@ -239,8 +260,10 @@ If possible, keep one deterministic eval benchmark and one noisy eval benchmark.
 
 ## 9) Known Implementation Notes
 
-1. `ObsGroup.enable_corruption = False` in `PolicyCfg` disables IsaacLab's built-in ObsTerm corruption path, but wrapper-based corruption in `mdp/observations.py` still applies because it is inside the term function itself.
-2. `_lookup_mdp_term` is cached with `lru_cache(maxsize=256)`; if hot-reloading symbols during development, restart or clear cache to force re-lookup.
+1. Adaptive observation-noise targets enable both the observation group and each
+   selected noise model; changing only one is insufficient.
+2. Action delay buffers reserve the configured curriculum maximum while the active
+   delay remains zero, allowing delay to grow safely during training.
 3. Observation and action per-episode bias tensors are sampled in `_reset_idx(...)` and zeroed if disabled.
 
 ## 10) Usage Examples
@@ -263,7 +286,65 @@ python scripts/skrl/play.py --task Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 python scripts/rsl_rl/play.py --task Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
 ```
 
-## 11) Recommended Next Extensions
+## 11) Enabling Randomization — Quick Reference
+
+All randomization is **off by default**. Each technique is controlled by a top-level flag on `RacingQuadcopterEnvCfg` so it can be toggled via `--override` without editing any file.
+
+### Flags and what they control
+
+| Flag | Default | Controls |
+|---|---|---|
+| `randomize_mass` | `False` | Startup mass scale ±10 % (`randomize_robot_mass` event) |
+| `randomize_com` | `False` | Startup CoM shift ±15 mm per axis (`randomize_base_com` event) |
+| `randomize_actuator_gains` | `False` | Startup stiffness/damping scale ±10 % (`randomize_robot_actuator_gains` event) |
+| `apply_external_disturbances` | `False` | Interval random force/torque + velocity push (`base_external_force_torque`, `push_robot` events) |
+| `observation_noise_enable` | `False` | Per-step Gaussian noise + per-episode bias on all obs terms (sets `PolicyCfg.enable_corruption`) |
+| `action_noise.enable` | `False` | Per-step Gaussian noise, per-episode bias, and LPF lag on actions (`ActionNoiseCfg`) |
+| `recovery_spawn_prob` | `0.0` | Fraction of envs that respawn with fully random attitude and velocity (stage 2+ only) |
+| `speed_limits.enabled` | `False` | Add paired observations and permanently enable sampling after curriculum activation; maximum penalties always apply |
+
+### Enable full DR stack for a training run
+
+```bash
+python scripts/skrl/train.py \
+    --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
+    --headless \
+    --override randomize_mass=True \
+    --override randomize_com=True \
+    --override randomize_actuator_gains=True \
+    --override apply_external_disturbances=True \
+    --override observation_noise_enable=True \
+    --override action_noise.enable=True \
+    --override recovery_spawn_prob=0.2
+```
+
+### Enable selectively (e.g. obs noise only)
+
+```bash
+python scripts/skrl/train.py \
+    --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
+    --headless \
+    --override observation_noise_enable=True
+```
+
+### Tune action noise parameters
+
+`action_noise.enable=True` uses the values already set in `ActionNoiseCfg`. Override individual knobs if needed:
+
+```bash
+--override action_noise.enable=True \
+--override action_noise.gaussian_std=0.015 \
+--override action_noise.bias_range="(-0.05, 0.05)" \
+--override action_noise.lpf_alpha=0.9
+```
+
+### Note on Play configs
+
+Play configs (`*-Play-v0`) inherit the same defaults (all DR off) and additionally set `eval_mode=True` and `fixed_spawn=True`. No extra flags are needed to run a clean evaluation.
+
+---
+
+## 12) Recommended Next Extensions
 
 If you want to push this further in a conventional way:
 - add correlated IMU noise (random walk + bias drift),

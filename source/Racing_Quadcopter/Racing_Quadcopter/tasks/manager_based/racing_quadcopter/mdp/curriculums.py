@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from Racing_Quadcopter.tasks.manager_based.shared_features import activate_speed_limit_randomization
+
 from collections.abc import Sequence
 
 _STAGE1_BOOST = 1.0  # multiplier applied to crash and angular_velocity in stage 1
@@ -55,6 +57,7 @@ def apply_staged_curriculum(
 
     if stage == 0 and env.common_step_counter >= env.cfg.curriculum_stage1_steps:
         env._curriculum_stage = 1
+        activate_speed_limit_randomization(env)
 
         crash_cfg = env.reward_manager.get_term_cfg("crash")
         crash_cfg.weight = env._stage2_crash_weight

@@ -55,6 +55,15 @@ def collision_termination(env: ManagerBasedRLEnv) -> torch.Tensor:
     return env._collision_termination_buf
 
 
+def wrong_direction_crossing(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """True when the drone crossed the current gate from the exit side (backwards). Shape [N].
+
+    Prevents the exploit of approaching a gate from behind, briefly tapping the approach
+    side, and receiving a valid passage credit on the next step.
+    """
+    return env._wrong_crossing_buf
+
+
 def lap_complete(env: ManagerBasedRLEnv) -> torch.Tensor:
     """True when the env has passed every gate at least once (eval mode only). Shape [N].
 

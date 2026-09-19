@@ -30,11 +30,19 @@ from isaaclab.utils import configclass
 
 from isaaclab_assets import CRAZYFLIE_CFG
 from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF
+from Racing_Quadcopter.tasks.manager_based.adaptive_curriculums import (
+    AdaptiveRandomizationFromRouteProgress,
+    AdaptiveRewardScaleFromRouteProgress,
+    get_randomization_profile,
+)
+from Racing_Quadcopter.tasks.manager_based import shared_features
+from Racing_Quadcopter.tasks.manager_based.shared_features import ActionNoiseCfg, SpeedLimitsCfg
+from Racing_Quadcopter.tasks.manager_based.noise import drone_noise_model_factory
 
 from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
 from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterMomentsActionCfg
 from .mdp.curriculums import apply_staged_curriculum
-from .mdp.noise import drone_noise_model_factory
+from .racing_randomization import register_racing_randomization_profile
 
 @dataclass
 class DroneProfile:
@@ -43,7 +51,7 @@ class DroneProfile:
     robot_cfg: ArticulationCfg
     body_name: str
     thrust_to_weight: float
-    moment_scale: float
+    moment_scale: tuple[float, float, float]  #: Per-axis (roll, pitch, yaw) moment scales [N·m] mapping action ±1 → full physical authority.
     motor_k_t: float #: Thrust coefficient :math:`k_T` [N/(rad/s)²] for :math:`T_i = k_T \Omega_i^2`.
     motor_k_d: float #: Drag torque coefficient :math:`k_D` [N·m/(rad/s)²] for yaw mixing row in :math:`B`.
     motor_arm_length_m: float #: Diagonal arm length :math:`l` [m] in the X-frame mixer :math:`B` (center to rotor).
@@ -61,7 +69,7 @@ def _make_profile(
     cfg: ArticulationCfg,
     body_name: str,
     thrust_to_weight: float,
-    moment_scale: float,
+    moment_scale: tuple[float, float, float],
     *,
     motor_k_t: float,
     motor_k_d: float,
@@ -95,15 +103,24 @@ def _make_profile(
 
 
 # Anemos: ~0.85 kg total (base_link 0.835 + 4 props), inertia ixx≈2.16e-3, iyy≈2.92e-3.
-# T/W ~4 is conservative for a 5" racing quad; moment_scale=0.1 gives ~35-45 rad/s² peak.
+#
+# moment_scale derivation (per-axis, from URDF geometry and k_t/k_d):
+#   τ_roll_max  = min(Σ|y_left| , Σ|y_right|) × k_t × Ω_max²
+#               = min(0.1438, 0.1360) × 8.54858 = 1.16 N·m   (motors at y=±0.068–0.072 m)
+#   τ_pitch_max = min(Σ|x_back| , Σ|x_front|) × k_t × Ω_max²
+#               = min(0.1640, 0.1771) × 8.54858 = 1.40 N·m   (motors at x=±0.082–0.089 m)
+#   τ_yaw_max   = 2 × k_d × Ω_max²
+#               = 2 × 1e-8 × 1e6 = 0.020 N·m
+#   Conservative: min of both ± directions so action ±1 is achievable without saturation.
 DRONE_PROFILES: dict[str, DroneProfile] = {
-    # motor_* placeholders until identified from bench/model; safe defaults for invertible B.
-    #Motor values taken from Crazyflie 2.0 https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    # Motor values taken from Crazyflie 2.0:
+    # https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    # Crazyflie moment_scale: roll/pitch max ≈ 0.011 N·m, yaw max ≈ 0.010 N·m → (0.01, 0.01, 0.01) is correct.
     "crazyflie": _make_profile(
         CRAZYFLIE_CFG,
         body_name="body",
         thrust_to_weight=1.9,
-        moment_scale=0.01,
+        moment_scale=(0.01, 0.01, 0.01),
         motor_k_t=2.9e-8,
         motor_k_d=7.3e-10,
         motor_arm_length_m=0.0397,
@@ -115,37 +132,39 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         pid_d=(32.0, 34.0, 32.0),
         pid_f=(0.0, 0.0, 0.0),
     ),
-    # Table values you provided (replace if USD differs).
     "anemos_usd": _make_profile(
         ANEMOS_DRONE_CFG_USD,
         body_name="base_link",
-        thrust_to_weight=4.0,
-        moment_scale=1.0,
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
         motor_k_t=8.54858e-6,
         motor_k_d=1e-8,
-        motor_arm_length_m=0.17,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
         motor_omega_max_rad_s=1000.0,
         rate_command_scale=30.0,
-        pid_scales=0.00005,
-        pid_p=(45.0, 47.0, 45.0),
+        pid_scales=0.005,
+        # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
+        # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
+        #      D=0: yaw authority is too low for derivative term to add meaningful damping
+        pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
-        pid_d=(32.0, 34.0, 32.0),
+        pid_d=(32.0, 34.0, 0.45),
         pid_f=(0.0, 0.0, 0.0),
     ),
     "anemos_urdf": _make_profile(
         ANEMOS_DRONE_CFG_URDF,
         body_name="base_link",
-        thrust_to_weight=4.0,
-        moment_scale=1.0,
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
         motor_k_t=8.54858e-6,
         motor_k_d=1e-8,
-        motor_arm_length_m=0.17,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
         motor_omega_max_rad_s=1000.0,
         rate_command_scale=30.0,
-        pid_scales=0.00005,
-        pid_p=(45.0, 47.0, 45.0),
+        pid_scales=0.005,
+        pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
-        pid_d=(32.0, 34.0, 32.0),
+        pid_d=(32.0, 34.0, 0.45),
         pid_f=(0.0, 0.0, 0.0),
     ),
 }
@@ -174,11 +193,14 @@ from Racing_Quadcopter.terrains import load_gates_from_yaml as _load_gates_from_
 DRONE_MODEL_ENV_VAR = "DRONE_MODEL"
 TRACK_YAML_ENV_VAR = "TRACK_YAML"
 ACTION_TYPE_ENV_VAR = "ACTION_TYPE"
+OBSERVATION_SPACE_ENV_VAR = "OBSERVATION_SPACE"
 
 _ACTION_TYPES = ("rates", "moments")
+_OBSERVATION_SPACES = ("mono_race", "ours")
 
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
 ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "rates")
+OBSERVATION_SPACE = _os.environ.get(OBSERVATION_SPACE_ENV_VAR, "ours")
 
 _REPO_ROOT = _os.path.normpath(
     _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..")
@@ -191,25 +213,47 @@ assert DRONE_MODEL in DRONE_PROFILES, (
 assert ACTION_TYPE in _ACTION_TYPES, (
     f"Invalid ACTION_TYPE={ACTION_TYPE!r}. Set ${ACTION_TYPE_ENV_VAR} to one of: {list(_ACTION_TYPES)}"
 )
+assert OBSERVATION_SPACE in _OBSERVATION_SPACES, (
+    f"Invalid OBSERVATION_SPACE={OBSERVATION_SPACE!r}. Set ${OBSERVATION_SPACE_ENV_VAR} to one of: {list(_OBSERVATION_SPACES)}"
+)
+
+# Register before observation configs are constructed, then retrieve the local
+# profile through the shared registry.  This keeps configuration values and
+# curriculum endpoints in one task-local source of truth.
+_RACING_NOISE_TERMS = ("base_ang_vel",) if OBSERVATION_SPACE == "mono_race" else (
+    "base_lin_vel",
+    "base_ang_vel",
+    "projected_gravity",
+)
+register_racing_randomization_profile(
+    observation_terms=_RACING_NOISE_TERMS,
+    action_type=ACTION_TYPE,
+)
+RACING_RANDOMIZATION = get_randomization_profile("racing")
 PROFILE = DRONE_PROFILES[DRONE_MODEL]
 
 
-# SKRL additionally applies rewards_shaper_scale=0.01 on top.
-@scale_dataclass_attributes(100.0)
+# @scale_dataclass_attributes(1.0)
 @dataclass
 class RewardWeights:
     GATE_PASSAGE: float = 250.0
     GATE_PROGRESS: float = 20.0
-    GATE_CENTERING: float = 0.5
+    GATE_CENTERING: float = 4.0
     VELOCITY_TOWARD_GATE: float = 2.0
-    VELOCITY_LIMIT: float = -0.05
+    VELOCITY_LIMIT: float = -1.5
+    ANGULAR_VELOCITY_LIMIT: float = -0.2
     PERCEPTION: float = -0.01
     ORIENTATION: float = -0.005
-    ANGULAR_VELOCITY: float = -0.001
-    ACTION_SMOOTHNESS: float = -0.0001
-    ACTION_MAGNITUDE: float = -0.001
+    ANGULAR_VELOCITY: float = -0.03
+    ACTION_SMOOTHNESS: float = -5.0
+    ACTION_MAGNITUDE: float = -1.0
     CRASH: float = -50.0
     WRONG_SIDE: float = -0.1
+    
+    # Currently not in use
+    # ACTION_RATE_THRESH: float = -0.005
+    # LOW_ACTION: float = -0.001
+    # WRONG_DIRECTION: float = -50.0
 
 
 
@@ -218,29 +262,12 @@ class GateObservationConfig:
     """Observation parameters."""
 
     num_next_gates: int = 3
-    include_velocity_limit: bool = True
+    mono_race_num_next_gates: int = 1
+    mono_race_future_gates_pose_ahead: int = 2
     # Fraction of the gate aperture to shrink off each side before reporting it as
     # the 7th observation value (effective_half = half * (1 - 2*frac)). 0.0 reports
     # the true aperture; 0.2 reports a conservative 60%-width inscribed area.
     gate_size_obs_buffer_frac: float = 0.0
-
-
-@configclass
-class ActionNoiseCfg:
-    """Config for corrupting actions / simulating actuator noise/lag.
-
-    - gaussian_std: per-step additive noise on actions
-    - per_episode_bias: sampled bias added to actions each episode
-    - lpf_alpha: first-order low-pass applied to actions (1.0=no smoothing)
-    """
-
-    # Conservative training defaults: enabled in training, disabled in *_PLAY configs.
-    enable: bool = True
-    per_episode_bias: bool = True
-    gaussian_std: float = 0.0
-    bias_range: tuple[float, float] = (-0.0, 0.0)
-    lpf_alpha: float = 1.0 # No lag; set <1.0 to simulate actuator lag.
-    clip_actions: bool = True
 
 
 @configclass
@@ -293,51 +320,65 @@ class ActionsCfg:
                 thrust_to_weight=PROFILE.thrust_to_weight,
                 action_dim=4,
                 body_name=PROFILE.body_name,
+                moment_scale=PROFILE.moment_scale,
             )
+
+# Observation history windows. Module-level (not class attributes): the ObservationManager
+# enumerates every attribute in a group's __dict__ as a term, and the name must not be
+# ``history_length`` (the inherited ObsGroup field, which would override every term).
+_OURS_OBS_WINDOW = 1
+_MONORACE_OBS_WINDOW = 1
+
 
 @configclass
 class ObservationsCfg:
     """Policy observations."""
     
     @configclass
-    class PolicyCfg(ObsGroup):
+    class OursObservationsCfg(ObsGroup):
+        # Individual noise models default off; this keeps their configs alive
+        # for the optional shared curriculum.
         enable_corruption: bool = True
         concatenate_terms: bool = True
         
-        history_length: int = 3
         
         base_lin_vel = ObsTerm(
             func=observations.base_lin_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.05, std_bias=0.01, dropout=0.0),
-            history_length=history_length,
+            noise=drone_noise_model_factory(
+                std_noise=RACING_RANDOMIZATION.base_lin_vel_noise[0],
+                std_bias=RACING_RANDOMIZATION.base_lin_vel_noise[1],
+                dropout=0.0,
+            ),
+            history_length=_OURS_OBS_WINDOW,
         )
         
         #IMU 
         base_ang_vel = ObsTerm(
             func=observations.base_ang_vel,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
-            history_length=history_length,
+            noise=drone_noise_model_factory(
+                std_noise=RACING_RANDOMIZATION.base_ang_vel_noise[0],
+                std_bias=RACING_RANDOMIZATION.base_ang_vel_noise[1],
+                dropout=0.0,
+            ),
+            history_length=_OURS_OBS_WINDOW,
         )
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
-            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
-            history_length=history_length,
+            noise=drone_noise_model_factory(
+                std_noise=RACING_RANDOMIZATION.gravity_noise[0],
+                std_bias=RACING_RANDOMIZATION.gravity_noise[1],
+                dropout=0.0,
+            ),
+            history_length=_OURS_OBS_WINDOW,
         )
-
-        #Having actions as observations is good enough (Linear transformation)
-        # motor_speeds = ObsTerm(
-        #     func=observations.motor_speeds_obs,
-        #     noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
-        #     history_length=history_length,
-        # )
 
         #ACTION
         last_action = ObsTerm(
             func=observations.last_action,
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
 
 
@@ -345,15 +386,58 @@ class ObservationsCfg:
         obs_gates = ObsTerm(
             func=observations.compute_next_gates_rel_and_fwd_body,
             noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
-            history_length=history_length,
+            history_length=_OURS_OBS_WINDOW,
         )
         
-        velocity_limit = ObsTerm(
-            func=observations.velocity_limit_obs,
-            history_length=history_length,
+        speed_limits = ObsTerm(
+            func=observations.speed_limits_obs,
         )
 
-    policy: PolicyCfg = PolicyCfg()
+    @configclass
+    class MonoRaceObservationsCfg(ObsGroup):
+        enable_corruption: bool = True
+        concatenate_terms: bool = True
+
+
+        mono_race_gate_position_velocity_gate_frame = ObsTerm(
+            func=observations.mono_race_gate_position_velocity_gate_frame,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+        mono_race_gate_orientations = ObsTerm(
+            func=observations.mono_race_gate_orientations,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+        mono_race_future_gates_pose_in_current_gate_frame = ObsTerm(
+            func=observations.mono_race_future_gates_pose_in_current_gate_frame,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+        base_ang_vel = ObsTerm(
+            func=observations.base_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(
+                std_noise=RACING_RANDOMIZATION.base_ang_vel_noise[0],
+                std_bias=RACING_RANDOMIZATION.base_ang_vel_noise[1],
+                dropout=0.0,
+            ),
+            scale= 0.2,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+        motor_speeds = ObsTerm(
+            func=observations.motor_speeds_obs,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+        speed_limits = ObsTerm(
+            func=observations.speed_limits_obs,
+        )
+
+
+    if OBSERVATION_SPACE == "mono_race":
+        policy = MonoRaceObservationsCfg()
+    else:
+        policy = OursObservationsCfg()
 
 
 @configclass
@@ -365,12 +449,19 @@ class RewardsCfg:
 
     gate_passage = RewTerm(func=rewards.reward_gate_passage, weight=RewardWeights.GATE_PASSAGE)
     gate_progress = RewTerm(func=rewards.reward_gate_progress, weight=RewardWeights.GATE_PROGRESS)
-    gate_centering = RewTerm(func=rewards.reward_gate_centering, weight=RewardWeights.GATE_CENTERING)
+    gate_centering = RewTerm(
+        func=rewards.reward_gate_centering,
+        weight=RewardWeights.GATE_CENTERING,
+        params={"reference_speed": 15.0},
+    )
     velocity_toward_gate = RewTerm(
         func=rewards.reward_velocity_toward_gate, weight=RewardWeights.VELOCITY_TOWARD_GATE
     )
     velocity_limit = RewTerm(func=rewards.penalty_velocity_limit, weight=RewardWeights.VELOCITY_LIMIT)
-    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+    angular_velocity_limit = RewTerm(
+        func=rewards.penalty_angular_velocity_limit, weight=RewardWeights.ANGULAR_VELOCITY_LIMIT
+    )
+    
     orientation = RewTerm(func=rewards.penalty_orientation, weight=RewardWeights.ORIENTATION)
     angular_velocity = RewTerm(
         func=rewards.penalty_angular_velocity, weight=RewardWeights.ANGULAR_VELOCITY
@@ -380,10 +471,22 @@ class RewardsCfg:
     )
 
     action_magnitude = RewTerm(
-        func=rewards.penalty_action_magnitude, weight=RewardWeights.ACTION_MAGNITUDE
+        func=shared_features.penalty_action_magnitude,
+        weight=RewardWeights.ACTION_MAGNITUDE,
+        params={
+            "clip_threshold": 1.0,
+            "clip_excess_multiplier": 100.0,
+        },
     )
     crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
     wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = RewTerm(func=rewards.penalty_wrong_direction, weight=RewardWeights.WRONG_DIRECTION)
+
+    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+    perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
 
 
 @configclass
@@ -438,13 +541,51 @@ class EventsCfg:
     )
     reset_scene_to_default = EventTerm(func=events.reset_scene_to_default, mode="reset")
     reset_racing_spawn = EventTerm(func=events.reset_racing_spawn, mode="reset", params={"method": "uniform"})
+    reset_action_noise = EventTerm(func=shared_features.reset_action_noise, mode="reset")
+    randomize_speed_limits = EventTerm(func=shared_features.randomize_speed_limits, mode="reset")
 
 
 @configclass
 class CurriculumCfg:
-    """Staged curriculum: stay-alive → full racing → recovery spawns."""
+    """Racing curriculum; route-adaptive terms are disabled by default."""
 
     staged = CurrTerm(func=apply_staged_curriculum)
+    route_progress_rewards = CurrTerm(
+        func=AdaptiveRewardScaleFromRouteProgress,
+        params={
+            "enabled_attr": "adaptive_curriculum_enabled",
+            "completion_term": "lap_complete",
+            "reward_term_names": (
+                "action_smoothness",
+                "gate_centering",
+                "velocity_limit",
+                "angular_velocity_limit",
+            ),
+            "increase_only_term_names": ("velocity_limit", "angular_velocity_limit"),
+            "eval_interval_s": 120.0,
+            "low_ratio_threshold": 0.50,
+            "high_ratio_threshold": 0.75,
+            "scale_step_fraction": 0.10,
+            "min_scale": 1.0,
+            "max_scale_default": 5.0,
+        },
+    )
+    randomization_progressive = CurrTerm(
+        func=AdaptiveRandomizationFromRouteProgress,
+        params={
+            "enabled_attr": "adaptive_curriculum_enabled",
+            "completion_term": "lap_complete",
+            "eval_interval_s": 120.0,
+            "low_ratio_threshold": 0.50,
+            "high_ratio_threshold": 0.75,
+            "scale_step_fraction": 0.10,
+            "min_noise_scale": 0.0,
+            "max_noise_scale": 1.0,
+            "initial_noise_scale": 0.0,
+            "randomization_profile": "racing",
+            "activate_speed_limits_on_increase": True,
+        },
+    )
 
 
 @configclass
@@ -455,7 +596,10 @@ class TerminationsCfg:
     runaway = DoneTerm(func=terminations.runaway_velocity, time_out=False)
     collision = DoneTerm(func=terminations.collision_termination, time_out=False)
     lap_complete = DoneTerm(func=terminations.lap_complete, time_out=True)
-
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = DoneTerm(func=terminations.wrong_direction_crossing, time_out=False)
 
 @configclass
 class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
@@ -463,7 +607,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     seed: int = 42
 
-    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=True)
+    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=False, clone_in_fabric=False)
 
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -473,13 +617,23 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
     observation: GateObservationConfig = GateObservationConfig()
     action_noise: ActionNoiseCfg = ActionNoiseCfg()
+    # Disabled by default.  Set ``enabled=True`` and positive ranges here (or
+    # in a derived config) to append [linear_limit, angular_limit] to policy obs.
+    speed_limits: SpeedLimitsCfg = SpeedLimitsCfg(
+        enabled=True,
+        linear_range=(2.0, 15.0),
+        angular_range=(1.0, 5.0),
+    )
+
+    # Enables the shared route-progress reward/noise/dynamics curriculum above.
+    # Speed limits remain independently controlled by ``speed_limits.enabled``.
+    adaptive_curriculum_enabled: bool = True
+    # Expensive action percentiles are opt-in and intended for evaluation/debug.
+    action_diagnostics_enabled: bool = False
+    action_diagnostics_interval_s: float = 1.0
 
     decimation: int = 2
     episode_length_s: float = 20.0
-
-    velocity_limit: float = 15.0
-    randomize_velocity_limit: bool = False
-    velocity_limit_range: tuple[float, float] = (8.0, 15.0)
 
     upside_down_threshold: float = 0.7
     min_height: float = 0.2
@@ -491,10 +645,19 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     force_collision_termination: bool = False  # skip the per-env competence curriculum and terminate on any collision
     fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
     recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
+
+    # ── Domain randomization flags ─────────────────────────────────────────────
+    # All default to False (no domain randomization). Set True individually to
+    # enable the corresponding perturbation.
+    randomize_mass: bool = False              # startup: scale robot mass ±10 %
+    randomize_com: bool = False               # startup: shift CoM ±15 mm per axis
+    randomize_actuator_gains: bool = False    # startup: scale stiffness/damping ±10 %
+    apply_external_disturbances: bool = False # interval: random force/torque + velocity push
+    observation_noise_enable: bool = False    # per-step obs Gaussian noise + per-episode bias
     speed_log_interval_s: float = 10.0
     stats_warmup_s: float = 0.0    # skip stats accumulation for this many simulation seconds at episode start
-    draw_trajectory: bool = True        # green closed-loop polyline through all waypoints (USD, no collision)
-    draw_gate_indicators: bool = True   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
+    draw_trajectory: bool = False        # green closed-loop polyline through all waypoints (USD, no collision)
+    draw_gate_indicators: bool = False   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
     draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
 
     # Demo mode: dark scene + OmniPBR emissive glow on all vis prims and drones (RTX only).
@@ -537,6 +700,21 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     viewer: ViewerCfg = ViewerCfg(eye=(15.0, 15.0, 7.0), lookat=(3.0, 3.0, 0.0), origin_type="world")
 
+    def _apply_dr_flags(self) -> None:
+        """Wire domain-randomization flags into sub-configs. Called by every __post_init__."""
+        if not self.randomize_mass:
+            self.events.randomize_robot_mass = None
+        if not self.randomize_com:
+            self.events.randomize_base_com = None
+        if not self.randomize_actuator_gains:
+            self.events.randomize_robot_actuator_gains = None
+        if not self.apply_external_disturbances:
+            self.events.base_external_force_torque = None
+            self.events.push_robot = None
+        # Per-term noise ``enable`` is the runtime authority.  The group stays
+        # enabled so Isaac Lab does not discard those term configurations.
+        self.observations.policy.enable_corruption = True
+
     def __post_init__(self) -> None:
         terrain_generator = create_racing_gates_terrain(self.seed)
         self.scene.terrain = TerrainImporterCfg(
@@ -554,6 +732,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             debug_vis=True,
         )
         self.sim.render_interval = self.decimation
+        self._apply_dr_flags()
 
 
 @configclass
@@ -565,10 +744,6 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observations.policy.enable_corruption = False
-        self.action_noise.enable = False
-        self.events.randomize_robot_mass = None
-        self.events.randomize_robot_actuator_gains = None
         self.stats_warmup_s = 30.0
         print("[INFO] Evaluation mode is ON.")
 
@@ -585,22 +760,22 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
 # and configs/tracks/simple.yaml for the YAML equivalents.
 # ---------------------------------------------------------------------------
 # FIXED_GATES (full circuit, see configs/tracks/default.yaml):
-#   GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
-#   GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
-#   GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
-#   GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
-#   GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # SPLIT-S entry
-#   GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # SPLIT-S exit
-#   GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
-#   GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
-#   GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
-#   GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
+#   GateSpec(position=[7.5,  2.0, 1.2], rotation=[0.0, 0.0, 0.0]),
+#   GateSpec(position=[12.5, 4.5, 2.5], rotation=[0.0, 0.0, 65.0]),
+#   GateSpec(position=[13.5, 9.0, 4.5], rotation=[0.0, 0.0, 105.0]),
+#   GateSpec(position=[10.5, 13.0, 4.5], rotation=[0.0, 0.0, 160.0]),
+#   GateSpec(position=[7.5, 13.5, 4.2], rotation=[0.0, 0.0, 180.0]),  # SPLIT-S entry
+#   GateSpec(position=[7.5, 12.0, 1.5], rotation=[0.0, 0.0, 0.0]),    # SPLIT-S exit
+#   GateSpec(position=[4.0, 10.5, 2.0], rotation=[0.0, 0.0, 270.0]),
+#   GateSpec(position=[1.8,  7.5, 1.5], rotation=[0.0, 0.0, 230.0]),
+#   GateSpec(position=[3.5,  3.5, 1.8], rotation=[0.0, 0.0, 350.0]),
+#   GateSpec(position=[5.5,  2.0, 2.5], rotation=[0.0, 0.0, 25.0]),
 #
 # FIXED_GATES_simple (4-gate diamond, see configs/tracks/simple.yaml):
-#   GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
-#   GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
-#   GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
-#   GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
+#   GateSpec(position=[7.5, 5.0, 4.5], rotation=[0.0, 0.0, 45.0]),
+#   GateSpec(position=[7.5, 7.5, 4.5], rotation=[0.0, 0.0, 315.0]),
+#   GateSpec(position=[5.0, 7.5, 4.5], rotation=[0.0, 0.0, 225.0]),
+#   GateSpec(position=[5.0, 5.0, 4.5], rotation=[0.0, 0.0, 135.0]),
 
 
 @configclass
@@ -635,6 +810,7 @@ class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
             debug_vis=True,
         )
         self.sim.render_interval = self.decimation
+        self._apply_dr_flags()
 
 
 @configclass
@@ -646,9 +822,5 @@ class RacingQuadcopterEnvCfg_FIXED_PLAY(RacingQuadcopterEnvCfg_FIXED):
         self.scene.num_envs = 1024
         self.eval_mode = True
         self.fixed_spawn = True
-        self.observations.policy.enable_corruption = False
-        self.action_noise.enable = False
-        self.events.randomize_robot_mass = None
-        self.events.randomize_robot_actuator_gains = None
         self.stats_warmup_s = 30.0
         print("[INFO] Fixed-track evaluation mode is ON.")

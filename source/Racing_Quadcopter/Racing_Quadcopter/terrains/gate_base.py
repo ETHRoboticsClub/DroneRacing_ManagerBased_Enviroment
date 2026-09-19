@@ -95,7 +95,7 @@ def gate_specs_to_gate_data(
     for spec in specs:
         pos = np.array(spec.position, dtype=float)
         rot = tf.Rotation.from_euler(
-            "xyz", [spec.roll_deg, spec.pitch_deg, -spec.yaw_deg], degrees=True
+            "xyz", [spec.rotation[0], spec.rotation[1], -spec.rotation[2]], degrees=True
         )
         q = rot.as_quat()  # xyzw
         positions_list.append(pos)

@@ -1,0 +1,17 @@
+# Example hovering / waypoint-following track.
+#
+# Loaded only when the WAYPOINTS environment variable points at this file
+# (or another YAML in this directory). Coordinates are in metres, expressed
+# in the cell's local frame — the env converts them to world frame using the
+# terrain-cell origin. When this YAML is loaded, the same track is shared
+# across every cell of the 8x8 terrain grid.
+#
+# collection_time_s is optional; if omitted, the cfg default applies to all
+# cells using this track.
+
+collection_time_s: 0.0
+waypoint_track:
+  - position: [7.5, 6.0, 2.0]
+  - position: [9.5, 7.5, 2.5]
+  - position: [7.5, 9.0, 2.0]
+  - position: [5.5, 7.5, 2.5]

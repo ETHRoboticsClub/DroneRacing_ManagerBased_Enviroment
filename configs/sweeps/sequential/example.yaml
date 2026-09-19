@@ -38,12 +38,15 @@ param_grid:
     - 30.0
     - 30.0
 
-  randomize_velocity_limit:
+  speed_limits.enabled:
     - true
     - true
-  velocity_limit_range:
-    - "(8.0, 15.0)"
-    - "(7.0, 16.0)"
+  speed_limits.linear_range:
+    - "(2.0, 15.0)"
+    - "(2.0, 16.0)"
+  speed_limits.angular_range:
+    - "(1.0, 8.0)"
+    - "(1.0, 8.0)"
 
   action_noise.enable:
     - true

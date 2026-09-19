@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+import time
 
 import numpy as np
 import torch
@@ -19,6 +20,16 @@ from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.sensors import ContactSensor
 
 from Racing_Quadcopter.terrains import get_gate_registry
+from Racing_Quadcopter.tasks.manager_based.action_diagnostics import ActionDiagnostics
+from Racing_Quadcopter.tasks.manager_based.route_progress import (
+    begin_racing_routes,
+    initialize_route_progress,
+)
+from Racing_Quadcopter.tasks.manager_based.shared_features import (
+    initialize_action_noise,
+    initialize_speed_limits,
+    validate_shared_feature_events,
+)
 from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.gate_utils import update_racing_state
@@ -61,20 +72,26 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
     def _prepare_racing_task(self) -> None:
         """Allocate all racing-specific GPU buffers before managers are built."""
+        validate_shared_feature_events(self.cfg)
         self._robot = self.scene["robot"]
         self._contact_sensor = self.scene.sensors["contact_sensor"]
         self._setup_gate_tracking()
+        initialize_route_progress(self, self._gate_positions.shape[1] + 1)
 
-        # Per-env speed cap; re-sampled each episode if cfg.randomize_velocity_limit.
-        self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
+        initialize_speed_limits(self)
 
         init_stats(self)
+        self._action_config_log_interval_s = 120.0
+        self._last_action_config_log_wall_time = 0.0
 
         # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
-        # Action-noise per-env bias (sampled at reset if enabled)
-        self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
+        # Raw policy output (before action manager processing) and one-step lag.
+        self._policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._action_diagnostics = ActionDiagnostics(self)
+        initialize_action_noise(self, action_dim=4)
 
         # Per-drone motor speeds [N, 4] (one element per impeller); updated elsewhere as needed.
         self._motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
@@ -97,6 +114,8 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         # until the curriculum threshold is met.
         self._crashed_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._collision_termination_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Set by check_gate_passages: drone crossed the current gate from the wrong direction.
+        self._wrong_crossing_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Gate-frame basis vectors on device; reused in every quat_apply call.
         # Gate convention: +Y = forward (passage), +X = right, +Z = up.
@@ -108,6 +127,31 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             device=self.device,
             dtype=torch.long,
         ).unsqueeze(0).expand(self.num_envs, -1)
+
+        # ``camera_keypoint`` link (URDF) — preferred frame for perception reward; else base (body/base_link/``base``).
+        try:
+            _cam_ids, _ = self._robot.find_bodies("camera_keypoint")
+        except ValueError:
+            try:
+                _cam_ids, _ = self._robot.find_bodies("body|base_link|^base$")
+            except ValueError as err:
+                raise RuntimeError(
+                    "Perception reward needs a `camera_keypoint` body or a single base link matching "
+                    "`body`, `base_link`, or `base`. "
+                    f"Available bodies: {self._robot.body_names}"
+                ) from err
+        if isinstance(_cam_ids, torch.Tensor):
+            _n = int(_cam_ids.numel())
+        else:
+            _n = len(_cam_ids)
+        if _n != 1:
+            raise RuntimeError(
+                "Perception reward requires exactly one `camera_keypoint` body, or exactly one base link "
+                f"(body/base_link/base). Matched {_n} bodies. Check the robot URDF/USD."
+            )
+        self._camera_keypoint_body_idx: int = (
+            int(_cam_ids[0].item()) if isinstance(_cam_ids, torch.Tensor) else int(_cam_ids[0])
+        )
 
         # All body IDs monitored for contact; ".*" captures every link.
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*")
@@ -123,6 +167,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._episode_lap_time_sum = torch.zeros(self.num_envs, device=self.device)
         self._episode_lap_count = torch.zeros(self.num_envs, device=self.device)
         self._last_lap_step = torch.zeros(self.num_envs, device=self.device)
+
+        # Top-speed metric. _run_max_speed is each env's peak speed since spawn; it is
+        # folded into the global running max _top_speed ONLY when that env completes a
+        # lap (so speeds from runs that crash/time-out are never counted). Reset per env
+        # at episode end; _top_speed persists for the whole run.
+        self._run_max_speed = torch.zeros(self.num_envs, device=self.device)
+        self._top_speed = torch.zeros((), device=self.device)
 
         # Per-passage quality stats accumulated each gate crossing.
         self._passage_velocity_sum = torch.zeros(self.num_envs, device=self.device)
@@ -289,6 +340,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 intensity=self.cfg.demo_drone_glow_intensity,
             )
 
+        self._log_action_configuration(reason="startup")
+        self._last_action_config_log_wall_time = time.time()
+
     def _load_cell_gate_data(
         self,
         terrain_origins: torch.Tensor,
@@ -368,8 +422,12 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         return per_cell_pos, per_cell_ori, per_cell_sizes, gate_datas, env_cell_idx, env_origins
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        # Keep a copy of raw network actions before the action manager transforms/clips them.
+        self._prev_policy_raw_actions[:] = self._policy_raw_actions
+        self._policy_raw_actions[:] = action.to(self.device)
+
         # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
-        self.action_manager.process_action(action.to(self.device))
+        self.action_manager.process_action(self._policy_raw_actions)
 
         self.recorder_manager.record_pre_step()
 
@@ -450,6 +508,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        self._action_diagnostics.update_if_due()
+        self._maybe_log_action_configuration()
+
         # Second obs pass: the "real" obs returned to the policy, with history update.
         # Runs after resets so freshly-spawned envs contribute correct observations.
         self.obs_buf = self.observation_manager.compute(update_history=True)
@@ -468,6 +529,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         gate_log = collect_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
+        begin_racing_routes(self, env_ids_tensor)
 
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
@@ -482,20 +544,24 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             except Exception as e:
                 print("DEBUG_TERRAIN: reset debug error", e)
 
-        # Sample per-episode biases for action noise (if enabled).
-        # These buffers were pre-allocated in _prepare_racing_task.
-        n = env_ids_tensor.shape[0]
-
-        action_noise_cfg = getattr(self.cfg, "action_noise", None)
-        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_bias", False):
-            a, b = action_noise_cfg.bias_range
-            self._action_noise_bias[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
-        else:
-            self._action_noise_bias[env_ids_tensor] = 0.0
-
         if gate_log:
             self.extras["log"].update(gate_log)
             self._on_episode_metrics_collected(gate_log)
+
+        # SKRL only logs scalar tensors from extras["log"]; managers emit floats.
+        if self.extras.get("log"):
+            log_tensors: dict[str, torch.Tensor] = {}
+            for key, value in self.extras["log"].items():
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    log_tensors[key] = value.detach().reshape(()).to(device=self.device, dtype=torch.float32)
+                elif isinstance(value, (float, int, bool)):
+                    log_tensors[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            self.extras["log"] = log_tensors
+
+        # Keep raw-action lag buffer aligned with reset state to avoid artificial first-step spikes.
+        self._policy_raw_actions[env_ids_tensor].zero_()
+        self._prev_policy_raw_actions[env_ids_tensor].zero_()
+        self._action_diagnostics.reset(env_ids_tensor)
 
     def _on_episode_metrics_collected(self, gate_log: dict) -> None:
         """Hook called after each reset once `gate_log` has been merged into ``extras["log"]``.
@@ -505,3 +571,158 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         without relying on the agent runner having a configured ``log_dir``.
         """
         return
+
+    @staticmethod
+    def _format_config_value(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        if isinstance(value, (tuple, list)):
+            return "(" + ", ".join(RacingQuadcopterRLEnv._format_config_value(v) for v in value) + ")"
+        return str(value)
+
+    def _log_action_configuration(self, reason: str) -> None:
+        """Print and log the current action-noise / corruption / randomization config."""
+        action_noise_cfg = getattr(self.cfg, "action_noise", None)
+        observations_cfg = getattr(self.cfg, "observations", None)
+        policy_obs_cfg = getattr(observations_cfg, "policy", None)
+        actions_cfg = getattr(self.cfg, "actions", None)
+        rates_cfg = getattr(actions_cfg, "rates", None)
+        if hasattr(self, "action_manager"):
+            try:
+                rates_cfg = self.action_manager.get_term("rates").cfg
+            except Exception:
+                pass
+        moments_cfg = getattr(actions_cfg, "moments", None)
+        action_cfg = rates_cfg if rates_cfg is not None else moments_cfg
+        action_type = "rates" if rates_cfg is not None else ("moments" if moments_cfg is not None else "none")
+
+        policy_term_cfgs = {}
+        if hasattr(self, "observation_manager"):
+            term_names = self.observation_manager._group_obs_term_names.get("policy", [])
+            term_cfgs = self.observation_manager._group_obs_term_cfgs.get("policy", [])
+            policy_term_cfgs = {name: cfg for name, cfg in zip(term_names, term_cfgs)}
+
+        def _obs_noise_attr(term_name: str, attr: str, default: object = "n/a") -> object:
+            term_cfg = policy_term_cfgs.get(term_name, None)
+            if term_cfg is None:
+                return default
+            noise_cfg = getattr(term_cfg, "noise", None)
+            if noise_cfg is None:
+                return default
+            obj = noise_cfg
+            for name in attr.split("."):
+                obj = getattr(obj, name, None)
+                if obj is None:
+                    return default
+            return obj
+
+        fields: dict[str, object] = {
+            "domain_randomization": getattr(self.cfg, "domain_randomization", "n/a"),
+            "observation_noise_enable": getattr(self.cfg, "observation_noise_enable", "n/a"),
+            "observations.policy.enable_corruption": getattr(policy_obs_cfg, "enable_corruption", "n/a"),
+            "obs_cfg.policy.base_lin_vel.noise.enable": _obs_noise_attr("base_lin_vel", "enable"),
+            "obs_cfg.policy.base_lin_vel.noise.std": _obs_noise_attr("base_lin_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_lin_vel.bias.std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.noise.enable": _obs_noise_attr("base_ang_vel", "enable"),
+            "obs_cfg.policy.base_ang_vel.noise.std": _obs_noise_attr("base_ang_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.bias.std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.noise.enable": _obs_noise_attr("projected_gravity", "enable"),
+            "obs_cfg.policy.projected_gravity.noise.std": _obs_noise_attr("projected_gravity", "noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.bias.std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std"),
+            "action_noise.enable": getattr(action_noise_cfg, "enable", "n/a"),
+            "action_noise.per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", "n/a"),
+            "action_noise.gaussian_std": getattr(action_noise_cfg, "gaussian_std", "n/a"),
+            "action_noise.bias_range": getattr(action_noise_cfg, "bias_range", "n/a"),
+            "action_noise.lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", "n/a"),
+            "action_noise.per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", "n/a"),
+            "action_noise.lpf_alpha_range": getattr(action_noise_cfg, "lpf_alpha_range", "n/a"),
+            "action_noise.clip_actions": getattr(action_noise_cfg, "clip_actions", "n/a"),
+            "action_type": action_type,
+        }
+        if action_cfg is not None:
+            fields["action_cfg.max_delay"] = getattr(action_cfg, "max_delay", "n/a")
+
+        if rates_cfg is not None:
+            fields.update(
+                {
+                    "action_cfg.pid_gain_randomization_frac": getattr(rates_cfg, "pid_gain_randomization_frac", "n/a"),
+                    "action_cfg.thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", "n/a"),
+                    "action_cfg.aero_randomization_frac": getattr(rates_cfg, "aero_randomization_frac", "n/a"),
+                }
+            )
+
+        summary = " ".join(f"{key}={self._format_config_value(value)}" for key, value in fields.items())
+        print(f"[ACTION_CFG][{reason}] {summary}")
+
+        log_dict = self.extras.setdefault("log", {})
+        scalar_fields = {
+            "Config/domain_randomization": getattr(self.cfg, "domain_randomization", None),
+            "Config/observation_noise_enable": getattr(self.cfg, "observation_noise_enable", None),
+            "Config/observations_policy_enable_corruption": getattr(policy_obs_cfg, "enable_corruption", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_enable": _obs_noise_attr("base_lin_vel", "enable", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_std": _obs_noise_attr("base_lin_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_lin_vel_bias_std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_enable": _obs_noise_attr("base_ang_vel", "enable", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_std": _obs_noise_attr("base_ang_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_bias_std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_enable": _obs_noise_attr("projected_gravity", "enable", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_std": _obs_noise_attr("projected_gravity", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_bias_std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std", None),
+            "Config/action_noise_enable": getattr(action_noise_cfg, "enable", None),
+            "Config/action_noise_per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", None),
+            "Config/action_noise_gaussian_std": getattr(action_noise_cfg, "gaussian_std", None),
+            "Config/action_noise_lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", None),
+            "Config/action_noise_per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", None),
+            "Config/action_noise_clip_actions": getattr(action_noise_cfg, "clip_actions", None),
+            "Config/action_cfg_max_delay": getattr(action_cfg, "max_delay", None) if action_cfg is not None else None,
+            "Config/action_type_is_rates": 1.0 if rates_cfg is not None else 0.0,
+            "Config/action_type_is_moments": 1.0 if moments_cfg is not None else 0.0,
+        }
+        if rates_cfg is not None:
+            scalar_fields.update(
+                {
+                    "Config/action_cfg_pid_gain_randomization_frac": getattr(
+                        rates_cfg, "pid_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", None),
+                }
+            )
+
+        for key, value in scalar_fields.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            elif isinstance(value, (int, float)):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+
+    def _maybe_log_action_configuration(self) -> None:
+        now = time.time()
+        if now - self._last_action_config_log_wall_time < self._action_config_log_interval_s:
+            return
+        self._last_action_config_log_wall_time = now
+        self._log_action_configuration(reason="heartbeat")

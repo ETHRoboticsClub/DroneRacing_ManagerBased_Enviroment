@@ -16,8 +16,8 @@ Gate coordinate conventions (shared with racing_gates.py)
   +Y  forward (passage direction — drone should fly through in +Y)
   +Z  up
 
-``GateSpec.yaw_deg`` follows a **clockwise-from-+Y** convention when viewed from
-above: 0° → drone passes in the +Y direction; 90° → passes in +X.
+``GateSpec.rotation[2]`` (yaw) follows a **clockwise-from-+Y** convention when
+viewed from above: 0° → drone passes in the +Y direction; 90° → passes in +X.
 All quaternions are (w, x, y, z) to match IsaacLab convention.
 """
 
@@ -55,9 +55,12 @@ def fixed_gates_terrain(
 
     gd = gate_specs_to_gate_data(cfg.gates, cfg.gate_size, cfg.bar_thickness)
 
+    # Competition tracks override the frame geometry (see competition_env_cfg).
+    frame_fn = cfg.gate_frame_fn if cfg.gate_frame_fn is not None else create_gate_frame
+
     meshes_list: list[trimesh.Trimesh] = [make_plane(cfg.size, height=0.0, center_zero=False)]
     for pos, quat_wxyz in zip(gd.positions, gd.orientations):
-        meshes_list.extend(create_gate_frame(pos, quat_wxyz, cfg.gate_size, cfg.bar_thickness, cfg.gate_color))
+        meshes_list.extend(frame_fn(pos, quat_wxyz, cfg.gate_size, cfg.bar_thickness, cfg.gate_color))
 
     gate_registry[(round(difficulty, 6), cfg.seed)] = gd
 

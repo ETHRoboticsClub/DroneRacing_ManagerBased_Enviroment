@@ -168,6 +168,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    rates_action_cfg = getattr(getattr(env_cfg, "actions", None), "rates", None)
+    moments_action_cfg = getattr(getattr(env_cfg, "actions", None), "moments", None)
+    action_cfg_name = (
+        type(rates_action_cfg).__name__
+        if rates_action_cfg is not None
+        else (type(moments_action_cfg).__name__ if moments_action_cfg is not None else "None")
+    )
+    print(
+        "[PERF_CHECK] "
+        f"task={args_cli.task} "
+        f"num_envs={env_cfg.scene.num_envs} "
+        f"action_cfg={action_cfg_name} "
+        f"decimation={getattr(env_cfg, 'decimation', 'n/a')} "
+        f"render_interval={getattr(getattr(env_cfg, 'sim', None), 'render_interval', 'n/a')} "
+        f"domain_randomization={getattr(env_cfg, 'domain_randomization', 'n/a')} "
+        f"action_noise_enable={getattr(getattr(env_cfg, 'action_noise', None), 'enable', 'n/a')} "
+        f"DEBUG_REWARDS={os.getenv('DEBUG_REWARDS', '0')} "
+        f"DEBUG_TERRAIN={os.getenv('DEBUG_TERRAIN', '0')}"
+    )
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 

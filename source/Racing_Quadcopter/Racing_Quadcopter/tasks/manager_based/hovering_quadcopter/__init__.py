@@ -1,0 +1,47 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Hovering / waypoint-following manager-based task."""
+
+import gymnasium as gym
+
+from . import agents
+
+gym.register(
+    id="Isaac-Hovering-Quadcopter-Manager-v0",
+    entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:HoveringQuadcopterEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Isaac-Hovering-Quadcopter-Manager-Play-v0",
+    entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:HoveringQuadcopterEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
+for _id, _cfg in (
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-v0", "HoveringQuadcopterEnvCfg"),
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-Play-v0", "HoveringQuadcopterEnvCfg_PLAY"),
+):
+    gym.register(
+        id=_id,
+        entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:{_cfg}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterRecurrentPPORunnerCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        },
+    )

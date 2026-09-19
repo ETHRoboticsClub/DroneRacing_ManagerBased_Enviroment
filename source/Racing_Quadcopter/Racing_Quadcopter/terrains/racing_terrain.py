@@ -73,14 +73,13 @@ def create_racing_gates_terrain(seed: int = 42) -> TerrainGeneratorCfg:
                 seed=seed,              # Overwritten to seed=42 by TerrainGenerator anyway
                 trajectory_type="random",  # randomly picks spline or chicane per cell
                 num_waypoints=200,      # finer resolution for tighter curves
-                # Spacing 1.0–7 m → avg 4.0 m → ~10–16 gates per circuit.
-                gate_spacing_range=(1.0, 7.0),
-                # Size 0.45–0.8 m: difficulty=0.7 → ~0.69 m (large), 1.0 → 0.45 m (tight).
-                gate_size_range=(0.45, 0.8),
+                # Spacing 3.0–7 m → avg 5.0 m → ~10–16 gates per circuit.
+                gate_spacing_range=(7.5, 15.0),
+                gate_size_range=(0.7, 1.5),
                 # 0.7–4.5 m: meaningful height variation with dramatic climbs at high difficulty.
                 gate_height_range=(0.7, 4.5),
                 bar_thickness=0.05,
-                gate_color=(1.0, 0.3, 0.0),  # Orange, high-contrast against sky/ground
+                gate_color=(1.0, 0.3, 0.0),  # Orange, high-contrast against sky/ground (DOESN'T WORK)
             ),
         },
     )
@@ -108,10 +107,10 @@ def create_fixed_track_terrain(
 
         terrain = create_fixed_track_terrain(
             gates=[
-                GateSpec(position=(7.5, 4.0, 1.5), yaw_deg=0),
-                GateSpec(position=(11.0, 7.5, 2.0), yaw_deg=90),
-                GateSpec(position=(7.5, 11.0, 1.5), yaw_deg=180),
-                GateSpec(position=(4.0, 7.5, 2.0), yaw_deg=270),
+                GateSpec(position=[7.5, 4.0, 1.5], rotation=[0.0, 0.0, 0.0]),
+                GateSpec(position=[11.0, 7.5, 2.0], rotation=[0.0, 0.0, 90.0]),
+                GateSpec(position=[7.5, 11.0, 1.5], rotation=[0.0, 0.0, 180.0]),
+                GateSpec(position=[4.0, 7.5, 2.0], rotation=[0.0, 0.0, 270.0]),
             ],
             gate_size=0.8,
         )
