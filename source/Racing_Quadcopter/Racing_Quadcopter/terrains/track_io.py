@@ -73,10 +73,8 @@ def load_gates_from_yaml(path: str | Path) -> list[GateSpec]:
         roll, pitch, yaw = _parse_rotation(entry.get("rotation"))
         gates.append(
             GateSpec(
-                position=(float(pos[0]), float(pos[1]), float(pos[2])),
-                roll_deg=roll,
-                pitch_deg=pitch,
-                yaw_deg=yaw,
+                position=[float(pos[0]), float(pos[1]), float(pos[2])],
+                rotation=[roll, pitch, yaw],
             )
         )
     return gates

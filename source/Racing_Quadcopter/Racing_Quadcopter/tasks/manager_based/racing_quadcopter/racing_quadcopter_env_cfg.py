@@ -759,22 +759,22 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
 # and configs/tracks/simple.yaml for the YAML equivalents.
 # ---------------------------------------------------------------------------
 # FIXED_GATES (full circuit, see configs/tracks/default.yaml):
-#   GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
-#   GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
-#   GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
-#   GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
-#   GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # SPLIT-S entry
-#   GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # SPLIT-S exit
-#   GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
-#   GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
-#   GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
-#   GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
+#   GateSpec(position=[7.5,  2.0, 1.2], rotation=[0.0, 0.0, 0.0]),
+#   GateSpec(position=[12.5, 4.5, 2.5], rotation=[0.0, 0.0, 65.0]),
+#   GateSpec(position=[13.5, 9.0, 4.5], rotation=[0.0, 0.0, 105.0]),
+#   GateSpec(position=[10.5, 13.0, 4.5], rotation=[0.0, 0.0, 160.0]),
+#   GateSpec(position=[7.5, 13.5, 4.2], rotation=[0.0, 0.0, 180.0]),  # SPLIT-S entry
+#   GateSpec(position=[7.5, 12.0, 1.5], rotation=[0.0, 0.0, 0.0]),    # SPLIT-S exit
+#   GateSpec(position=[4.0, 10.5, 2.0], rotation=[0.0, 0.0, 270.0]),
+#   GateSpec(position=[1.8,  7.5, 1.5], rotation=[0.0, 0.0, 230.0]),
+#   GateSpec(position=[3.5,  3.5, 1.8], rotation=[0.0, 0.0, 350.0]),
+#   GateSpec(position=[5.5,  2.0, 2.5], rotation=[0.0, 0.0, 25.0]),
 #
 # FIXED_GATES_simple (4-gate diamond, see configs/tracks/simple.yaml):
-#   GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
-#   GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
-#   GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
-#   GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
+#   GateSpec(position=[7.5, 5.0, 4.5], rotation=[0.0, 0.0, 45.0]),
+#   GateSpec(position=[7.5, 7.5, 4.5], rotation=[0.0, 0.0, 315.0]),
+#   GateSpec(position=[5.0, 7.5, 4.5], rotation=[0.0, 0.0, 225.0]),
+#   GateSpec(position=[5.0, 5.0, 4.5], rotation=[0.0, 0.0, 135.0]),
 
 
 @configclass

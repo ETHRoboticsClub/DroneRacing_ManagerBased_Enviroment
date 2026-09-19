@@ -102,10 +102,10 @@ def create_fixed_track_terrain(
 
         terrain = create_fixed_track_terrain(
             gates=[
-                GateSpec(position=(7.5, 4.0, 1.5), yaw_deg=0),
-                GateSpec(position=(11.0, 7.5, 2.0), yaw_deg=90),
-                GateSpec(position=(7.5, 11.0, 1.5), yaw_deg=180),
-                GateSpec(position=(4.0, 7.5, 2.0), yaw_deg=270),
+                GateSpec(position=[7.5, 4.0, 1.5], rotation=[0.0, 0.0, 0.0]),
+                GateSpec(position=[11.0, 7.5, 2.0], rotation=[0.0, 0.0, 90.0]),
+                GateSpec(position=[7.5, 11.0, 1.5], rotation=[0.0, 0.0, 180.0]),
+                GateSpec(position=[4.0, 7.5, 2.0], rotation=[0.0, 0.0, 270.0]),
             ],
             gate_size=0.8,
         )

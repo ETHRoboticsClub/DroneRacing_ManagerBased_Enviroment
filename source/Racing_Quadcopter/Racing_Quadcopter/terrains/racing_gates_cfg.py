@@ -5,7 +5,7 @@
 
 """Configuration for racing-gate mesh sub-terrains (extension-local; not in stock Isaac Lab)."""
 
-from dataclasses import MISSING, dataclass
+from dataclasses import MISSING, dataclass, field
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.utils import configclass
@@ -21,17 +21,16 @@ class GateSpec:
     the bottom-left corner of the tile; a 15×15 m tile runs to (size_x, size_y).
 
     Orientation uses extrinsic ``[roll, pitch, yaw]`` Euler angles (RPY, degrees) —
-    the conventional ROS/URDF order. ``yaw_deg`` follows a **clockwise-from-+Y**
-    convention when viewed from above:
+    the conventional ROS/URDF order. ``rotation[2]`` (yaw) follows a
+    **clockwise-from-+Y** convention when viewed from above:
       0°  → drone passes through in the +Y direction (tile's forward axis)
       90° → drone passes through in the +X direction (tile's right axis)
-    Roll is rotation about the passage axis; pitch tilts the gate up/down.
+    ``rotation[0]`` (roll) rotates about the passage axis; ``rotation[1]`` (pitch)
+    tilts the gate up/down.
     """
 
-    position: tuple[float, float, float]
-    roll_deg: float = 0.0
-    pitch_deg: float = 0.0
-    yaw_deg: float = 0.0
+    position: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.5])
+    rotation: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # [roll, pitch, yaw] in degrees
 
 
 @configclass
