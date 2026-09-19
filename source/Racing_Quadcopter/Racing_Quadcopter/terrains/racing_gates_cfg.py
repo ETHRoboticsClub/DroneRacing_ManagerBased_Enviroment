@@ -95,3 +95,7 @@ class MeshFixedGatesTerrainCfg(SubTerrainBaseCfg):
     gate_size: float = 0.8
     bar_thickness: float = 0.05
     gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)
+    # Optional custom mesh builder with the same signature as
+    # ``gate_base.create_gate_frame(position, orientation, gate_size, bar_thickness, color)``.
+    # None -> default square frame centred on the aperture edges.
+    gate_frame_fn: object | None = None

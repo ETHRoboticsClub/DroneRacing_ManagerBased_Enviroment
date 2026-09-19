@@ -56,6 +56,8 @@ def fixed_gates_terrain(
 
     meshes_list: list[trimesh.Trimesh] = [make_plane(cfg.size, height=0.0, center_zero=False)]
 
+    frame_fn = cfg.gate_frame_fn if cfg.gate_frame_fn is not None else create_gate_frame
+
     positions_list = []
     orientations_list = []
 
@@ -75,7 +77,7 @@ def fixed_gates_terrain(
         positions_list.append(pos)
         orientations_list.append(quat_wxyz)
         meshes_list.extend(
-            create_gate_frame(pos, quat_wxyz, cfg.gate_size, cfg.bar_thickness, cfg.gate_color)
+            frame_fn(pos, quat_wxyz, cfg.gate_size, cfg.bar_thickness, cfg.gate_color)
         )
 
     positions_arr = np.array(positions_list)

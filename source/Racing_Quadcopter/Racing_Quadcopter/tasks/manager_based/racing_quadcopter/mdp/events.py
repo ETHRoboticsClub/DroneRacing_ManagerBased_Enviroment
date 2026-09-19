@@ -13,7 +13,86 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.events import *
 from isaaclab.utils.math import quat_apply
 
+from Racing_Quadcopter.tasks.manager_based.route_progress import snapshot_episode_route_progress
+
 from .stats import accumulate_episode_stats
+
+
+def _sample_uniform(
+    shape: tuple[int, ...],
+    low: float,
+    high: float,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(shape, device=device, dtype=torch.float32).uniform_(low, high)
+
+
+def randomize_rigid_body_inertia(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg,
+    inertia_distribution_params: tuple[float, float] = (0.8, 1.2),
+    operation: str = "scale",
+    distribution: str = "uniform",
+) -> None:
+    """Randomize rigid-body inertias if the Isaac/PhysX runtime exposes inertia tensors.
+
+    Isaac Lab provides a stock mass randomizer, but not every installed version exposes a
+    matching inertia event. This helper mirrors the mass-randomization pattern while staying
+    defensive: if the current runtime lacks ``get_inertias``/``set_inertias``, the event
+    prints one warning and otherwise leaves the simulation unchanged.
+    """
+    if env_ids is None or isinstance(env_ids, slice):
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    else:
+        env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    if distribution != "uniform":
+        raise ValueError(f"Unsupported inertia distribution {distribution!r}; only 'uniform' is implemented.")
+    if operation != "scale":
+        raise ValueError(f"Unsupported inertia operation {operation!r}; only 'scale' is implemented.")
+
+    env_ids_cpu = env_ids.to(device="cpu")
+
+    asset = env.scene[asset_cfg.name]
+    physx_view = asset.root_physx_view
+    if not hasattr(physx_view, "get_inertias") or not hasattr(physx_view, "set_inertias"):
+        if not getattr(env, "_warned_missing_inertia_randomization", False):
+            print("[WARN] Inertia randomization requested, but this Isaac runtime has no PhysX inertia API.")
+            env._warned_missing_inertia_randomization = True
+        return
+
+    cache_name = f"_default_inertias_{asset_cfg.name}"
+    default_inertias = getattr(env, cache_name, None)
+    if default_inertias is None:
+        default_inertias = physx_view.get_inertias().clone()
+        setattr(env, cache_name, default_inertias)
+
+    inertias = default_inertias.clone()
+    selected = inertias[env_ids_cpu]
+    inertia_device = selected.device
+    body_ids = getattr(asset_cfg, "body_ids", slice(None))
+    if body_ids is None:
+        body_ids = slice(None)
+    if isinstance(body_ids, int):
+        body_ids = [body_ids]
+
+    body_selected = selected[:, body_ids]
+    low, high = inertia_distribution_params
+    multiplier_shape = body_selected.shape[:2] + (1,) * max(body_selected.ndim - 2, 0)
+    multipliers = _sample_uniform(multiplier_shape, float(low), float(high), inertia_device).to(
+        body_selected.dtype
+    )
+    selected[:, body_ids] = body_selected * multipliers
+
+    try:
+        physx_view.set_inertias(selected, indices=env_ids_cpu)
+    except (TypeError, RuntimeError):
+        inertias[env_ids_cpu] = selected
+        try:
+            physx_view.set_inertias(inertias, indices=env_ids_cpu)
+        except TypeError:
+            physx_view.set_inertias(inertias, env_ids_cpu)
 
 
 def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor: torch.Tensor) -> dict:
@@ -27,46 +106,71 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     if env_ids_tensor.numel() == 0:
         return gate_log
 
-    gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[env_ids_tensor].float().mean().item()
+    # This task-independent score is additional to all existing lap/gate
+    # statistics. Curriculum controllers consume it on the ensuing reset.
+    gate_log.update(snapshot_episode_route_progress(env, env_ids_tensor))
 
-    step_counts = env._episode_step_count[env_ids_tensor]
-    valid_steps = step_counts > 0
-    if valid_steps.any():
-        mean_vel = (
-            env._episode_velocity_sum[env_ids_tensor][valid_steps] / step_counts[valid_steps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_velocity"] = mean_vel
+    # Restrict all stats to drones that spawned at the offset origin (when configured). The
+    # curriculum snapshots and buffer zeroing further below still apply to ALL resetting envs.
+    if bool(getattr(env.cfg, "stats_origin_only", False)) and hasattr(env, "_spawned_at_origin"):
+        stats_ids = env_ids_tensor[env._spawned_at_origin[env_ids_tensor]]
     else:
-        gate_log["Episode_Metrics/mean_velocity"] = 0.0
+        stats_ids = env_ids_tensor
 
-    gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[env_ids_tensor].mean().item()
+    # Overall (run-wide) peak speed over any completed run; folded origin-only in gate_utils.
+    gate_log["Episode_Metrics/top_speed"] = env._top_speed.item()
 
-    lap_counts = env._episode_lap_count[env_ids_tensor]
-    has_laps = lap_counts > 0
-    if has_laps.any():
-        mean_lap_time = (
-            env._episode_lap_time_sum[env_ids_tensor][has_laps] / lap_counts[has_laps]
-        ).mean().item()
-        gate_log["Episode_Metrics/mean_lap_time_s"] = mean_lap_time
-        env._total_lap_time_sum += float(env._episode_lap_time_sum[env_ids_tensor][has_laps].sum().item())
-        env._total_lap_count += int(lap_counts[has_laps].sum().item())
+    if stats_ids.numel() > 0:
+        gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[stats_ids].float().mean().item()
 
-    # Per-env episode mean speed: zero for envs that had no steps.
-    step_counts_all = env._episode_step_count[env_ids_tensor]
-    episode_mean_speed = torch.where(
-        step_counts_all > 0,
-        env._episode_velocity_sum[env_ids_tensor] / step_counts_all.clamp(min=1),
-        torch.zeros_like(step_counts_all),
-    )
+        step_counts = env._episode_step_count[stats_ids]
+        valid_steps = step_counts > 0
+        if valid_steps.any():
+            gate_log["Episode_Metrics/mean_velocity"] = (
+                env._episode_velocity_sum[stats_ids][valid_steps] / step_counts[valid_steps]
+            ).mean().item()
+        else:
+            gate_log["Episode_Metrics/mean_velocity"] = 0.0
 
-    accumulate_episode_stats(
-        env,
-        env_ids_tensor,
-        env._gates_passed[env_ids_tensor],
-        lap_counts,
-        env._gate_counts[env_ids_tensor],
-        episode_mean_speed,
-    )
+        has_passages_stats = env._passage_count[stats_ids] > 0
+        if has_passages_stats.any():
+            gate_log["Episode_Metrics/mean_passage_center_offset"] = (
+                env._passage_centering_sum[stats_ids][has_passages_stats]
+                / env._passage_count[stats_ids][has_passages_stats]
+            ).mean().item()
+            gate_log["Episode_Metrics/mean_passage_velocity"] = (
+                env._passage_velocity_sum[stats_ids][has_passages_stats]
+                / env._passage_count[stats_ids][has_passages_stats]
+            ).mean().item()
+        else:
+            gate_log["Episode_Metrics/mean_passage_center_offset"] = 0.0
+            gate_log["Episode_Metrics/mean_passage_velocity"] = 0.0
+
+        gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[stats_ids].mean().item()
+
+        lap_counts = env._episode_lap_count[stats_ids]
+        has_laps = lap_counts > 0
+        if has_laps.any():
+            gate_log["Episode_Metrics/mean_lap_time_s"] = (
+                env._episode_lap_time_sum[stats_ids][has_laps] / lap_counts[has_laps]
+            ).mean().item()
+            env._total_lap_time_sum += float(env._episode_lap_time_sum[stats_ids][has_laps].sum().item())
+            env._total_lap_count += int(lap_counts[has_laps].sum().item())
+
+        step_counts_all = env._episode_step_count[stats_ids]
+        episode_mean_speed = torch.where(
+            step_counts_all > 0,
+            env._episode_velocity_sum[stats_ids] / step_counts_all.clamp(min=1),
+            torch.zeros_like(step_counts_all),
+        )
+        accumulate_episode_stats(
+            env,
+            stats_ids,
+            env._gates_passed[stats_ids],
+            lap_counts,
+            env._gate_counts[stats_ids],
+            episode_mean_speed,
+        )
 
     # Save passage-quality averages for the curriculum check in the NEXT episode.
     # _last_episode_* persist across resets; the live accumulators are zeroed below.
@@ -93,6 +197,7 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     env._episode_lap_time_sum[env_ids_tensor] = 0.0
     env._episode_lap_count[env_ids_tensor] = 0.0
     env._last_lap_step[env_ids_tensor] = 0.0
+    env._run_max_speed[env_ids_tensor] = 0.0  # discard peak speed of the (now-ended) run
 
     return gate_log
 
@@ -130,6 +235,7 @@ def _write_spawn_state(
     env._robot.write_root_pose_to_sim(root_poses, env_ids)
     env._robot.write_root_velocity_to_sim(root_vel, env_ids)
     env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+    env._route_episode_start_position[env_ids] = start_pos
 
     # Sync _prev_drone_pos to the new spawn position so the first step's gate-progress
     # reward computes a valid (zero) distance reduction rather than a garbage delta.
@@ -152,14 +258,39 @@ def _write_spawn_state(
 def _sample_spawn_gate(
     env: ManagerBasedRLEnv, env_ids: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample a uniformly random gate index per env and return (spawn_idx, gate_pos, gate_ori).
+    """Sample a gate index per env and return (spawn_idx, gate_pos, gate_ori).
 
-    Each env draws from [0, gate_count-1] independently so multi-difficulty grids
-    (which have different gate counts per row) are handled correctly.
+    The distribution over gates is controlled by ``cfg.spawn_gate_bias`` (a power-law
+    exponent on each gate's rank from the end of the track)::
+
+        weight(gate i) ∝ (gate_count - i) ** spawn_gate_bias
+
+    - ``bias = 0`` → uniform over [0, gate_count-1] (default; original behaviour).
+    - ``bias = 1`` → linear, favouring earlier gates; the first:last spawn ratio is
+      ``gate_count : 1`` (e.g. 6:1 on a 6-gate track → gate 0 ≈ 28.6 %, last ≈ 4.8 %).
+    - higher values steepen the bias toward the first gate.
+
+    Earlier gates are favoured because a drone spawned at gate i also flies the
+    downstream gates once competent, so late gates accrue pass-through coverage;
+    the non-zero tail still gives the final segments direct spawns early in training.
+
+    Each env draws independently so multi-difficulty grids (different gate counts
+    per row) are handled correctly.
     """
     n = len(env_ids)
     gate_counts = env._gate_counts[env_ids].float()  # [N]
-    spawn_idx = (torch.rand(n, device=env.device) * gate_counts).long()  # [N] in [0, count-1]
+    bias = float(getattr(env.cfg, "spawn_gate_bias", 0.0))
+
+    if bias == 0.0:
+        spawn_idx = (torch.rand(n, device=env.device) * gate_counts).long()  # [N] in [0, count-1]
+    else:
+        max_count = int(env._gate_counts[env_ids].max().item())
+        idx = torch.arange(max_count, device=env.device).unsqueeze(0)  # [1, max_count]
+        rank_from_end = gate_counts.unsqueeze(1) - idx                  # [N, max_count]; >0 for valid gates
+        weights = torch.where(
+            rank_from_end > 0, rank_from_end.pow(bias), torch.zeros_like(rank_from_end)
+        )
+        spawn_idx = torch.multinomial(weights, num_samples=1).squeeze(1)  # [N] in [0, count-1]
 
     idx_pos = spawn_idx.view(n, 1, 1).expand(n, 1, 3)
     gate_pos = env._gate_positions[env_ids].gather(1, idx_pos).squeeze(1)  # [N, 3]
@@ -341,9 +472,3 @@ def reset_racing_spawn(
         mask = torch.rand(n, device=env.device) < recovery_prob
         if mask.any():
             _apply_recovery_override(env, env_ids[mask])
-
-    if env.cfg.randomize_velocity_limit:
-        # Re-sample per-env speed cap from the configured range each episode.
-        # The new limit is also written into the observation so the policy can adapt.
-        lo, hi = env.cfg.velocity_limit_range
-        env._velocity_limit[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo

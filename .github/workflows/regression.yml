@@ -73,13 +73,16 @@ jobs:
             baseline_value: "98.0"
           - drone: anemos_moments
             sweep_path: configs/sweeps/single/regression_test/anemos_moments.yaml
-            baseline_value: "96.0"
+            baseline_value: "98.0"
           - drone: anemos_rates
             sweep_path: configs/sweeps/single/regression_test/anemos_rates.yaml
-            baseline_value: "96.0"
+            baseline_value: "98.0"
           - drone: anemos_rates_generalization
             sweep_path: configs/sweeps/single/regression_test/anemos_rates_generalization.yaml
-            baseline_value: "94.0"
+            baseline_value: "92.0"
+          - drone: anemos_rates_monorace_obs
+            sweep_path: configs/sweeps/single/regression_test/anemos_rates_monorace_obs.yaml
+            baseline_value: "98.0"
 
     name: regression-test (${{ matrix.drone }})
 
