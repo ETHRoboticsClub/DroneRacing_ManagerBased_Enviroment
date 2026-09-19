@@ -130,6 +130,12 @@ class RacingQuadcopterSkillEvalEnvCfg(RacingQuadcopterEnvCfg):
         self.force_collision_termination = True
         self.observations.policy.enable_corruption = False
         self.action_noise.enable = False
+
+        # IsaacLab nulls every term_cfg.noise when enable_corruption is False
+        # (ObservationManager), but the adaptive curricula bind "noise.enable" on
+        # those term cfgs. Disable them here: this is an evaluation env, and the
+        # staged curriculum already self-disables under eval_mode.
+        self.adaptive_curriculum_enabled = False
         self.events.randomize_robot_mass = None
         self.events.randomize_robot_actuator_gains = None
         self.stats_warmup_s = 30.0
