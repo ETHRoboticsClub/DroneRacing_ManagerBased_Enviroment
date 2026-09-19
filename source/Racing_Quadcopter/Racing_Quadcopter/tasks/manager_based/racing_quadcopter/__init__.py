@@ -53,6 +53,17 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Isaac-Racing-Quadcopter-Manager-SkillEval-v0",
+    entry_point=f"{__name__}.racing_quadcopter_multi_track_env:RacingQuadcopterSkillEvalRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.racing_quadcopter_multi_track_cfg:RacingQuadcopterSkillEvalEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
 for _id, _cfg in (
     ("Isaac-Racing-Quadcopter-Manager-RNN-v0", "RacingQuadcopterEnvCfg"),
     ("Isaac-Racing-Quadcopter-Manager-RNN-Play-v0", "RacingQuadcopterEnvCfg_PLAY"),

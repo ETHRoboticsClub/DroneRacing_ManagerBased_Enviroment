@@ -18,6 +18,68 @@ from Racing_Quadcopter.tasks.manager_based.route_progress import snapshot_episod
 from .stats import accumulate_episode_stats
 
 
+def _emit_episode_metrics(env: ManagerBasedRLEnv, ids: torch.Tensor, prefix: str, gate_log: dict) -> None:
+    """Write gates_passed / mean_velocity_kmh / lap_completion_pct / mean_lap_time_s to gate_log.
+
+    Logging contract: ``gates_passed`` and ``mean_velocity_kmh`` are always
+    emitted; ``lap_completion_pct`` is emitted whenever the subset has at least
+    one countable run (a finished lap or a terminated partial run);
+    ``mean_lap_time_s`` is emitted only when at least one env completed a full lap.
+
+    ``mean_velocity_kmh`` is the per-step world-frame speed averaged over each
+    env's episode (in m/s), then averaged across envs in the subset, then
+    converted to km/h (×3.6) to match the console "Speed" stat.
+
+    ``lap_completion_pct`` mirrors the console "Lap%" formula: each completed lap
+    contributes 1.0, each terminated (not timed-out) episode contributes a
+    partial-run value of ``(gates_passed % gate_count) / gate_count``, and the
+    metric is the mean over those run entries.
+    """
+    if ids.numel() == 0:
+        return
+
+    gate_log[f"{prefix}/gates_passed"] = env._gates_passed[ids].float().mean().item()
+
+    step_counts = env._episode_step_count[ids]
+    valid_steps = step_counts > 0
+    if valid_steps.any():
+        mean_vel_ms = (
+            env._episode_velocity_sum[ids][valid_steps] / step_counts[valid_steps]
+        ).mean().item()
+        gate_log[f"{prefix}/mean_velocity_kmh"] = mean_vel_ms * 3.6
+    else:
+        gate_log[f"{prefix}/mean_velocity_kmh"] = 0.0
+
+    lap_counts = env._episode_lap_count[ids].long()
+    gates_passed = env._gates_passed[ids].long()
+    gate_counts = env._gate_counts[ids].long()
+    reset_terminated = getattr(env, "reset_terminated", None)
+    if reset_terminated is not None:
+        terminated = reset_terminated[ids].bool()
+    else:
+        terminated = torch.zeros_like(lap_counts, dtype=torch.bool)
+
+    has_laps = lap_counts > 0
+    if has_laps.any():
+        mean_lap_time = (
+            env._episode_lap_time_sum[ids][has_laps] / lap_counts[has_laps]
+        ).mean().item()
+        gate_log[f"{prefix}/mean_lap_time_s"] = mean_lap_time
+
+    # Lap-completion percentage, matching the sliding-window console "Lap%".
+    partial_mask = terminated & (gate_counts > 0)
+    runs_count = int(lap_counts.sum().item()) + int(partial_mask.sum().item())
+    if runs_count > 0:
+        completed_value = float(lap_counts.sum().item())
+        if partial_mask.any():
+            gp_p = gates_passed[partial_mask].float()
+            gc_p = gate_counts[partial_mask].float()
+            partial_value = float(((gp_p % gc_p) / gc_p).sum().item())
+        else:
+            partial_value = 0.0
+        gate_log[f"{prefix}/lap_completion_pct"] = (completed_value + partial_value) / runs_count * 100.0
+
+
 def _sample_uniform(
     shape: tuple[int, ...],
     low: float,
@@ -101,6 +163,11 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
     Must be called BEFORE super()._reset_idx so the accumulators still hold the
     completed episode's data. After super()._reset_idx the EventManager will call
     reset_racing_spawn which zeros _current_gate_idx and _gates_passed.
+
+    When the env exposes ``_env_col_idx`` (skill-evaluation env), per-terrain
+    metrics are emitted under ``terrain_{i}/*`` in addition to the global
+    ``Episode_Metrics/*`` keys. Each terrain gets its own top-level
+    tensorboard panel; the global aggregate stays under ``Episode_Metrics/``.
     """
     gate_log: dict = {}
     if env_ids_tensor.numel() == 0:
@@ -171,6 +238,16 @@ def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor:
             env._gate_counts[stats_ids],
             episode_mean_speed,
         )
+
+    # Per-terrain breakdown when running on the skill-evaluation env. Deliberately
+    # keyed off all resetting envs rather than stats_ids: each terrain column is its
+    # own population, so origin-only filtering does not apply here.
+    env_col_idx = getattr(env, "_env_col_idx", None)
+    if env_col_idx is not None:
+        cols = env_col_idx[env_ids_tensor]
+        for col in cols.unique().tolist():
+            ids = env_ids_tensor[cols == col]
+            _emit_episode_metrics(env, ids, f"terrain_{int(col)}", gate_log)
 
     # Save passage-quality averages for the curriculum check in the NEXT episode.
     # _last_episode_* persist across resets; the live accumulators are zeroed below.
@@ -472,3 +549,54 @@ def reset_racing_spawn(
         mask = torch.rand(n, device=env.device) < recovery_prob
         if mask.any():
             _apply_recovery_override(env, env_ids[mask])
+
+
+def _apply_upside_down_override(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Re-write drone orientation to 180° around X (upside-down), keeping spawn position.
+
+    Called after a standard spawn has already set ``_prev_drone_pos``. Reads the
+    position from there, writes back with a flipped quaternion.  Gate indices and
+    the action/motor buffers are reset by ``_write_spawn_state`` as a side-effect.
+
+    wxyz (0, 1, 0, 0) encodes a 180° rotation around the world X axis, which
+    flips the drone so its +Z (body up) points toward -Z (world down).
+    """
+    n = len(env_ids)
+    pos = env._prev_drone_pos[env_ids].clone()
+    quat = torch.zeros(n, 4, device=env.device)
+    quat[:, 1] = 1.0  # wxyz (0, 1, 0, 0) = 180° around X = upside-down
+    _write_spawn_state(env, env_ids, pos, quat, torch.zeros(n, 6, device=env.device))
+
+
+def reset_skill_eval_spawn(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> None:
+    """Per-terrain spawn dispatcher for skill evaluation terrains.
+
+    Iterates over ``env.cfg.skill_terrains`` (one entry per terrain) and
+    applies each terrain's spawn logic to the subset of ``env_ids`` assigned to
+    that terrain (determined via ``env._env_col_idx``, stored by
+    :class:`RacingQuadcopterSkillEvalRLEnv`).
+
+    Currently supported per-terrain flags (extend :class:`SkillTerrainCfg` and
+    add branches here to expose new spawn behaviours):
+        spawn_upside_down : spawn behind gate 0, then flip orientation 180° around X.
+        spawn_recovery    : spawn behind gate 0, then apply random attitude + velocity
+                            (delegates to ``_apply_recovery_override``).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+
+    skill_terrains = env.cfg.skill_terrains
+    for col_idx, terrain_cfg in enumerate(skill_terrains):
+        mask = env._env_col_idx[env_ids] == col_idx
+        col_ids = env_ids[mask]
+        if len(col_ids) == 0:
+            continue
+
+        # Base spawn: deterministic grid behind gate 0 (same as eval/fixed_spawn mode).
+        _apply_fixed_initialization(env, col_ids)
+
+        # Per-terrain overrides applied on top of the base spawn.
+        if getattr(terrain_cfg, "spawn_upside_down", False):
+            _apply_upside_down_override(env, col_ids)
+        elif getattr(terrain_cfg, "spawn_recovery", False):
+            _apply_recovery_override(env, col_ids)

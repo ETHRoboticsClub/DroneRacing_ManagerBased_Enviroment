@@ -128,20 +128,27 @@ def refresh_crash_buffers_for_step(env: ManagerBasedRLEnv) -> None:
     Called from update_racing_state() after sensors are refreshed.
     """
     # Re-evaluate the curriculum gate using last-episode metrics (not current-episode,
-    # because those are mid-episode and would give noisy signals).
-    env._collision_detection_enabled = check_collision_curriculum_enabled(
-        env=env,
-        gates_passed_per_env=env._last_episode_gates_passed,
-        passage_velocity_per_env=env._last_episode_mean_velocity,
-        passage_centering_per_env=env._last_episode_center_offset,
-        # passage_count_per_env is passed as ones so the curriculum function receives
-        # the already-averaged _last_episode_mean_velocity / _last_episode_center_offset
-        # directly (no further averaging needed inside check_collision_curriculum_enabled).
-        passage_count_per_env=torch.ones_like(env._last_episode_gates_passed),
-        min_gates_passed=env.cfg.curriculum_min_gates_passed,
-        min_mean_velocity=env.cfg.curriculum_min_mean_velocity,
-        max_center_offset=env.cfg.curriculum_max_center_offset,
-    )
+    # because those are mid-episode and would give noisy signals). Skipped when
+    # force_collision_termination is set — eval setups (e.g. skill eval) need
+    # collisions to terminate from step 0 regardless of training-curriculum state.
+    if getattr(env.cfg, "force_collision_termination", False):
+        env._collision_detection_enabled = torch.ones(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+    else:
+        env._collision_detection_enabled = check_collision_curriculum_enabled(
+            env=env,
+            gates_passed_per_env=env._last_episode_gates_passed,
+            passage_velocity_per_env=env._last_episode_mean_velocity,
+            passage_centering_per_env=env._last_episode_center_offset,
+            # passage_count_per_env is passed as ones so the curriculum function receives
+            # the already-averaged _last_episode_mean_velocity / _last_episode_center_offset
+            # directly (no further averaging needed inside check_collision_curriculum_enabled).
+            passage_count_per_env=torch.ones_like(env._last_episode_gates_passed),
+            min_gates_passed=env.cfg.curriculum_min_gates_passed,
+            min_mean_velocity=env.cfg.curriculum_min_mean_velocity,
+            max_center_offset=env.cfg.curriculum_max_center_offset,
+        )
 
     # net_forces_w_history: [N, history_steps, num_bodies, 3] world-frame contact forces.
     net_contact_forces = env._contact_sensor.data.net_forces_w_history

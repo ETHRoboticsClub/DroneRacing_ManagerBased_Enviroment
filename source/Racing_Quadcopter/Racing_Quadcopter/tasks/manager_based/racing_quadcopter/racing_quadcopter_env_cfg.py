@@ -642,6 +642,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
 
     eval_mode: bool = False
     crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
+    force_collision_termination: bool = False  # skip the per-env competence curriculum and terminate on any collision
     fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
     recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
 

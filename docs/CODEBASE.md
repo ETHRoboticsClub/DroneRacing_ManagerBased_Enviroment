@@ -745,10 +745,11 @@ After warmup, printed every `speed_log_interval_s` seconds (default 10 s):
 
 `extras["log"]` dictionary is populated each reset with:
 - `Episode_Metrics/gates_passed` — mean gates passed over reset batch
-- `Episode_Metrics/mean_velocity` — mean drone speed over episode (m/s)
-- `Episode_Metrics/collision_count` — mean non-timeout terminations per episode
+- `Episode_Metrics/mean_velocity_kmh` — mean drone speed over episode (km/h)
+- `Episode_Metrics/lap_completion_pct` — mean lap completion %, averaged across completed laps and terminated partial runs (skipped if no run is countable)
 - `Episode_Metrics/mean_lap_time_s` — mean lap duration (only when laps completed)
 - `Curriculum/stage` — current stage (0, 1, 2, or 1000)
+- (skill-eval only) `terrain_{i}/...` — same metrics restricted to envs assigned to terrain `i` (each terrain becomes its own top-level tensorboard panel)
 
 SKRL routes these to TensorBoard automatically via `environment_info: log` in the trainer config.
 
