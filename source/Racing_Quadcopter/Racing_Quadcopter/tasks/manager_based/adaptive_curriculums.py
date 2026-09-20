@@ -216,6 +216,9 @@ class _RouteProgressController(ManagerTermBase):
         self._window = env._route_progress_curriculum_window
         self._window_start = self._window.snapshot()
         self._last_eval_step = int(env.common_step_counter)
+        # Curricula adapt difficulty during training; evaluation runs must see fixed
+        # conditions. Mirrors apply_staged_curriculum, which already returns early here.
+        self._eval_mode = bool(getattr(env.cfg, "eval_mode", False))
 
     def _measure(
         self,
@@ -280,7 +283,7 @@ class AdaptiveRewardScaleFromRouteProgress(_RouteProgressController):
             raise ValueError("increase_only_term_names cannot change after controller initialization.")
         if enabled_attr != self._enabled_attr:
             raise ValueError("enabled_attr cannot change after controller initialization.")
-        if enabled_attr is not None and not bool(getattr(env.cfg, enabled_attr)):
+        if self._eval_mode or (enabled_attr is not None and not bool(getattr(env.cfg, enabled_attr))):
             out = {"enabled": 0.0, "updated": 0.0}
             for name in self._reward_term_names:
                 out[f"reward_scale/{name}"] = self._term_scales[name]
@@ -350,7 +353,7 @@ class AdaptiveRandomizationFromRouteProgress(_RouteProgressController):
         self._enabled_attr = cfg.params.get("enabled_attr")
         self._noise_scale = float(cfg.params["initial_noise_scale"])
         self._bindings_applied = False
-        if self._enabled_attr is None or bool(getattr(env.cfg, self._enabled_attr)):
+        if not self._eval_mode and (self._enabled_attr is None or bool(getattr(env.cfg, self._enabled_attr))):
             self._initialize_bindings(env, self._target_specs)
             self._apply_scale_to_bindings(self._noise_scale)
             self._bindings_applied = True
@@ -499,7 +502,7 @@ class AdaptiveRandomizationFromRouteProgress(_RouteProgressController):
             raise ValueError("activate_speed_limits_on_increase cannot change after initialization.")
         if enabled_attr != self._enabled_attr:
             raise ValueError("enabled_attr cannot change after controller initialization.")
-        if enabled_attr is not None and not bool(getattr(env.cfg, enabled_attr)):
+        if self._eval_mode or (enabled_attr is not None and not bool(getattr(env.cfg, enabled_attr))):
             return {
                 "enabled": 0.0,
                 "updated": 0.0,
