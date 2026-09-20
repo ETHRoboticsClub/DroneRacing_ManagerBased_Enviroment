@@ -725,6 +725,10 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 50,
         render_interval=2,
+        # The default 2**21 aggregate-pair buffer is short by one pair per
+        # environment at 8192 envs, which makes PhysX drop broad-phase
+        # interactions. Keep a power-of-two margin for competition sweeps.
+        physx=sim_utils.PhysxCfg(gpu_total_aggregate_pairs_capacity=2**22),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
