@@ -45,6 +45,12 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
     target_pos = _gather_current_waypoint(env)
     dist = torch.norm(target_pos - drone_pos, dim=1)  # [N]
 
+    # Preserve reward distances before potentially advancing the waypoint.
+    # The reward manager runs after this function, while observations should
+    # already expose the next target after a successful collection.
+    env._reward_previous_dist_to_waypoint[:] = env._previous_dist_to_waypoint
+    env._reward_dist_to_waypoint[:] = dist
+
     r_capture = float(env.cfg.r_capture)
     r_hold = float(env.cfg.r_hold)
     step_dt = float(env.step_dt)
@@ -53,8 +59,28 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
     timer = env._collection_timer
     tc = env._collection_time
 
-    inside_capture = dist < r_capture
-    inside_hold = dist < r_hold
+    lin_speed = torch.linalg.vector_norm(env._robot.data.root_lin_vel_b, dim=1)
+    ang_speed = torch.linalg.vector_norm(env._robot.data.root_ang_vel_b, dim=1)
+    tilt_sin = torch.linalg.vector_norm(env._robot.data.projected_gravity_b[:, :2], dim=1)
+    linear_ok = lin_speed <= float(env.cfg.collection_max_linear_speed_m_s)
+    angular_ok = ang_speed <= float(env.cfg.collection_max_angular_speed_rad_s)
+    tilt_ok = tilt_sin <= float(env.cfg.collection_max_tilt_sin)
+    stable = linear_ok & angular_ok & tilt_ok
+    in_capture_radius = dist < r_capture
+    in_hold_radius = dist < r_hold
+    requires_dwell = tc > 1.0e-6
+
+    # Fly-through cells (T_c == 0) intentionally collect on spatial capture
+    # alone.  Requiring a near-stationary hover there made the early curriculum
+    # contradict its own zero-dwell training examples.
+    inside_capture = in_capture_radius & ((~requires_dwell) | stable)
+    inside_hold = in_hold_radius & ((~requires_dwell) | stable)
+
+    env._hold_capture_steps += in_capture_radius.float()
+    env._hold_linear_ok_capture_steps += (in_capture_radius & linear_ok).float()
+    env._hold_angular_ok_capture_steps += (in_capture_radius & angular_ok).float()
+    env._hold_tilt_ok_capture_steps += (in_capture_radius & tilt_ok).float()
+    env._hold_stable_capture_steps += (in_capture_radius & stable).float()
 
     # Transition: idle → holding (entered tight radius).
     enter = (~holding) & inside_capture
@@ -66,12 +92,14 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
     stay = holding & inside_hold
     if stay.any():
         timer[stay] = timer[stay] + step_dt
+        env._hold_dwell_time_s += stay.float() * step_dt
 
     # Dropped out of the lax radius → reset proximity state.
     drop = holding & (~inside_hold)
     if drop.any():
         holding[drop] = False
         timer[drop] = 0.0
+        env._hold_timer_reset_count += drop.float()
 
     # Collection condition. T_c == 0 collects the moment we entered capture
     # range, which is precisely when ``enter`` was set this step.
@@ -81,7 +109,7 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
 
     # Advance the target waypoint and reset proximity state for collected envs.
     if collected.any():
-        env._gates_passed[collected] = env._gates_passed[collected] + 1  # legacy alias
+        env._route_confirmed_segments[collected] += 1
         env._episode_collected_count[collected] = env._episode_collected_count[collected] + 1.0
         new_idx = env._current_wp_idx[collected] + 1
         counts = env._waypoint_counts[collected]
@@ -93,6 +121,16 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
         holding[collected] = False
         timer[collected] = 0.0
 
+    # Prepare the next step's progress reference.  Collected environments now
+    # point to a different waypoint, so their reference must be measured to
+    # that new target rather than to the one just collected.
+    env._previous_dist_to_waypoint[:] = dist
+    if collected.any():
+        next_target = _gather_current_waypoint(env)
+        env._previous_dist_to_waypoint[collected] = torch.linalg.vector_norm(
+            next_target[collected] - drone_pos[collected], dim=1
+        )
+
     env._holding = holding
     env._collection_timer = timer
-    env._curr_dist_to_waypoint = dist
+    env._curr_dist_to_waypoint = env._previous_dist_to_waypoint

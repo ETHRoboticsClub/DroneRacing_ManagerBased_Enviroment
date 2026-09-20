@@ -26,6 +26,10 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.rewards import *
 
 from isaaclab.utils.math import quat_apply
+from Racing_Quadcopter.tasks.manager_based.shared_features import (
+    penalty_angular_velocity_limit,
+    penalty_velocity_limit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +53,27 @@ def reward_gate_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
     return (prev_dist - dist_to_gate).clamp(-1.0, 1.0)
 
 
-def reward_gate_centering(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Exponential alignment reward: peaks when drone is centred on gate axis.
+def reward_gate_centering(env: ManagerBasedRLEnv, reference_speed: float = 15.0) -> torch.Tensor:
+    """Reward centred *forward motion* through the current gate.
 
-    Only active on the approach side (dist_to_plane <= 0) to avoid rewarding
-    alignment from behind the gate after it has been passed.
-    Formula: exp(-3 * lateral / size) * exp(-0.5 * |plane_dist|)
+    The alignment potential is exponential in lateral and plane distance, but
+    it is gated by positive velocity along the gate's passage direction.  This
+    makes the time integral approximately depend on distance travelled through
+    the well-centred region, rather than on dwell time: a stationary drone earns
+    zero and a slower drone cannot collect extra reward just by taking more
+    simulation steps near a gate.
+
+    ``reference_speed`` is the velocity at which the motion factor reaches one;
+    faster motion is clipped so this dense shaping term cannot grow unbounded.
     """
+    if reference_speed <= 0.0:
+        raise ValueError(f"reference_speed must be positive, got {reference_speed}.")
     gate_size = env._gate_sizes  # [N] per-env aperture in metres
     centering_value = torch.exp(-3.0 * env._curr_dist_to_gate_lateral / gate_size)   # falls off with lateral offset
     proximity_factor = torch.exp(-0.5 * env._curr_dist_to_gate_forward.abs())         # falls off with distance to plane
-    return centering_value * proximity_factor * env._on_approach_gate_side.float()
+    forward_speed = (env._robot.data.root_lin_vel_w * env._curr_gate_forward).sum(dim=1)
+    motion_factor = (forward_speed / reference_speed).clamp(min=0.0, max=1.0)
+    return centering_value * proximity_factor * motion_factor * env._on_approach_gate_side.float()
 
 
 def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -70,14 +84,6 @@ def reward_velocity_toward_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
     drone_vel = env._robot.data.root_lin_vel_w
     vel_toward_gate = (drone_vel * env._curr_dist_to_gate_vector_normalized).sum(dim=1).clamp(min=0.0)
     return vel_toward_gate * env._on_approach_gate_side.float()
-
-
-def penalty_velocity_limit(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Quadratic penalty for exceeding the per-env velocity cap (m/s)."""
-    drone_vel = env._robot.data.root_lin_vel_w
-    speed = torch.norm(drone_vel, dim=1)
-    speed_excess = (speed - env._velocity_limit).clamp(min=0.0)  # zero below limit
-    return speed_excess**2
 
 
 def penalty_orientation(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -101,14 +107,15 @@ def penalty_angular_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def penalty_action_smoothness(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Sum of squared action deltas between consecutive steps. Discourages jitter."""
+    """Sum of squared action deltas between consecutive steps. Discourages jitter.
+
+    The first step after reset is excluded to avoid comparing against a reset/placeholder
+    previous action value.
+    """
     action_diff = env._actions_buf - env._prev_actions  # [N, 4]
-    return action_diff.square().sum(dim=1)
-
-
-def penalty_action_magnitude(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Sum of squared action values. Mild regulariser to prevent saturating actuators."""
-    return env._actions_buf.square().sum(dim=1)
+    penalty = action_diff.square().sum(dim=1)
+    valid = (env.episode_length_buf > 1).to(penalty.dtype)
+    return penalty * valid
 
 
 def penalty_crash(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -204,4 +211,3 @@ def penalty_low_action(env: ManagerBasedRLEnv, low_floor_norm: float = 0.5) -> t
     omega_max = env.cfg.motor_omega_max_rad_s
     w = env._motor_speeds / omega_max
     return (low_floor_norm - w).clamp(min=0.0).sum(dim=1)
-

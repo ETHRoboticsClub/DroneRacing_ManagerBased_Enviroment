@@ -15,16 +15,15 @@ plus two new terms for the waypoint-task extension:
     purely additive and intended to be commentable-out without breaking
     learning of the other terms.
 
-Continuous-quantity terms (``lin_vel``, ``ang_vel``, ``distance_to_waypoint``)
-multiply by ``env.step_dt`` so they integrate to a per-second magnitude
-regardless of policy frequency, matching the original direct env.
+The Isaac Lab ``RewardManager`` multiplies every term by the environment time
+step.  Consequently, the functions in this module return *unscaled* factors;
+applying ``env.step_dt`` here as well would accidentally scale continuous
+rewards by ``dt²``.
 
 Each function returns the **unweighted** factor for that term — shape [N].
 ``RewardManager`` multiplies by the configured weight from
 :class:`WaypointRewardWeights`. Each weight in the cfg is the original
 direct-env weight × the old env's ``reward_scale=0.2``; the
-``@scale_dataclass_attributes(100.0)`` decorator scales by 100 so SKRL's
-``rewards_shaper_scale=0.01`` produces the original effective magnitudes.
 """
 
 from __future__ import annotations
@@ -36,54 +35,56 @@ from isaaclab.envs.mdp.rewards import *  # noqa: F401, F403
 
 
 # ---------------------------------------------------------------------------
-# Mirror of the old direct-env terms (continuous → multiplied by step_dt)
+# Dense waypoint shaping
 # ---------------------------------------------------------------------------
 
-def reward_distance_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``(d + 2)^3 * step_dt`` for the current target. Matches the old env.
+def reward_progress_to_waypoint(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Bounded reward for reducing distance to the active waypoint.
 
-    Cubic-shifted form gives a strong gradient even at large distances; the
-    +2 shift keeps the derivative finite at d=0 and is more aggressive
-    than a quadratic at every range. Multiplying by ``step_dt`` converts
-    the per-step contribution into a per-second magnitude so the
-    integrated penalty over an episode is independent of dt.
+    The state updater preserves both distances with respect to the target
+    that was active during the just-completed control step.  This remains
+    correct on a collection step, where the public ``current waypoint`` has
+    already advanced for the next observation.
     """
-    return torch.pow(env._curr_dist_to_waypoint + 2.0, 3.0) * env.step_dt
+    scale = float(env.cfg.progress_to_waypoint_scale_m)
+    delta = env._reward_previous_dist_to_waypoint - env._reward_dist_to_waypoint
+    return torch.tanh(delta / scale)
+
+
+def reward_waypoint_proximity(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Broad bounded reward for being near the waypoint."""
+    scale = float(env.cfg.waypoint_proximity_scale_m)
+    return 1.0 - torch.tanh(env._reward_dist_to_waypoint / scale)
+
+
+def reward_waypoint_proximity_fine(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """High-resolution positive reward around the waypoint centre."""
+    scale = float(env.cfg.waypoint_proximity_fine_scale_m)
+    return 1.0 - torch.tanh(env._reward_dist_to_waypoint / scale)
 
 
 def penalty_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``‖v_b‖² * step_dt`` — discourages drifting / unnecessary motion.
-
-    Linear velocity is taken from sim (not from obs); the policy doesn't
-    see it but the critic does via the reward.
-    """
-    return env._robot.data.root_lin_vel_b.square().sum(dim=1) * env.step_dt
+    """``‖v_b‖²`` — discourages drifting / unnecessary motion."""
+    return env._robot.data.root_lin_vel_b.square().sum(dim=1)
 
 
 def penalty_ang_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``‖ω_b‖² * step_dt`` — without this the drone learns to circle the goal.
-
-    Comment from the direct-env reward manager: "It learns to circle around
-    when this is too low".
-    """
-    return env._robot.data.root_ang_vel_b.square().sum(dim=1) * env.step_dt
+    """``‖ω_b‖²`` — without this the drone learns to circle the goal."""
+    return env._robot.data.root_ang_vel_b.square().sum(dim=1)
 
 
-def penalty_action_magnitude(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``‖a‖²`` — mild regulariser. No dt scaling (event-like)."""
-    return env._actions_buf.square().sum(dim=1)
+def penalty_near_waypoint_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Extra braking cost that smoothly activates near the active target."""
+    radius = float(env.cfg.near_waypoint_velocity_radius_m)
+    proximity = torch.exp(-(env._reward_dist_to_waypoint / radius).square())
+    return env._robot.data.root_lin_vel_b.square().sum(dim=1) * proximity
 
 
-def penalty_oversaturation(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``‖a_raw - a_clamped‖²`` — penalises the policy for asking for actions
-    outside ``[-1, 1]`` that the action term then clips.
-
-    Reads ``env._unclamped_actions_buf``, which the env stores at the top of
-    each ``step`` before the action term clamps & applies noise/lag.
-    """
-    raw = env._unclamped_actions_buf
-    clamped = raw.clamp(-1.0, 1.0)
-    return (raw - clamped).square().sum(dim=1)
+def penalty_near_waypoint_ang_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Extra angular-rate cost near the active target."""
+    radius = float(env.cfg.near_waypoint_velocity_radius_m)
+    proximity = torch.exp(-(env._reward_dist_to_waypoint / radius).square())
+    return env._robot.data.root_ang_vel_b.square().sum(dim=1) * proximity
 
 
 def penalty_action_smoothness(env: ManagerBasedRLEnv) -> torch.Tensor:

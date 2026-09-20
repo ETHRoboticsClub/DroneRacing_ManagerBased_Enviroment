@@ -11,6 +11,7 @@ import math
 import os
 import random
 from collections.abc import Sequence
+import time
 
 import numpy as np
 import torch
@@ -22,6 +23,16 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply
 
 from Racing_Quadcopter.terrains import get_gate_registry
+from Racing_Quadcopter.tasks.manager_based.action_diagnostics import ActionDiagnostics
+from Racing_Quadcopter.tasks.manager_based.route_progress import (
+    begin_racing_routes,
+    initialize_route_progress,
+)
+from Racing_Quadcopter.tasks.manager_based.shared_features import (
+    initialize_action_noise,
+    initialize_speed_limits,
+    validate_shared_feature_events,
+)
 from .mdp.curriculums import init_two_stage_curriculum
 from .mdp.events import collect_episode_metrics_before_reset
 from .mdp.gate_utils import update_racing_state
@@ -85,20 +96,26 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
     def _prepare_racing_task(self) -> None:
         """Allocate all racing-specific GPU buffers before managers are built."""
+        validate_shared_feature_events(self.cfg)
         self._robot = self.scene["robot"]
         self._contact_sensor = self.scene.sensors["contact_sensor"]
         self._setup_gate_tracking()
+        initialize_route_progress(self, self._gate_positions.shape[1] + 1)
 
-        # Per-env speed cap; re-sampled each episode if cfg.randomize_velocity_limit.
-        self._velocity_limit = torch.full((self.num_envs,), self.cfg.velocity_limit, device=self.device)
+        initialize_speed_limits(self)
 
         init_stats(self)
+        self._action_config_log_interval_s = 120.0
+        self._last_action_config_log_wall_time = 0.0
 
         # [N, 4] normalized thrust+moment actions. _prev_actions used for smoothness penalty.
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions_buf)
-        # Action-noise per-env bias (sampled at reset if enabled)
-        self._action_noise_bias = torch.zeros(self.num_envs, 4, device=self.device)
+        # Raw policy output (before action manager processing) and one-step lag.
+        self._policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._prev_policy_raw_actions = torch.zeros_like(self._actions_buf)
+        self._action_diagnostics = ActionDiagnostics(self)
+        initialize_action_noise(self, action_dim=4)
 
         # Per-drone motor speeds [N, 4] (one element per impeller); updated elsewhere as needed.
         self._motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
@@ -175,6 +192,13 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         self._episode_lap_count = torch.zeros(self.num_envs, device=self.device)
         self._last_lap_step = torch.zeros(self.num_envs, device=self.device)
 
+        # Top-speed metric. _run_max_speed is each env's peak speed since spawn; it is
+        # folded into the global running max _top_speed ONLY when that env completes a
+        # lap (so speeds from runs that crash/time-out are never counted). Reset per env
+        # at episode end; _top_speed persists for the whole run.
+        self._run_max_speed = torch.zeros(self.num_envs, device=self.device)
+        self._top_speed = torch.zeros((), device=self.device)
+
         # Per-passage quality stats accumulated each gate crossing.
         self._passage_velocity_sum = torch.zeros(self.num_envs, device=self.device)
         self._passage_centering_sum = torch.zeros(self.num_envs, device=self.device)
@@ -201,13 +225,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
     def _setup_gate_tracking(self) -> None:
         """Build world-frame gate position/orientation tables for all envs.
 
-        Gate registry design:
-            racing_gates_terrain() stores its output in a module-level dict because
-            TerrainGenerator discards the function's return value. The dict is keyed
-            by (difficulty, seed). TerrainGenerator differentiates the seed per cell,
-            so a 4×4 grid produces 16 unique registry entries — every cell has its own
-            random gate layout. Difficulty varies per row (4 levels); columns within a
-            row share difficulty but differ in seed, so their circuits are distinct.
+        Fetches terrain geometry, delegates data loading and env→cell mapping to
+        ``_load_cell_gate_data`` (override in subclasses for different terrain types),
+        then fills the shared gate buffers and calls the vis helpers.
 
         Centre-offset correction:
             Gate positions are generated in a corner-origin local frame (origin at mesh
@@ -215,17 +235,10 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             so we subtract (size_x/2, size_y/2, 0) before adding the origin.
 
         Padding:
-            Different difficulty rows may have different gate counts. All tensors are
-            padded to max_gates; _gate_counts[env_id] stores the true count so modular
-            indexing never reads a padding slot.
+            Different cells may have different gate counts. All tensors are padded to
+            max_gates; _gate_counts[env_id] stores the true count so modular indexing
+            never reads a padding slot.
         """
-        registry = get_gate_registry()
-        if not registry:
-            raise RuntimeError(
-                "Gate registry is empty — use terrain that calls racing_gates_terrain (MeshRacingGatesTerrainCfg)."
-            )
-
-        gate_datas = list(registry.values())
         terrain = self.scene.terrain
         if terrain is None or terrain.cfg.terrain_generator is None:
             raise RuntimeError("Racing quadcopter requires a generator terrain with gates.")
@@ -233,22 +246,6 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
 
         # Shift from corner-origin (mesh builder) to centre-origin (TerrainGenerator).
         centre_offset = np.array([-terrain_cfg.size[0] / 2.0, -terrain_cfg.size[1] / 2.0, 0.0])
-
-        per_cell_base_pos = []
-        per_cell_base_ori = []
-        for gd in gate_datas:
-            local_gate_pos = gd.positions + centre_offset  # numpy [G, 3], centre-origin frame
-            per_cell_base_pos.append(torch.from_numpy(local_gate_pos).float().to(self.device))
-            per_cell_base_ori.append(torch.from_numpy(gd.orientations).float().to(self.device))
-
-        per_cell_counts = [p.shape[0] for p in per_cell_base_pos]
-        per_cell_sizes  = [gd.gate_size for gd in gate_datas]
-        max_gates = max(per_cell_counts)
-        self._num_gates  = max_gates
-        self._gate_sizes = torch.zeros(self.num_envs, device=self.device)  # [N] per-env gate aperture
-        # Single-cell FPV/race mode currently uses uniform bar geometry; stored as a scalar
-        # for the target-gate highlight overlay (see _update_target_gate_highlight).
-        self._gate_bar_thickness = float(gate_datas[0].bar_thickness)
 
         terrain_origins = terrain.terrain_origins
         if terrain_origins is None:
@@ -259,47 +256,30 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             terrain_origins = terrain_origins.to(self.device)
         num_rows, num_cols = terrain_origins.shape[:2]
 
-        if os.getenv("DEBUG_TERRAIN") == "1":
-            try:
-                keys = list(registry.keys())
-                print("DEBUG_TERRAIN: gate_registry_len=", len(keys))
-                print("DEBUG_TERRAIN: gate_registry_keys_sample=", keys[:5])
-            except Exception:
-                pass
-            try:
-                to_cpu = terrain_origins.cpu().numpy()
-                print("DEBUG_TERRAIN: terrain_origins_shape=", to_cpu.shape)
-                uniq = np.unique(np.round(to_cpu.reshape(-1, 3), 5), axis=0)
-                print("DEBUG_TERRAIN: unique_origins_count=", uniq.shape[0])
-                print("DEBUG_TERRAIN: terrain_origins_sample=", to_cpu.reshape(-1, 3)[:5])
-            except Exception:
-                pass
+        per_cell_pos, per_cell_ori, per_cell_sizes, gate_datas, env_cell_idx, env_origins = \
+            self._load_cell_gate_data(terrain_origins, centre_offset)
+
+        max_gates = max(p.shape[0] for p in per_cell_pos)
+        self._num_gates = max_gates
+        self._gate_sizes = torch.zeros(self.num_envs, device=self.device)
+        # Uniform bar geometry across cells; scalar for the target-gate highlight
+        # overlay (see _update_target_gate_highlight).
+        self._gate_bar_thickness = float(gate_datas[0].bar_thickness)
 
         # Shape [N, max_gates, 3/4]; padded slots are zero.
         self._gate_positions = torch.zeros(self.num_envs, max_gates, 3, device=self.device)
         self._gate_orientations = torch.zeros(self.num_envs, max_gates, 4, device=self.device)
         self._gate_counts = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-        # env_id → (row, col) mirrors TerrainGenerator's row-major cell assignment.
-        # If num_envs < num_rows*num_cols some cells have no drone (static geometry only).
-        # If num_envs > num_rows*num_cols the row/col indices wrap and multiple envs
-        # share the same layout but differ by terrain_origin.
         for env_id in range(self.num_envs):
-            row = (env_id // num_cols) % num_rows
-            col = env_id % num_cols
-            origin = terrain_origins[row, col]  # world-frame cell centre [3]
-
-            # 16 registry entries for a 4×4 grid; wrap defensively if counts diverge.
-            cell_idx = (row * num_cols + col) % len(per_cell_base_pos)
-            cell_base_pos = per_cell_base_pos[cell_idx]  # [G, 3] centre-origin frame
-            cell_base_ori = per_cell_base_ori[cell_idx]  # [G, 4]
-
-            n = cell_base_pos.shape[0]
-            self._gate_positions[env_id, :n] = cell_base_pos + origin  # → world frame
-            self._gate_orientations[env_id, :n] = cell_base_ori.clone()
+            c = int(env_cell_idx[env_id])
+            origin = env_origins[env_id]
+            n = per_cell_pos[c].shape[0]
+            self._gate_positions[env_id, :n] = per_cell_pos[c] + origin
+            self._gate_orientations[env_id, :n] = per_cell_ori[c].clone()
             self._gate_counts[env_id] = int(n)
-            self._gate_sizes[env_id] = per_cell_sizes[cell_idx]
-            if n < max_gates:  # zero-pad remaining slots to prevent NaN contamination
+            self._gate_sizes[env_id] = per_cell_sizes[c]
+            if n < max_gates:
                 self._gate_positions[env_id, n:] = 0.0
                 self._gate_orientations[env_id, n:] = 0.0
 
@@ -386,6 +366,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 color=self.cfg.demo_drone_glow_color,
                 intensity=self.cfg.demo_drone_glow_intensity,
             )
+
+        self._log_action_configuration(reason="startup")
+        self._last_action_config_log_wall_time = time.time()
 
         # Per-step camera-direction arrow above each drone (visualisation only — never
         # touched by physics or the policy). Prim is created here once; points are
@@ -835,10 +818,91 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             gate_size=gate_size,
             bar_thickness=self._gate_bar_thickness,
         )
+    def _load_cell_gate_data(
+        self,
+        terrain_origins: torch.Tensor,
+        centre_offset: np.ndarray,
+    ) -> tuple[list, list, list, list, np.ndarray, torch.Tensor]:
+        """Load per-cell gate data and compute the env→cell mapping.
+
+        Default implementation for procedural / single-circuit terrains: reads
+        from the module-level ``gate_registry`` (populated as a side-effect of
+        terrain generation) and resolves env→cell via the hand-rolled row-major
+        formula ``cell_idx = (row * num_cols + col) % n_cells``.
+
+        Override in subclasses that source gate data differently (e.g.
+        ``RacingQuadcopterMultiTrackRLEnv`` reads from sub_terrain cfgs and
+        uses ``scene.env_origins`` for an exact env→cell lookup).
+
+        Args:
+            terrain_origins: ``[num_rows, num_cols, 3]`` world-frame cell centres.
+            centre_offset:   ``[3]`` shift from corner-origin to centre-origin frame.
+
+        Returns:
+            per_cell_pos   : ``list[Tensor[G, 3]]`` gate positions, centre-origin frame.
+            per_cell_ori   : ``list[Tensor[G, 4]]`` gate quaternions (wxyz).
+            per_cell_sizes : ``list[float]`` gate aperture per cell.
+            gate_datas     : ``list[GateData]`` in cell-major order for vis helpers.
+            env_cell_idx   : ``np.ndarray[num_envs]`` per-env index into per_cell_*.
+            env_origins    : ``Tensor[num_envs, 3]`` per-env world-frame terrain origin.
+        """
+        registry = get_gate_registry()
+        if not registry:
+            raise RuntimeError(
+                "Gate registry is empty — terrain must call racing_gates_terrain / fixed_gates_terrain."
+            )
+
+        gate_datas_reg = list(registry.values())
+        per_cell_pos: list[torch.Tensor] = []
+        per_cell_ori: list[torch.Tensor] = []
+        per_cell_sizes: list[float] = []
+        for gd in gate_datas_reg:
+            local_pos = gd.positions + centre_offset
+            per_cell_pos.append(torch.from_numpy(local_pos).float().to(self.device))
+            per_cell_ori.append(torch.from_numpy(gd.orientations).float().to(self.device))
+            per_cell_sizes.append(float(gd.gate_size))
+
+        num_rows, num_cols = terrain_origins.shape[:2]
+        n_cells = len(per_cell_pos)
+
+        if os.getenv("DEBUG_TERRAIN") == "1":
+            try:
+                keys = list(registry.keys())
+                print("DEBUG_TERRAIN: gate_registry_len=", len(keys))
+                print("DEBUG_TERRAIN: gate_registry_keys_sample=", keys[:5])
+            except Exception:
+                pass
+            try:
+                to_cpu = terrain_origins.cpu().numpy()
+                print("DEBUG_TERRAIN: terrain_origins_shape=", to_cpu.shape)
+                uniq = np.unique(np.round(to_cpu.reshape(-1, 3), 5), axis=0)
+                print("DEBUG_TERRAIN: unique_origins_count=", uniq.shape[0])
+                print("DEBUG_TERRAIN: terrain_origins_sample=", to_cpu.reshape(-1, 3)[:5])
+            except Exception:
+                pass
+
+        env_cell_idx = np.empty(self.num_envs, dtype=int)
+        env_origins = torch.zeros(self.num_envs, 3, device=self.device)
+        for env_id in range(self.num_envs):
+            row = (env_id // num_cols) % num_rows
+            col = env_id % num_cols
+            cell_idx = (row * num_cols + col) % n_cells
+            env_cell_idx[env_id] = cell_idx
+            env_origins[env_id] = terrain_origins[row, col]
+
+        # gate_datas in cell-major order (row * num_cols + col) for vis helpers.
+        gate_datas = [gate_datas_reg[(r * num_cols + c) % n_cells]
+                      for r in range(num_rows) for c in range(num_cols)]
+
+        return per_cell_pos, per_cell_ori, per_cell_sizes, gate_datas, env_cell_idx, env_origins
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        # Keep a copy of raw network actions before the action manager transforms/clips them.
+        self._prev_policy_raw_actions[:] = self._policy_raw_actions
+        self._policy_raw_actions[:] = action.to(self.device)
+
         # Step 1: clamp to [-1,1], write _actions_buf, copy to _prev_actions.
-        self.action_manager.process_action(action.to(self.device))
+        self.action_manager.process_action(self._policy_raw_actions)
 
         self.recorder_manager.record_pre_step()
 
@@ -930,6 +994,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        self._action_diagnostics.update_if_due()
+        self._maybe_log_action_configuration()
+
         # Second obs pass: the "real" obs returned to the policy, with history update.
         # Runs after resets so freshly-spawned envs contribute correct observations.
         self.obs_buf = self.observation_manager.compute(update_history=True)
@@ -956,6 +1023,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
         gate_log = collect_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
+        begin_racing_routes(self, env_ids_tensor)
 
         if os.getenv("DEBUG_TERRAIN") == "1":
             try:
@@ -970,19 +1038,9 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             except Exception as e:
                 print("DEBUG_TERRAIN: reset debug error", e)
 
-        # Sample per-episode biases for action noise (if enabled).
-        # These buffers were pre-allocated in _prepare_racing_task.
-        n = env_ids_tensor.shape[0]
-
-        action_noise_cfg = getattr(self.cfg, "action_noise", None)
-        if action_noise_cfg and getattr(action_noise_cfg, "enable", False) and getattr(action_noise_cfg, "per_episode_bias", False):
-            a, b = action_noise_cfg.bias_range
-            self._action_noise_bias[env_ids_tensor] = torch.rand(n, 4, device=self.device) * (b - a) + a
-        else:
-            self._action_noise_bias[env_ids_tensor] = 0.0
-
         if gate_log:
             self.extras["log"].update(gate_log)
+            self._on_episode_metrics_collected(gate_log)
 
         # SKRL only logs scalar tensors from extras["log"]; managers emit floats.
         if self.extras.get("log"):
@@ -993,3 +1051,172 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
                 elif isinstance(value, (float, int, bool)):
                     log_tensors[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
             self.extras["log"] = log_tensors
+
+        # Keep raw-action lag buffer aligned with reset state to avoid artificial first-step spikes.
+        self._policy_raw_actions[env_ids_tensor].zero_()
+        self._prev_policy_raw_actions[env_ids_tensor].zero_()
+        self._action_diagnostics.reset(env_ids_tensor)
+
+    def _on_episode_metrics_collected(self, gate_log: dict) -> None:
+        """Hook called after each reset once `gate_log` has been merged into ``extras["log"]``.
+
+        Default is a no-op. Subclasses (e.g. ``RacingQuadcopterSkillEvalRLEnv``)
+        override this to write the metrics directly to a tensorboard writer
+        without relying on the agent runner having a configured ``log_dir``.
+        """
+        return
+
+    @staticmethod
+    def _format_config_value(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        if isinstance(value, (tuple, list)):
+            return "(" + ", ".join(RacingQuadcopterRLEnv._format_config_value(v) for v in value) + ")"
+        return str(value)
+
+    def _log_action_configuration(self, reason: str) -> None:
+        """Print and log the current action-noise / corruption / randomization config."""
+        action_noise_cfg = getattr(self.cfg, "action_noise", None)
+        observations_cfg = getattr(self.cfg, "observations", None)
+        policy_obs_cfg = getattr(observations_cfg, "policy", None)
+        actions_cfg = getattr(self.cfg, "actions", None)
+        rates_cfg = getattr(actions_cfg, "rates", None)
+        if hasattr(self, "action_manager"):
+            try:
+                rates_cfg = self.action_manager.get_term("rates").cfg
+            except Exception:
+                pass
+        moments_cfg = getattr(actions_cfg, "moments", None)
+        action_cfg = rates_cfg if rates_cfg is not None else moments_cfg
+        action_type = "rates" if rates_cfg is not None else ("moments" if moments_cfg is not None else "none")
+
+        policy_term_cfgs = {}
+        if hasattr(self, "observation_manager"):
+            term_names = self.observation_manager._group_obs_term_names.get("policy", [])
+            term_cfgs = self.observation_manager._group_obs_term_cfgs.get("policy", [])
+            policy_term_cfgs = {name: cfg for name, cfg in zip(term_names, term_cfgs)}
+
+        def _obs_noise_attr(term_name: str, attr: str, default: object = "n/a") -> object:
+            term_cfg = policy_term_cfgs.get(term_name, None)
+            if term_cfg is None:
+                return default
+            noise_cfg = getattr(term_cfg, "noise", None)
+            if noise_cfg is None:
+                return default
+            obj = noise_cfg
+            for name in attr.split("."):
+                obj = getattr(obj, name, None)
+                if obj is None:
+                    return default
+            return obj
+
+        fields: dict[str, object] = {
+            "domain_randomization": getattr(self.cfg, "domain_randomization", "n/a"),
+            "observation_noise_enable": getattr(self.cfg, "observation_noise_enable", "n/a"),
+            "observations.policy.enable_corruption": getattr(policy_obs_cfg, "enable_corruption", "n/a"),
+            "obs_cfg.policy.base_lin_vel.noise.enable": _obs_noise_attr("base_lin_vel", "enable"),
+            "obs_cfg.policy.base_lin_vel.noise.std": _obs_noise_attr("base_lin_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_lin_vel.bias.std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.noise.enable": _obs_noise_attr("base_ang_vel", "enable"),
+            "obs_cfg.policy.base_ang_vel.noise.std": _obs_noise_attr("base_ang_vel", "noise_cfg.std"),
+            "obs_cfg.policy.base_ang_vel.bias.std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.noise.enable": _obs_noise_attr("projected_gravity", "enable"),
+            "obs_cfg.policy.projected_gravity.noise.std": _obs_noise_attr("projected_gravity", "noise_cfg.std"),
+            "obs_cfg.policy.projected_gravity.bias.std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std"),
+            "action_noise.enable": getattr(action_noise_cfg, "enable", "n/a"),
+            "action_noise.per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", "n/a"),
+            "action_noise.gaussian_std": getattr(action_noise_cfg, "gaussian_std", "n/a"),
+            "action_noise.bias_range": getattr(action_noise_cfg, "bias_range", "n/a"),
+            "action_noise.lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", "n/a"),
+            "action_noise.per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", "n/a"),
+            "action_noise.lpf_alpha_range": getattr(action_noise_cfg, "lpf_alpha_range", "n/a"),
+            "action_noise.clip_actions": getattr(action_noise_cfg, "clip_actions", "n/a"),
+            "action_type": action_type,
+        }
+        if action_cfg is not None:
+            fields["action_cfg.max_delay"] = getattr(action_cfg, "max_delay", "n/a")
+
+        if rates_cfg is not None:
+            fields.update(
+                {
+                    "action_cfg.pid_gain_randomization_frac": getattr(rates_cfg, "pid_gain_randomization_frac", "n/a"),
+                    "action_cfg.thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", "n/a"
+                    ),
+                    "action_cfg.aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", "n/a"),
+                    "action_cfg.aero_randomization_frac": getattr(rates_cfg, "aero_randomization_frac", "n/a"),
+                }
+            )
+
+        summary = " ".join(f"{key}={self._format_config_value(value)}" for key, value in fields.items())
+        print(f"[ACTION_CFG][{reason}] {summary}")
+
+        log_dict = self.extras.setdefault("log", {})
+        scalar_fields = {
+            "Config/domain_randomization": getattr(self.cfg, "domain_randomization", None),
+            "Config/observation_noise_enable": getattr(self.cfg, "observation_noise_enable", None),
+            "Config/observations_policy_enable_corruption": getattr(policy_obs_cfg, "enable_corruption", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_enable": _obs_noise_attr("base_lin_vel", "enable", None),
+            "Config/obs_cfg_policy_base_lin_vel_noise_std": _obs_noise_attr("base_lin_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_lin_vel_bias_std": _obs_noise_attr("base_lin_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_enable": _obs_noise_attr("base_ang_vel", "enable", None),
+            "Config/obs_cfg_policy_base_ang_vel_noise_std": _obs_noise_attr("base_ang_vel", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_base_ang_vel_bias_std": _obs_noise_attr("base_ang_vel", "bias_noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_enable": _obs_noise_attr("projected_gravity", "enable", None),
+            "Config/obs_cfg_policy_projected_gravity_noise_std": _obs_noise_attr("projected_gravity", "noise_cfg.std", None),
+            "Config/obs_cfg_policy_projected_gravity_bias_std": _obs_noise_attr("projected_gravity", "bias_noise_cfg.std", None),
+            "Config/action_noise_enable": getattr(action_noise_cfg, "enable", None),
+            "Config/action_noise_per_episode_bias": getattr(action_noise_cfg, "per_episode_bias", None),
+            "Config/action_noise_gaussian_std": getattr(action_noise_cfg, "gaussian_std", None),
+            "Config/action_noise_lpf_alpha": getattr(action_noise_cfg, "lpf_alpha", None),
+            "Config/action_noise_per_episode_lpf_alpha": getattr(action_noise_cfg, "per_episode_lpf_alpha", None),
+            "Config/action_noise_clip_actions": getattr(action_noise_cfg, "clip_actions", None),
+            "Config/action_cfg_max_delay": getattr(action_cfg, "max_delay", None) if action_cfg is not None else None,
+            "Config/action_type_is_rates": 1.0 if rates_cfg is not None else 0.0,
+            "Config/action_type_is_moments": 1.0 if moments_cfg is not None else 0.0,
+        }
+        if rates_cfg is not None:
+            scalar_fields.update(
+                {
+                    "Config/action_cfg_pid_gain_randomization_frac": getattr(
+                        rates_cfg, "pid_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_thrust_to_weight_randomization_frac": getattr(
+                        rates_cfg, "thrust_to_weight_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_natural_frequency_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_natural_frequency_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_damping_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_damping_randomization_frac", None
+                    ),
+                    "Config/action_cfg_rate_filter_command_gain_randomization_frac": getattr(
+                        rates_cfg, "rate_filter_command_gain_randomization_frac", None
+                    ),
+                    "Config/action_cfg_aero_randomization_enable": getattr(rates_cfg, "aero_randomization_enable", None),
+                }
+            )
+
+        for key, value in scalar_fields.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+            elif isinstance(value, (int, float)):
+                log_dict[key] = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+
+    def _maybe_log_action_configuration(self) -> None:
+        now = time.time()
+        if now - self._last_action_config_log_wall_time < self._action_config_log_interval_s:
+            return
+        self._last_action_config_log_wall_time = now
+        self._log_action_configuration(reason="heartbeat")

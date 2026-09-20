@@ -303,7 +303,9 @@ All buffers are allocated in `_prepare_racing_task()` on `self.device`.
 | `_crashed_buf` | `[N]` bool | Contact force OR upside-down |
 | `_collision_termination_buf` | `[N]` bool | Contact force only (gated by curriculum) |
 | `_collision_detection_enabled` | `[N]` bool | Per-env curriculum gate |
-| `_velocity_limit` | `[N]` | Per-env speed cap (m/s) |
+| `_velocity_limit` | `[N]` | Per-env linear speed cap (m/s) |
+| `_angular_velocity_limit` | `[N]` | Per-env angular speed cap (rad/s) |
+| `_speed_limit_randomization_active` | bool | One-way curriculum latch for per-episode sampling |
 | `_actions_buf` | `[N, 4]` | Current step actions |
 | `_prev_actions` | `[N, 4]` | Previous step actions |
 | `_action_noise_bias` | `[N, 4]` | Per-episode action bias |
@@ -357,7 +359,7 @@ Both are disabled in Play configs.
 
 ### 6.1 Observation Space
 
-**Policy group** — concatenated, history length 3 (each term stacked over 3 consecutive steps).
+**Policy group** — concatenated, with the current default history window of 1.
 
 | Term | Dimension (per step) | Function | Description |
 |------|----------------------|----------|-------------|
@@ -365,24 +367,26 @@ Both are disabled in Play configs.
 | `base_ang_vel` | 3 | `wrap_base_ang_vel` | Body-frame angular velocity (rad/s) |
 | `projected_gravity` | 3 | `wrap_projected_gravity` | Gravity direction in body frame |
 | `last_action` | 4 | `wrap_last_action` | Previous step action `[a0..a3]` |
-| `obs_gates` | K×6 | `compute_next_gates_rel_and_fwd_body` | Next K gates: relative position + forward |
-| `velocity_limit` | 1 | `velocity_limit_obs` | Per-env speed cap / 10 |
+| `obs_gates` | K×7 | `compute_next_gates_rel_and_fwd_body` | Next K gates: relative position, forward, aperture half-width |
+| `speed_limits` | 0 or 2 | `speed_limits_obs` | Disabled: no columns; enabled: linear and angular episode limits |
 
-With default `K=3` and `history_length=3`: total observation dimension = `(3+3+3+4+18+1) × 3 = 96`.
+With default `K=3`, the base observation has 34 values. Enabling paired speed
+limits appends two values for a total of 36.
 
 **Gate observation details** (`compute_next_gates_rel_and_fwd_body`):
 
 For each of the next K gates:
 - `rel_pos [3]` — gate centre relative to drone, in drone **body frame**, divided by `_REL_POSITION_SCALE=10.0` to keep values near `[-1, 1]` for gates up to 10 m away
 - `fwd [3]` — gate forward direction (+Y in gate frame), rotated to drone body frame (unit vector)
+- `half_width [1]` — effective gate aperture half-width
 
 All K gates are gathered simultaneously using vectorized `torch.gather` over the padded gate table with modular indexing.
 
 **`enable_corruption = False`** in `PolicyCfg.__post_init__`: the IsaacLab manager-level corruption pipeline is disabled. All noise is applied manually in `_apply_obs_noise` instead (see [Section 8](#8-observation-corruption)).
 
-**`GateObservationConfig`:**
-- `num_next_gates: int = 3` — lookahead depth K
-- `include_velocity_limit: bool = True` — whether `velocity_limit` obs is included (currently always included regardless of this flag; the flag is informational)
+**`GateObservationConfig`:** `num_next_gates: int = 3` controls lookahead depth K.
+The paired limit observations are added only when `speed_limits.enabled=True`; this
+changes the policy input by two values and is incompatible with older checkpoints.
 
 ### 6.2 Action Space
 
@@ -404,7 +408,8 @@ All functions return an **unweighted** scalar per environment `[N]`. The `Reward
 | `gate_progress` | `reward_gate_progress` | +20.0 | +2000 | Distance reduction toward current gate (clamped ±1 m) |
 | `gate_centering` | `reward_gate_centering` | +0.5 | +50 | Exponential alignment bonus on approach side |
 | `velocity_toward_gate` | `reward_velocity_toward_gate` | +2.0 | +200 | Velocity projection onto gate direction, approach side only |
-| `velocity_limit` | `penalty_velocity_limit` | −0.05 | −5 | Quadratic penalty for exceeding per-env speed cap |
+| `velocity_limit` | `penalty_velocity_limit` | −0.5 | −0.5 | Quadratic penalty for exceeding per-env speed cap |
+| `angular_velocity_limit` | `penalty_angular_velocity_limit` | −0.03 | −0.03 | Quadratic penalty for exceeding per-env angular speed cap |
 | `orientation` | `penalty_orientation` | −0.005 | −0.5 | Squared tilt angle from upright |
 | `angular_velocity` | `penalty_angular_velocity` | −0.001 | −0.1 | Sum of squared body angular rates |
 | `action_smoothness` | `penalty_action_smoothness` | −0.0001 | −0.01 | Squared action deltas between steps |
@@ -451,7 +456,7 @@ Reset pipeline runs in this order on each env that terminates:
 1. **`collect_episode_metrics_before_reset`** (called from `_reset_idx`, before super) — snapshots episode stats, accumulates sliding windows, saves `_last_episode_*` for curriculum, zeros all live accumulators
 2. **`reset_scene_to_default`** (EventManager mode=reset) — resets Isaac simulation state
 3. **`reset_racing_spawn`** (EventManager mode=reset) — sets spawn position and velocity
-4. Observation/action noise biases resampled in `_reset_idx` (after super)
+4. Shared `reset_action_noise` and `randomize_speed_limits` EventTerms sample optional per-episode state
 
 **Spawn modes** (set by `method` parameter in `reset_racing_spawn`):
 
@@ -474,7 +479,26 @@ After the normal spawn, a fraction `recovery_spawn_prob` of envs have their orie
 
 Recovery spawns are suppressed in eval mode regardless of `recovery_spawn_prob` and `_curriculum_stage`.
 
-**Velocity limit resampling:** if `randomize_velocity_limit=True`, `_velocity_limit[env_ids]` is resampled uniformly from `velocity_limit_range` each episode.
+**Speed-limit enforcement and resampling:** disabled limits produce no observation
+columns and zero penalties. When enabled, both penalties enforce the configured maximum
+limits. After the one-way curriculum latch activates, the reset
+`randomize_speed_limits` event samples both limits for only the resetting environments. Evaluation
+activates enabled randomization immediately; equal range endpoints make evaluation deterministic.
+In the competition curriculum, both speed-limit reward weights can grow to 5× their
+base magnitude when normalized route progress is high, and are held—not reduced—when progress declines.
+
+Adaptive curriculum decisions use a shared geometric score from
+`tasks/manager_based/route_progress.py`. It projects the episode start and final drone
+positions onto the closest points of an ordered straight-segment polyline and divides
+covered arc length by the distance reachable at that episode's linear speed limit over
+the full episode duration. Every route prepends an origin (the official start for
+competition, otherwise the episode spawn) to its task points. Hovering uses its ordered
+target poses and subtracts their required dwell time
+from the travel budget. Original lap/gate and waypoint-completion computations are not
+removed; they remain independent metrics.
+The reward and randomization controllers are likewise task-independent and live in
+`tasks/manager_based/adaptive_curriculums.py`; task configs only provide target names,
+thresholds, and an optional completion term used for secondary logging.
 
 ### 6.6 Curriculum
 
@@ -635,7 +659,6 @@ All noise is applied manually by the custom `wrap_*` functions and `compute_next
 | `base_ang_vel` | 0.02 rad/s | ±0.02 rad/s |
 | `projected_gravity` | 0.01 | ±0.01 |
 | `obs_gates` | 0.02 (scaled units) | ±0.1 (scaled units ≈ ±1 m) |
-| `velocity_limit` | 0.0 | ±0.5 m/s |
 | `last_action` | 0.0 | ±0.05 |
 
 All noise is disabled in Play configs (`observation_noise.enable=False`).
@@ -722,10 +745,11 @@ After warmup, printed every `speed_log_interval_s` seconds (default 10 s):
 
 `extras["log"]` dictionary is populated each reset with:
 - `Episode_Metrics/gates_passed` — mean gates passed over reset batch
-- `Episode_Metrics/mean_velocity` — mean drone speed over episode (m/s)
-- `Episode_Metrics/collision_count` — mean non-timeout terminations per episode
+- `Episode_Metrics/mean_velocity_kmh` — mean drone speed over episode (km/h)
+- `Episode_Metrics/lap_completion_pct` — mean lap completion %, averaged across completed laps and terminated partial runs (skipped if no run is countable)
 - `Episode_Metrics/mean_lap_time_s` — mean lap duration (only when laps completed)
 - `Curriculum/stage` — current stage (0, 1, 2, or 1000)
+- (skill-eval only) `terrain_{i}/...` — same metrics restricted to envs assigned to terrain `i` (each terrain becomes its own top-level tensorboard panel)
 
 SKRL routes these to TensorBoard automatically via `environment_info: log` in the trainer config.
 
@@ -948,11 +972,12 @@ Both train.py and play.py support `--override KEY=VAL`. Multiple `--override` fl
 **Examples:**
 ```bash
 --override episode_length_s=30.0
---override velocity_limit_range="(8.0, 15.0)"
+--override speed_limits.enabled=True
+--override speed_limits.linear_range="(2.0, 15.0)"
+--override speed_limits.angular_range="(1.0, 8.0)"
 --override rewards.crash.weight=-8000.0
 --override observation_noise.gaussian_std_obs_gates=0.05
 --override recovery_spawn_prob=0.3
---override randomize_velocity_limit=True
 ```
 
 If a key does not exist, `apply_overrides` raises `AttributeError`. If the value cannot be coerced, it raises `ValueError`.
@@ -991,13 +1016,14 @@ Derived: `step_dt = decimation × dt = 0.04 s`, `max_episode_steps = episode_len
 | `upside_down_threshold` | 0.7 | `projected_gravity_b[2]` above this → upside-down termination (stage 0 only) |
 | `crash_termination` | True | Master switch for collision termination |
 
-### Velocity limit
+### Optional speed limits
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `velocity_limit` | 15.0 m/s | Fixed per-env speed cap when not randomizing |
-| `randomize_velocity_limit` | False | Re-sample cap each episode from range |
-| `velocity_limit_range` | (8.0, 15.0) | Uniform sampling range when randomizing |
+| `speed_limits.enabled` | False | Add paired observations, penalties, and curriculum-latched randomization |
+| `speed_limits.linear_range` | (0.0, 0.0) m/s | Disabled default; set a positive range when enabling |
+| `speed_limits.angular_range` | (0.0, 0.0) rad/s | Disabled default; set a positive range when enabling |
+| `adaptive_curriculum_enabled` | False | Enable shared reward/noise/dynamics progression outside competition |
 
 ### Spawn
 

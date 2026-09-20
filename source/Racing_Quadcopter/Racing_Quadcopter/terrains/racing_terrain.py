@@ -10,8 +10,13 @@ from __future__ import annotations
 from isaaclab.terrains import TerrainGeneratorCfg
 
 from .racing_gates_cfg import GateSpec, MeshFixedGatesTerrainCfg, MeshRacingGatesTerrainCfg
+from .track_io import load_gates_from_yaml
 
-__all__ = ["create_fixed_track_terrain", "create_racing_gates_terrain"]
+__all__ = [
+    "create_fixed_track_terrain",
+    "create_multi_track_terrain",
+    "create_racing_gates_terrain",
+]
 
 
 def create_racing_gates_terrain(seed: int = 42) -> TerrainGeneratorCfg:
@@ -102,10 +107,10 @@ def create_fixed_track_terrain(
 
         terrain = create_fixed_track_terrain(
             gates=[
-                GateSpec(position=(7.5, 4.0, 1.5), yaw_deg=0),
-                GateSpec(position=(11.0, 7.5, 2.0), yaw_deg=90),
-                GateSpec(position=(7.5, 11.0, 1.5), yaw_deg=180),
-                GateSpec(position=(4.0, 7.5, 2.0), yaw_deg=270),
+                GateSpec(position=[7.5, 4.0, 1.5], rotation=[0.0, 0.0, 0.0]),
+                GateSpec(position=[11.0, 7.5, 2.0], rotation=[0.0, 0.0, 90.0]),
+                GateSpec(position=[7.5, 11.0, 1.5], rotation=[0.0, 0.0, 180.0]),
+                GateSpec(position=[4.0, 7.5, 2.0], rotation=[0.0, 0.0, 270.0]),
             ],
             gate_size=0.8,
         )
@@ -147,4 +152,75 @@ def create_fixed_track_terrain(
                 gate_color=gate_color,
             ),
         },
+    )
+
+
+def create_multi_track_terrain(
+    track_yaml_paths: list[str],
+    *,
+    gate_size: float = 0.8,
+    bar_thickness: float = 0.05,
+    gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0),
+    terrain_size: tuple[float, float] = (15.0, 15.0),
+    border_width: float = 0.5,
+    seed: int = 42,
+) -> TerrainGeneratorCfg:
+    """Return a TerrainGeneratorCfg laying out ``N = len(track_yaml_paths)`` fixed
+    circuits one per column, using IsaacLab's curriculum layout so the per-column
+    assignment is deterministic.
+
+    With ``curriculum=True``, ``num_rows=1`` and N columns each holding a different
+    sub-terrain (proportion ``1/N``), TerrainGenerator builds column ``j`` from
+    ``track_yaml_paths[j]``. ``TerrainImporter`` then evenly partitions ``num_envs``
+    across columns (``floor(env_id / (num_envs / N))``), so all envs in the same
+    column share the same fixed track.
+
+    The collapsed ``difficulty_range=(0.5, 0.5)`` removes the per-cell η perturbation
+    (``fixed_gates_terrain`` ignores difficulty anyway, but keeping the range tight
+    avoids accidental noise if other parameters ever start to depend on it).
+
+    Args:
+        track_yaml_paths: paths to per-column track YAMLs (length = N).
+        gate_size:        square aperture side length in metres.
+        bar_thickness:    gate bar diameter in metres (visual only).
+        gate_color:       RGB in 0–1 range.
+        terrain_size:     (width, height) of each terrain cell in metres.
+        border_width:     border kept collision-free around each cell edge.
+        seed:             base seed (TerrainGenerator differentiates per cell).
+
+    Returns:
+        ``TerrainGeneratorCfg`` ready to pass to ``TerrainImporterCfg``.
+    """
+    if not track_yaml_paths:
+        raise ValueError("track_yaml_paths must not be empty.")
+
+    n = len(track_yaml_paths)
+    proportion = 1.0 / n
+    sub_terrains: dict[str, MeshFixedGatesTerrainCfg] = {}
+    for i, yaml_path in enumerate(track_yaml_paths):
+        gates = load_gates_from_yaml(yaml_path)
+        # seed must differ per cfg so the gate registry key (difficulty, seed)
+        # is unique even before TerrainGenerator's per-cell seed differentiation.
+        sub_terrains[f"course_{i:03d}"] = MeshFixedGatesTerrainCfg(
+            proportion=proportion,
+            seed=seed + i,
+            gates=gates,
+            gate_size=gate_size,
+            bar_thickness=bar_thickness,
+            gate_color=gate_color,
+        )
+
+    return TerrainGeneratorCfg(
+        seed=seed,
+        size=terrain_size,
+        difficulty_range=(0.5, 0.5),  # collapsed; fixed_gates_terrain ignores it anyway
+        border_width=border_width,
+        num_rows=1,
+        num_cols=n,
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        use_cache=False,
+        curriculum=True,
+        sub_terrains=sub_terrains,
     )

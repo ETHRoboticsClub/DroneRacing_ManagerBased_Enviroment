@@ -1,0 +1,38 @@
+# Drones in this column spawn via _apply_recovery_override: random attitude and
+# random linear velocity (2–6 m/s) plus random angular velocity (±3 rad/s).
+#
+# Coordinates are terrain-centre-relative (0, 0 = centre of the 15×15 m cell).
+# rotation: [roll, pitch, yaw] in degrees.
+
+gate_track:
+  # 0 – start gate: low, heading north (+Y)
+  - position: [7.5, 2.5, 1.5]
+    rotation: [0, 0, 0]
+
+  # 1 – climbing right-hand sweep
+  - position: [11.5, 5.5, 3.0]
+    rotation: [0, 0, 60]
+
+  # 2 – apex: high right corner
+  - position: [12.5, 10.0, 4.5]
+    rotation: [0, 0, 90]
+
+  # 3 – high back-straight, turning left
+  - position: [9.5, 12.5, 4.0]
+    rotation: [0, 0, 150]
+
+  # 4 – Split-S entry: high gate heading south
+  - position: [5.5, 12.5, 4.2]
+    rotation: [0, 0, 180]
+
+  # 5 – Split-S exit: low gate heading north (≈2.7 m altitude drop over ~4 m)
+  - position: [5.5, 10.5, 1.5]
+    rotation: [0, 0, 0]
+
+  # 6 – chicane left: snap to the west side
+  - position: [2.5, 7.5, 2.5]
+    rotation: [0, 0, 270]
+
+  # 7 – final return arc back to start
+  - position: [4.5, 3.5, 2.0]
+    rotation: [0, 0, 320]

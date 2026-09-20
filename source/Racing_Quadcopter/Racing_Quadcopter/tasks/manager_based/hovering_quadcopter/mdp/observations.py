@@ -45,6 +45,17 @@ def base_lin_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     return env.scene[asset_cfg.name].data.root_lin_vel_b
 
 
+def mocap_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Filtered body-frame velocity estimated from consecutive mocap poses.
+
+    Returning zero columns cleanly removes this term from both actor and
+    critic vectors without mutating shared observation configuration objects.
+    """
+    if not env.cfg.mocap_velocity_obs_enabled:
+        return torch.empty((env.num_envs, 0), device=env.device)
+    return env._mocap_lin_vel_b
+
+
 def next_waypoints_rel_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Relative positions of the next two waypoints in body frame. Shape [N, 6].
 
