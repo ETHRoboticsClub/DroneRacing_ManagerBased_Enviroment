@@ -147,18 +147,34 @@ def penalty_wrong_side(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def penalty_perception(
-    env: ManagerBasedRLEnv, theta_threshold: float = math.pi / 6.0
+    env: ManagerBasedRLEnv,
+    theta_threshold: float = math.radians(15.0),
+    max_penalty: float = 10.0,
 ) -> torch.Tensor:
-    """The perception penalty encourages the drone to keep the next gate within the forward-facing
-       camera's view:
+    """Perception penalty: keep the next gate inside the FPV camera frustum, with a steep ramp
+    once the line-of-sight angle approaches/leaves the field of view.
+
+    Shape: ``max(0, tan(θ) − tan(threshold))``, clamped to ``max_penalty``. The tangent form is
+    the natural pinhole projection — it equals the normalized pixel offset of the gate from the
+    image center, so the penalty is "how far off-screen the gate is" in image-plane units.
+    Compared with a linear-in-θ form, it ramps far faster as θ exceeds the threshold and
+    diverges as the gate goes lateral (θ → 90°), driving tight optical-axis alignment.
+
+    Default ``theta_threshold = 15°`` is well inside the camera's horizontal half-FOV
+    (≈32° for focal=2.0, aperture=2.5) so the penalty starts pushing before the gate
+    actually leaves the frame.
+
+    Uses the ``camera_keypoint`` body's own world pose (position AND orientation), so the
+    camera's URDF-defined tilt relative to ``base_link`` is respected. The optical axis is the
+    camera-frame ``+X``; rotating it by the keypoint's world quaternion yields the true
+    line-of-sight in world frame.
     """
     gate_pos = env._curr_gate_pos  # [N, 3]
     kp_idx: int = env._camera_keypoint_body_idx
-    root_quat = env._robot.data.root_quat_w
 
     anchor_pos = env._robot.data.body_pos_w[:, kp_idx]
+    cam_quat = env._robot.data.body_quat_w[:, kp_idx]
     cam_axis = env._x_local.expand(env.num_envs, -1)
-    cam_quat = root_quat
 
     to_gate = gate_pos - anchor_pos
     dist = torch.norm(to_gate, dim=1)
@@ -170,9 +186,14 @@ def penalty_perception(
     cos_theta = torch.sum(cam_forward_norm * to_gate_norm, dim=1).clamp(-1.0, 1.0)
     theta = torch.acos(cos_theta)
 
+    # Clamp below 90° before applying tan: gate behind the camera (θ > 90°) saturates
+    # to the ceiling rather than wrapping through tan's discontinuity.
+    theta_safe = theta.clamp(max=math.pi / 2 - 1e-3)
+    tan_thresh = math.tan(theta_threshold)
+    penalty = (torch.tan(theta_safe) - tan_thresh).clamp(min=0.0, max=max_penalty)
+
     active = env._on_approach_gate_side & (dist > 0.1)
-    penalty = theta * active.float()
-    return torch.where(theta > theta_threshold, penalty, torch.zeros_like(theta))
+    return penalty * active.float()
 
 def penalty_action_rate_thresh(
     env: ManagerBasedRLEnv, delta_omega_norm_thresh: float = 0.05

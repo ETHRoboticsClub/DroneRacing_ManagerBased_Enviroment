@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
@@ -382,9 +384,25 @@ def _apply_fixed_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -
     Envs that share the same terrain cell get unique positions so they don't
     stack on top of each other. Lanes are 0.6 m wide; rows are 0.6 m deep,
     starting 2 m behind the gate.
+
+    Race-scenario hook: when ``env.cfg.opponent_spawn_gate_idx`` is set (an int
+    in [0, gate_count-1]), env_id == 1 (the "opponent") spawns at that gate
+    index instead of gate 0 — giving it a head start along the track. env_0
+    remains the main drone, always starting at gate 0.
     """
     n = len(env_ids)
     spawn_idx = torch.zeros(n, dtype=torch.long, device=env.device)
+
+    opp_offset = getattr(env.cfg, "opponent_spawn_gate_idx", None)
+    if opp_offset is not None:
+        opp_mask = env_ids == 1
+        if opp_mask.any():
+            opp_local_idx = opp_mask.nonzero(as_tuple=False).squeeze(-1)
+            gc_opp = env._gate_counts[env_ids[opp_local_idx]].clamp(min=1)
+            spawn_idx[opp_local_idx] = torch.minimum(
+                torch.full_like(gc_opp, int(opp_offset)),
+                gc_opp - 1,
+            )
 
     idx_pos = spawn_idx.view(n, 1, 1).expand(n, 1, 3)
     gate_pos = env._gate_positions[env_ids].gather(1, idx_pos).squeeze(1)  # [N, 3]
@@ -411,7 +429,19 @@ def _apply_fixed_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -
     start_pos[:, 2] = gate_pos[:, 2]
     root_vel = torch.zeros(n, 6, device=env.device)
 
-    _write_spawn_state(env, env_ids, start_pos, gate_ori, root_vel)
+    # Deterministic eval pose: aim the camera optical axis at gate 0 (no random noise).
+    # Same geometry as the uniform spawn — see _apply_uniform_initialization for the
+    # derivation. With lane lateral offsets, yaw is no longer just along the gate's
+    # forward axis; computing it from the actual spawn→gate vector keeps every lane on-axis.
+    CAM_TILT = math.radians(30.0)
+    to_gate = gate_pos - start_pos
+    d_horiz = torch.linalg.norm(to_gate[:, :2], dim=1).clamp(min=1e-3)
+    yaw   = torch.atan2(to_gate[:, 1], to_gate[:, 0])
+    pitch = (CAM_TILT - torch.atan2(to_gate[:, 2], d_horiz)).clamp(-math.pi / 3.0, math.pi / 3.0)
+    roll  = torch.zeros(n, device=env.device)
+    start_quat = _quat_from_euler_xyz(roll, pitch, yaw)
+
+    _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel)
 
 
 def _apply_ground_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
@@ -464,11 +494,28 @@ def _apply_uniform_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor)
     # Never go below ground. Clamp above min_height (0.2 m) to avoid instant termination.
     start_pos[:, 2] = start_pos[:, 2].clamp(min=0.3)
 
-    # Roll/pitch within ±20° (±π/9), full random yaw.
-    # Random orientation prevents the agent from exploiting a fixed spawn heading.
-    roll  = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
-    pitch = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
-    yaw   = -torch.pi + torch.rand(n, device=env.device) * (2.0 * torch.pi)
+    # Aim the camera optical axis at the next gate, then sprinkle ±20° noise on each Euler angle.
+    # Geometry: camera_keypoint is rotated -30° about Y wrt base_link (URDF), so the
+    # camera's body-frame forward is R_y(-30°)·[1,0,0] = (cos30°, 0, sin30°) — 30° above
+    # body +X. Drone Euler is R_world_body = R_z(yaw) R_y(pitch) R_x(roll). With roll=0,
+    # the camera-world direction in the (x,z) pitch-plane lies at elevation (CAM_TILT − pitch).
+    # To make that match the elevation-to-gate, set:    pitch = CAM_TILT − elevation_to_gate.
+    # Yaw is set so the body-forward horizontal projection points at the gate.
+    CAM_TILT = math.radians(30.0)
+    to_gate = gate_pos - start_pos                                        # [N, 3]
+    d_horiz = torch.linalg.norm(to_gate[:, :2], dim=1).clamp(min=1e-3)    # [N]
+    yaw_to_gate       = torch.atan2(to_gate[:, 1], to_gate[:, 0])         # [N]
+    elevation_to_gate = torch.atan2(to_gate[:, 2], d_horiz)               # [N]
+    desired_pitch     = (CAM_TILT - elevation_to_gate).clamp(-math.pi / 3.0, math.pi / 3.0)
+
+    # Wider noise here trains robustness to mid-flight misalignment encountered later in
+    # episodes — too tight a cone caused the policy to overfit to near-aligned starts.
+    yaw_half   = math.pi / 3.0   # ±60° around gate direction
+    pitch_half = math.pi / 4.0   # ±45° around camera-aimed pitch
+    roll_half  = math.pi / 4.0   # ±45° roll
+    roll  = (2.0 * torch.rand(n, device=env.device) - 1.0) * roll_half
+    pitch = desired_pitch + (2.0 * torch.rand(n, device=env.device) - 1.0) * pitch_half
+    yaw   = yaw_to_gate   + (2.0 * torch.rand(n, device=env.device) - 1.0) * yaw_half
     start_quat = _quat_from_euler_xyz(roll, pitch, yaw)
 
     # Small random initial velocity and angular rate to improve robustness to

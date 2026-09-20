@@ -21,7 +21,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import CameraCfg, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils.noise import GaussianNoiseCfg
@@ -285,6 +285,11 @@ class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
         track_air_time=False,
     )
 
+    # FPV camera (opt-in). Populated in RacingQuadcopterEnvCfg.__post_init__ when
+    # `enable_fpv_camera=True`. Default off — rendering a per-env camera is expensive
+    # and not needed for blind-state training.
+    fpv_camera: CameraCfg | None = None
+
     dome_light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)),
@@ -485,7 +490,6 @@ class RewardsCfg:
     # curriculum stage to avoid hindering early learning).
     # wrong_direction = RewTerm(func=rewards.penalty_wrong_direction, weight=RewardWeights.WRONG_DIRECTION)
 
-    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
     perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
 
 
@@ -640,6 +644,8 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     max_velocity: float = 50.0
     collision_force_threshold: float = 0.001
 
+    enable_fpv_camera: bool = False
+
     eval_mode: bool = False
     crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
     force_collision_termination: bool = False  # skip the per-env competence curriculum and terminate on any collision
@@ -659,6 +665,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     draw_trajectory: bool = False        # green closed-loop polyline through all waypoints (USD, no collision)
     draw_gate_indicators: bool = False   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
     draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
+    draw_camera_arrow: bool = False     # yellow arrow above each drone showing its camera's true world-frame forward axis (per-step USD update — visualisation only)
 
     # Demo mode: dark scene + OmniPBR emissive glow on all vis prims and drones (RTX only).
     demo_mode: bool = False
@@ -715,6 +722,35 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
         # enabled so Isaac Lab does not discard those term configurations.
         self.observations.policy.enable_corruption = True
 
+    def _maybe_attach_fpv_camera(self) -> None:
+        """Spawn the FPV camera only if `enable_fpv_camera` is True. Called from __post_init__.
+
+        Mount uses the Anemos `camera_keypoint` body — the URDF fixed joint already encodes
+        the FPV pose (+X optical axis, -30° pitch about Y). Identity offset with
+        convention="world" (forward=+X, up=+Z) keeps the URDF as the single source of truth.
+        Only valid for Anemos profiles (crazyflie has no such link).
+        """
+        if not self.enable_fpv_camera:
+            return
+        self.scene.fpv_camera = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/camera_keypoint/fpv_camera",
+            update_period=1 / 30,
+            height=int(getattr(self, "fpv_camera_height", 1080)),
+            width=int(getattr(self, "fpv_camera_width", 1920)),
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=2.0,
+                focus_distance=400.0,
+                horizontal_aperture=2.5,
+                clipping_range=(0.01, 1000.0),
+            ),
+            offset=CameraCfg.OffsetCfg(
+                pos=(0.0, 0.0, 0.0),
+                rot=(1.0, 0.0, 0.0, 0.0),
+                convention="world",
+            ),
+        )
+
     def __post_init__(self) -> None:
         terrain_generator = create_racing_gates_terrain(self.seed)
         self.scene.terrain = TerrainImporterCfg(
@@ -729,10 +765,11 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
                 static_friction=1.0,
                 dynamic_friction=1.0,
             ),
-            debug_vis=True,
+            debug_vis=False,
         )
         self.sim.render_interval = self.decimation
         self._apply_dr_flags()
+        self._maybe_attach_fpv_camera()
 
 
 @configclass
@@ -807,10 +844,11 @@ class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
                 static_friction=1.0,
                 dynamic_friction=1.0,
             ),
-            debug_vis=True,
+            debug_vis=False,
         )
         self.sim.render_interval = self.decimation
         self._apply_dr_flags()
+        self._maybe_attach_fpv_camera()
 
 
 @configclass
@@ -823,4 +861,231 @@ class RacingQuadcopterEnvCfg_FIXED_PLAY(RacingQuadcopterEnvCfg_FIXED):
         self.eval_mode = True
         self.fixed_spawn = True
         self.stats_warmup_s = 30.0
+        self.draw_camera_arrow = True
         print("[INFO] Fixed-track evaluation mode is ON.")
+
+
+@configclass
+class RacingQuadcopterEnvCfg_FIXED_PLAY_FPV(RacingQuadcopterEnvCfg_FIXED_PLAY):
+    """Single-drone fixed-track evaluation with an FPV camera attached.
+
+    Identical behaviour to ``RacingQuadcopterEnvCfg_FIXED_PLAY`` (eval mode,
+    fixed spawn at gate 0, no randomisation) but:
+
+    - ``num_envs = 1``: only one drone in the world. Required because the FPV
+      ``CameraCfg`` is cloned per env via ``{ENV_REGEX_NS}``; rendering a
+      camera for each of 1024 envs would tank performance, and bypassing the
+      regex (single literal path) breaks the scene's sensor-reset loop, which
+      assumes one sensor instance per env.
+    - **1×1 terrain grid**: a single 15×15 m circuit instead of 4×4=16
+      copies. Same fixed gates as the parent.
+    - ``enable_fpv_camera = True``: spawns the camera under the drone's
+      ``camera_keypoint`` body. Launch with ``--enable_cameras``.
+
+    View the FPV feed in the Isaac Sim viewport's camera dropdown:
+    ``/World/envs/env_0/Robot/camera_keypoint/fpv_camera``.
+
+    Race-scenario knobs (env_0 = "main" drone, env_1 = "opponent"):
+
+    - ``opponent_spawn_gate_idx``: opponent spawns at this gate index instead
+      of 0, giving it a head start along the track. Clamped to gate_count - 1.
+    - ``draw_target_gate_highlight``: glowing outline overlaid on env_0's
+      next gate; tracks ``_current_gate_idx`` and re-authors on gate changes.
+    """
+
+    # Race-scenario knobs. Overridable via Hydra / CLI on this task only.
+    # Palette: mostly-black + dark-purple sky, white pillars, light-blue main, purple opponent,
+    # flickering purple↔white target gate.
+    draw_target_gate_highlight: bool = True
+    target_gate_highlight_color: tuple[float, float, float] = (0.75, 0.15, 1.0)  # deeper purple
+    target_gate_highlight_emissive: float = 180.0
+    target_gate_highlight_width: float = 0.10                                    # thinner
+    # Flicker stays in the purple family — alt color is pale lavender, not pure white.
+    target_gate_flicker_freq_hz: float = 10.0
+    target_gate_flicker_depth: float = 0.7
+    target_gate_flicker_jitter: float = 0.3
+    target_gate_flicker_alt_color: tuple[float, float, float] = (0.85, 0.55, 1.0)  # pale purple
+    opponent_spawn_gate_idx: int | None = 1
+
+    # Drone glow markers — pulled back so they no longer wash surroundings to white.
+    main_glow_color: tuple[float, float, float] | None = (0.3, 0.7, 1.0)        # light blue
+    main_glow_radius: float = 0.0                                                # ignored
+    main_glow_intensity: float = 0.0                                             # ignored
+    main_glow_light_radius: float = 0.03
+    main_glow_light_intensity: float = 2.0e7                                     # ~4× softer
+
+    opponent_glow_color: tuple[float, float, float] | None = (0.75, 0.20, 1.0)   # purple
+    opponent_glow_radius: float = 0.0                                            # ignored
+    opponent_glow_intensity: float = 0.0                                         # ignored
+    opponent_glow_light_radius: float = 0.03
+    opponent_glow_light_intensity: float = 2.0e7                                 # ~4× softer
+
+    # Drone light trails — thinner + much brighter.
+    draw_drone_trails: bool = True
+    main_trail_color: tuple[float, float, float] = (0.3, 0.7, 1.0)        # light blue
+    opponent_trail_color: tuple[float, float, float] = (0.75, 0.20, 1.0)  # purple
+    trail_length: int = 40                                                 # ~1.6 s at 25 Hz
+    trail_width: float = 0.015
+    trail_emissive: float = 320.0                                          # very strong
+
+    # Stadium perimeter pillars — white alternating with light blue (no orange).
+    draw_stadium_pillars: bool = True
+    stadium_pillar_count: int = 12
+    stadium_pillar_ring_radius: float = 9.5
+    stadium_pillar_radius: float = 0.3
+    stadium_pillar_height: float = 10.0
+    stadium_pillar_colors: tuple[tuple[float, float, float], ...] = (
+        (1.0, 1.0, 1.0),    # white
+        (0.3, 0.7, 1.0),    # light blue
+    )
+    stadium_pillar_emissive: float = 120.0
+
+    # Wet reflective ground (neon mirrors off it).
+    draw_wet_ground: bool = True
+    wet_ground_size: float = 80.0
+    wet_ground_color: tuple[float, float, float] = (0.010, 0.010, 0.018)   # near-black cool
+    wet_ground_metallic: float = 0.8
+    wet_ground_roughness: float = 0.15
+
+    # Holographic floor grid.
+    draw_holographic_grid: bool = True
+    holo_grid_size: float = 30.0
+    holo_grid_spacing: float = 1.5
+    holo_grid_width: float = 0.03
+    holo_grid_color: tuple[float, float, float] = (0.3, 0.7, 1.0)          # light blue
+    holo_grid_emissive: float = 55.0
+
+    # Neon walls between pillars — alternating white + light blue.
+    draw_neon_walls: bool = True
+    neon_wall_heights: tuple[float, ...] = (0.6, 2.0, 4.0, 6.0, 8.0, 10.0)
+    neon_wall_colors: tuple[tuple[float, float, float], ...] = (
+        (1.0, 1.0, 1.0),
+        (0.3, 0.7, 1.0),
+        (1.0, 1.0, 1.0),
+        (0.3, 0.7, 1.0),
+        (1.0, 1.0, 1.0),
+        (0.3, 0.7, 1.0),
+    )
+    neon_wall_width: float = 0.06
+    neon_wall_emissive: float = 90.0
+
+    # Hemispherical dome cap above the pillars — alternating white + light blue.
+    draw_dome_cap: bool = True
+    dome_cap_radius: float = 9.5
+    dome_cap_meridians: int = 12
+    dome_cap_latitudes: int = 5
+    dome_cap_segments: int = 18
+    dome_cap_colors: tuple[tuple[float, float, float], ...] = (
+        (1.0, 1.0, 1.0),
+        (0.3, 0.7, 1.0),
+    )
+    dome_cap_width: float = 0.06
+    dome_cap_emissive: float = 100.0
+
+    # Sky accents — purple + light blue + white dots (no orange).
+    draw_sky_accents: bool = True
+    sky_accent_count: int = 220
+    sky_accent_palette: tuple[tuple[float, float, float], ...] = (
+        (0.7, 0.2, 1.0),    # purple
+        (0.45, 0.1, 0.9),   # deeper purple
+        (0.3, 0.7, 1.0),    # light blue
+        (1.0, 1.0, 1.0),    # white
+    )
+    sky_accent_radius_range: tuple[float, float] = (0.04, 0.12)
+    sky_accent_emissive: float = 180.0
+
+    # White outline overlay on every gate.
+    draw_all_gate_outlines: bool = True
+    all_gate_outline_color: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    all_gate_outline_emissive: float = 18.0
+    all_gate_outline_width: float = 0.06
+
+    # Party lights — drone-glow-style SphereLights at random arena positions, each
+    # flickering on/off on its own schedule and periodically swapping colors. Looks
+    # like a chaotic concert/festival light show.
+    draw_party_lights: bool = True
+    party_light_count: int = 28
+    # Radial annulus the lights spawn in — default biases toward the perimeter so the
+    # arena walls/dome are populated instead of just the floor.
+    party_light_plan_radius_range: tuple[float, float] = (3.0, 9.4)
+    party_light_height_range: tuple[float, float] = (1.5, 14.0)
+    party_light_palette: tuple[tuple[float, float, float], ...] = (
+        (1.0, 0.3, 0.0),    # orange
+        (0.3, 0.7, 1.0),    # light blue
+        (0.75, 0.20, 1.0),  # purple
+        (1.0, 1.0, 1.0),    # white
+        (0.0, 1.0, 0.5),    # mint
+        (1.0, 0.1, 0.6),    # hot pink
+    )
+    party_light_body_radius: float = 0.04
+    party_light_base_intensity: float = 2.0e7        # ~4× softer than before — no washout
+    party_light_freq_range: tuple[float, float] = (0.4, 2.2)             # Hz
+    party_light_sharpness_range: tuple[float, float] = (1.5, 4.0)        # higher = sharper on/off
+    party_light_color_change_period_range: tuple[float, float] = (2.5, 8.0)  # seconds
+    party_light_seed: int = 42
+
+    # FPV camera resolution (set on the CameraCfg; affects render cost).
+    fpv_camera_width: int = 1920
+    fpv_camera_height: int = 1080
+
+    # Automatic FPV video recording (env_0 camera → MP4). Encoded with imageio +
+    # libx264 at CRF 14 (visually lossless). Frames are pulled in step() after the
+    # camera is updated.
+    record_fpv_video: bool = True
+    video_output_dir: str = "logs/fpv_videos"
+    video_filename: str = ""                       # empty → auto-generated timestamp
+    video_fps: int = 0                             # 0 → auto = 1/step_dt → playback matches real-time
+    video_length_s: float = 30.0
+    video_crf: int = 14                            # x264 CRF: lower = higher quality
+
+    # Cyberpunk atmosphere: mostly black sky tinted dark purple, purple fog.
+    enable_cyberpunk_atmosphere: bool = True
+    cyber_fog_color: tuple[float, float, float] = (0.05, 0.01, 0.12)       # dark purple
+    cyber_fog_intensity: float = 1.0
+    cyber_fog_start: float = 2.0
+    cyber_fog_end: float = 90.0
+    cyber_fog_density: float = 0.022
+    cyber_chromatic_strength: float = 0.005
+    cyber_dome_intensity: float = 25.0                                     # very dim (mostly black sky)
+    cyber_dome_color: tuple[float, float, float] = (0.06, 0.02, 0.12)      # dark purple
+
+    def __post_init__(self) -> None:
+        # Must be set before super(), since super().__post_init__ attaches the camera.
+        self.enable_fpv_camera = True
+        super().__post_init__()
+        # Override the 1024-env grid set by parent.
+        self.scene.num_envs = 2
+        # Rebuild the terrain as a single 1×1 cell instead of 4×4.
+        track_path = _os.environ.get(TRACK_YAML_ENV_VAR, self.gate_track_yaml)
+        gates = _load_gates_from_yaml(track_path)
+        terrain_generator = create_fixed_track_terrain(
+            gates, seed=self.seed, num_rows=1, num_cols=1
+        )
+        self.scene.terrain = TerrainImporterCfg(
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=terrain_generator,
+            max_init_terrain_level=0,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            debug_vis=False,
+        )
+
+        self.draw_camera_arrow = False
+        self.draw_trajectory = False
+        self.draw_gate_indicators = False
+        self.draw_gate_labels = False
+
+        # Race mode: drones loop the circuit until they crash. Disable lap-complete
+        # termination (it fires after one lap in eval mode) and push the episode
+        # length far enough out that the timeout never triggers in practice.
+        self.terminations.lap_complete = None
+        self.terminations.time_out = None
+        self.episode_length_s = 1.0e6
+
+        print("[INFO] FPV race evaluation mode is ON (main=env_0, opponent=env_1).")
