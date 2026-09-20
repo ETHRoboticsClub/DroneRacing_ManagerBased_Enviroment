@@ -532,6 +532,18 @@ class EventsCfg:
             "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
         },
     )
+    # Must stay after randomize_robot_mass: that term uses recompute_inertia=True,
+    # which would overwrite any inertia scaling applied before it.
+    randomize_robot_inertia = EventTerm(
+        func=events.randomize_rigid_body_inertia,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
+            "inertia_distribution_params": (0.8, 1.2),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
     randomize_robot_actuator_gains = EventTerm(
         func=events.randomize_actuator_gains,
         mode="startup",
@@ -673,6 +685,7 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     # enable the corresponding perturbation.
     randomize_mass: bool = False              # startup: scale robot mass ±10 %
     randomize_com: bool = False               # startup: shift CoM ±15 mm per axis
+    randomize_inertia: bool = False           # startup: scale principal inertias ±20 %
     randomize_actuator_gains: bool = False    # startup: scale stiffness/damping ±10 %
     apply_external_disturbances: bool = False # interval: random force/torque + velocity push
     observation_noise_enable: bool = False    # per-step obs Gaussian noise + per-episode bias
@@ -729,6 +742,8 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             self.events.randomize_robot_mass = None
         if not self.randomize_com:
             self.events.randomize_base_com = None
+        if not self.randomize_inertia:
+            self.events.randomize_robot_inertia = None
         if not self.randomize_actuator_gains:
             self.events.randomize_robot_actuator_gains = None
         if not self.apply_external_disturbances:
