@@ -1,30 +1,21 @@
 
-TASK=Isaac-Racing-Quadcopter-Manager-v0
+TASK=Isaac-Hovering-Quadcopter-Manager-RNN-v0
+DRONE_MODEL=anemos_urdf
+
+RL_LIBRARY=rsl_rl
+
+HEADLESS=1
 
 NUM_ENVS=4096
 
-VIDEO_LENGTH=400
-VIDEO_INTERVAL=3000
+VIDEO=1
+VIDEO_LENGTH=1000
+VIDEO_INTERVAL=4000
 
 
-# check if --headless is in the arguments
-if [[ "$@" == *"--headless"* ]]; then
-    HEADLESS="--headless"
-else
-    HEADLESS=""
-fi
-
-# check if --video is in the arguments
-if [[ "$@" == *"--video"* ]]; then
-    VIDEO="--video"
-else
-    VIDEO=""
-fi
-
-python scripts/skrl/train.py \
+DRONE_MODEL=$DRONE_MODEL python scripts/$RL_LIBRARY/train.py \
     --task $TASK \
     --num_envs $NUM_ENVS \
-    $HEADLESS \
-    $VIDEO \
-    --video_length $VIDEO_LENGTH \
-    --video_interval $VIDEO_INTERVAL
+    $([ $HEADLESS -eq 1 ] && echo "--headless") \
+    $([ $VIDEO -eq 1 ] && echo "--video --video_length ${VIDEO_LENGTH} --video_interval ${VIDEO_INTERVAL}") \
+    $@

@@ -1,6 +1,5 @@
 # DO NOT TOUCH THIS FILE
 # This config is used for regression testing
-# Required scores: Lap% >= 98% and Lap Time <= 11s
 
 task_train: Isaac-Racing-Quadcopter-Manager-v0
 task_play:  Isaac-Racing-Quadcopter-Manager-Play-v0
@@ -14,7 +13,7 @@ env_vars:
 
 sweep_mode: sequential
 
-num_envs: 1024
+num_envs: 4096
 
 train_iterations: 834  # 20016 steps
 eval_steps: 3000

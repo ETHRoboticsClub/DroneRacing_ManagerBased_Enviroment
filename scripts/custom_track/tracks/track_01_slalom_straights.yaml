@@ -1,0 +1,68 @@
+schema_version: 1
+track_name: Slalom Straights
+description: Tests simple gates (straight fly-through) and gate slalom (left-right
+  weave). Circuit layout with straight approach, slalom section, and return loop.
+elements_tested:
+- simple_gate
+- slalom
+- 180_turn
+gate_size: 0.7
+bar_thickness: 0.05
+loop_closed: true
+gate_track:
+- position: [-23.71, -3.86, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G1: Start/Finish - simple gate heading +X'
+- position: [-17.71, -3.86, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G2: Straight approach'
+- position: [-11.71, -3.86, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G3: Straight approach end'
+- position: [-5.71, -0.36, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G4: Slalom right offset'
+- position: [0.29, -7.36, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G5: Slalom left offset'
+- position: [6.29, -0.36, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G6: Slalom right offset'
+- position: [12.29, -7.36, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G7: Slalom left offset'
+- position: [18.29, -3.86, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G8: Slalom exit - straight'
+- position: [22.29, 2.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G9: 180-turn entry (right sweep)'
+- position: [18.29, 8.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G10: 180-turn apex'
+- position: [12.29, 6.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G11: 180-turn exit heading back -X'
+- position: [0.29, 6.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G12: Return straight'
+- position: [-11.71, 6.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G13: Return straight'
+- position: [-19.71, 2.14, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G14: Final turn back toward start'

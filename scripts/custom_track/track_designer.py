@@ -10,8 +10,8 @@ Run::
     python scripts/custom_track/track_designer.py             # blank track
     python scripts/custom_track/track_designer.py track.json  # open existing
 
-Conventions are documented in ``track_io`` — yaw is in **radians on disk**
-and **degrees in the UI**.  Gates are upright (rotation about world +Z only).
+Conventions are documented in ``track_io`` — angles are in **degrees** both
+on disk and in the UI.  Roll/pitch/yaw follow extrinsic XYZ (ROS RPY) order.
 """
 from __future__ import annotations
 
@@ -90,6 +90,7 @@ class TopDownCanvas(FigureCanvas):
 
     def set_track(self, track: dict) -> None:
         self._track = track
+        self._sync_lists()
         self._selected = None
         self.redraw()
         self.selection_changed.emit(None)
@@ -112,15 +113,16 @@ class TopDownCanvas(FigureCanvas):
         return self._selected
 
     def select(self, idx: int | None) -> None:
-        if idx is not None and (idx < 0 or idx >= len(self._track["gates"])):
+        if idx is not None and (idx < 0 or idx >= len(self._track["gate_track"])):
             idx = None
         self._selected = idx
         self.redraw()
         self.selection_changed.emit(idx)
 
     def update_gate(self, idx: int, **kwargs) -> None:
-        if 0 <= idx < len(self._track["gates"]):
-            self._track["gates"][idx].update(kwargs)
+        if 0 <= idx < len(self._track["gate_track"]):
+            self._track["gate_track"][idx].update(kwargs)
+            self._sync_lists()
             self.redraw()
             self.gates_changed.emit()
 
@@ -130,13 +132,15 @@ class TopDownCanvas(FigureCanvas):
         self.gates_changed.emit()
 
     def auto_yaw_all(self) -> None:
-        for g in self._track["gates"]:
+        for g in self._track["gate_track"]:
             g["auto_yaw"] = True
         self.redraw()
         self.gates_changed.emit()
 
     def clear(self) -> None:
-        self._track["gates"].clear()
+        self._track["gate_track"].clear()
+        self._track["positions"].clear()
+        self._track["orientations"].clear()
         self._selected = None
         self.redraw()
         self.selection_changed.emit(None)
@@ -146,7 +150,7 @@ class TopDownCanvas(FigureCanvas):
         self._delete(idx)
 
     def reorder(self, idx: int, direction: str) -> None:
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if direction == "up" and idx > 0:
             gates[idx - 1], gates[idx] = gates[idx], gates[idx - 1]
             self.select(idx - 1)
@@ -155,6 +159,7 @@ class TopDownCanvas(FigureCanvas):
             self.select(idx + 1)
         else:
             return
+        self._sync_lists()
         self.gates_changed.emit()
 
     # ----- mouse events --------------------------------------------------
@@ -200,9 +205,10 @@ class TopDownCanvas(FigureCanvas):
         self.mouse_moved.emit(x, y)
         if self._dragging and self._selected is not None:
             x, y = self._snap_to_grid(x, y)
-            g = self._track["gates"][self._selected]
-            g["x"] = x
-            g["y"] = y
+            g = self._track["gate_track"][self._selected]
+            g["position"][0] = x
+            g["position"][1] = y
+            self._sync_lists()
             self.redraw()
             self.gates_changed.emit()
 
@@ -210,6 +216,12 @@ class TopDownCanvas(FigureCanvas):
         self._dragging = False
 
     # ----- helpers -------------------------------------------------------
+    def _sync_lists(self) -> None:
+        """Keep track['positions'] and track['orientations'] in sync with gate_track."""
+        gates = self._track["gate_track"]
+        self._track["positions"]    = [g["position"] for g in gates]
+        self._track["orientations"] = [g["rotation"]  for g in gates]
+
     def _snap_to_grid(self, x: float, y: float) -> tuple[float, float]:
         if self._snap > 0.0:
             x = round(x / self._snap) * self._snap
@@ -217,11 +229,11 @@ class TopDownCanvas(FigureCanvas):
         return float(x), float(y)
 
     def _hit_test(self, x: float, y: float) -> int | None:
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if not gates:
             return None
-        cx = np.array([g["x"] for g in gates])
-        cy = np.array([g["y"] for g in gates])
+        cx = np.array([g["position"][0] for g in gates])
+        cy = np.array([g["position"][1] for g in gates])
         d = np.hypot(cx - x, cy - y)
         # Hit radius: half a gate plus pad. In data units, so it's slightly
         # zoom-dependent in feel, which is acceptable.
@@ -234,24 +246,21 @@ class TopDownCanvas(FigureCanvas):
         # New gates inherit z from last selection's z if there is one — keeps
         # successive clicks at the same height by default.
         z = self._default_z
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if self._selected is not None and 0 <= self._selected < len(gates):
-            z = float(gates[self._selected]["z"])
+            z = float(gates[self._selected]["position"][2])
         gate = {
-            "x": float(x),
-            "y": float(y),
-            "z": float(z),
-            "yaw":   0.0,
-            "pitch": 0.0,
-            "roll":  0.0,
+            "position": [float(x), float(y), float(z)],
+            "rotation": [0.0, 0.0, 0.0],
             "auto_yaw": True,
         }
         gates.append(gate)
+        self._sync_lists()
         self.select(len(gates) - 1)
         self.gates_changed.emit()
 
     def _delete(self, idx: int) -> None:
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if not (0 <= idx < len(gates)):
             return
         del gates[idx]
@@ -278,12 +287,12 @@ class TopDownCanvas(FigureCanvas):
         ax.axhline(0.0, color="0.7", lw=0.5)
         ax.axvline(0.0, color="0.7", lw=0.5)
 
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if not gates:
             self.draw_idle()
             return
 
-        positions = np.array([[g["x"], g["y"], g["z"]] for g in gates])
+        positions = np.array([g["position"] for g in gates])
         closed = bool(self._track.get("loop_closed", True))
         gate_size = float(self._track.get("gate_size", 0.7))
 
@@ -305,23 +314,23 @@ class TopDownCanvas(FigureCanvas):
             _, quats, _ = track_io.track_to_arrays(self._track)
             right_axes, forward_axes, _ = track_io.quat_axes_wxyz(quats)
         except Exception:
-            yaws = np.array([float(g.get("yaw", 0.0)) for g in gates])
-            cy, sy = np.cos(yaws), np.sin(yaws)
+            yaws_deg = np.array([float(g["rotation"][2]) for g in gates])
+            yaws_rad = np.radians(yaws_deg)
+            cy, sy = np.cos(yaws_rad), np.sin(yaws_rad)
             right_axes   = np.stack([cy, sy, np.zeros_like(cy)], axis=1)
             forward_axes = np.stack([-sy, cy, np.zeros_like(cy)], axis=1)
 
         half = gate_size / 2.0
         for i, g in enumerate(gates):
+            px, py = g["position"][0], g["position"][1]
             rx, ry = right_axes[i, 0], right_axes[i, 1]
-            x0, y0 = g["x"] - rx * half, g["y"] - ry * half
-            x1, y1 = g["x"] + rx * half, g["y"] + ry * half
+            x0, y0 = px - rx * half, py - ry * half
+            x1, y1 = px + rx * half, py + ry * half
             color = "#ff6a00" if i == self._selected else "#222222"
             lw = 3.0 if i == self._selected else 1.8
             ax.plot([x0, x1], [y0, y1], color=color, lw=lw, solid_capstyle="round")
 
             # Forward arrow along the horizontal projection of gate +Y.
-            # Skip when the gate is nose-up/nose-down enough to lose XY
-            # projection (the arrow would degenerate to a dot).
             fx, fy = forward_axes[i, 0], forward_axes[i, 1]
             fnorm = float(np.hypot(fx, fy))
             if fnorm > 1e-3:
@@ -329,13 +338,13 @@ class TopDownCanvas(FigureCanvas):
                 arrow_len = max(0.4, gate_size * 0.6)
                 ax.annotate(
                     "",
-                    xy=(g["x"] + fx * arrow_len, g["y"] + fy * arrow_len),
-                    xytext=(g["x"], g["y"]),
+                    xy=(px + fx * arrow_len, py + fy * arrow_len),
+                    xytext=(px, py),
                     arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
                 )
 
             ax.text(
-                g["x"] + 0.15, g["y"] + 0.15, str(i),
+                px + 0.15, py + 0.15, str(i),
                 color=color, fontsize=9, weight="bold",
             )
 
@@ -369,7 +378,7 @@ class PreviewCanvas3D(FigureCanvas):
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
 
-        gates = self._track["gates"]
+        gates = self._track["gate_track"]
         if not gates:
             ax.set_xlim(-5, 5)
             ax.set_ylim(-5, 5)
@@ -377,7 +386,7 @@ class PreviewCanvas3D(FigureCanvas):
             self.draw_idle()
             return
 
-        positions = np.array([[g["x"], g["y"], g["z"]] for g in gates])
+        positions = np.array([g["position"] for g in gates])
         closed = bool(self._track.get("loop_closed", True))
         gate_size = float(self._track.get("gate_size", 0.7))
 
@@ -395,8 +404,9 @@ class PreviewCanvas3D(FigureCanvas):
             _, quats, _ = track_io.track_to_arrays(self._track)
             right_axes, _, up_axes = track_io.quat_axes_wxyz(quats)
         except Exception:
-            yaws = np.array([float(g.get("yaw", 0.0)) for g in gates])
-            cy_, sy_ = np.cos(yaws), np.sin(yaws)
+            yaws_deg = np.array([float(g["rotation"][2]) for g in gates])
+            yaws_rad = np.radians(yaws_deg)
+            cy_, sy_ = np.cos(yaws_rad), np.sin(yaws_rad)
             right_axes = np.stack([cy_, sy_, np.zeros_like(cy_)], axis=1)
             up_axes    = np.tile(np.array([0.0, 0.0, 1.0]), (len(gates), 1))
 
@@ -404,7 +414,7 @@ class PreviewCanvas3D(FigureCanvas):
         for i, g in enumerate(gates):
             right = right_axes[i]
             up    = up_axes[i]
-            centre = np.array([g["x"], g["y"], g["z"]])
+            centre = np.array(g["position"])
             corners = np.stack([
                 centre + half * (-right - up),
                 centre + half * ( right - up),
@@ -554,7 +564,7 @@ class PropertyPanel(QtWidgets.QWidget):
         self._block = False
 
     def _refresh_selected_widgets(self):
-        gates = self._track.get("gates", [])
+        gates = self._track.get("gate_track", [])
         idx = self._selected
         enabled = idx is not None and 0 <= idx < len(gates)
         for w in (self._gx, self._gy, self._gz, self._gyaw,
@@ -563,13 +573,14 @@ class PropertyPanel(QtWidgets.QWidget):
         if not enabled:
             return
         g = gates[idx]
+        rot = g.get("rotation", [0.0, 0.0, 0.0])
         self._block = True
-        self._gx.setValue(float(g["x"]))
-        self._gy.setValue(float(g["y"]))
-        self._gz.setValue(float(g["z"]))
-        self._gyaw.setValue(float(np.degrees(g.get("yaw", 0.0))))
-        self._gpitch.setValue(float(np.degrees(g.get("pitch", 0.0))))
-        self._groll.setValue(float(np.degrees(g.get("roll", 0.0))))
+        self._gx.setValue(float(g["position"][0]))
+        self._gy.setValue(float(g["position"][1]))
+        self._gz.setValue(float(g["position"][2]))
+        self._gyaw.setValue(float(rot[2]))
+        self._gpitch.setValue(float(rot[1]))
+        self._groll.setValue(float(rot[0]))
         self._gauto.setChecked(bool(g.get("auto_yaw", True)))
         # Yaw spinbox is informational while auto-yaw is on; pitch and roll
         # are always user-controlled.
@@ -579,9 +590,10 @@ class PropertyPanel(QtWidgets.QWidget):
     def _refresh_list(self):
         self._block = True
         self._list.clear()
-        for i, g in enumerate(self._track.get("gates", [])):
+        for i, g in enumerate(self._track.get("gate_track", [])):
+            p = g["position"]
             self._list.addItem(
-                f"{i:>3}  ({g['x']:+.2f}, {g['y']:+.2f}, {g['z']:+.2f})"
+                f"{i:>3}  ({p[0]:+.2f}, {p[1]:+.2f}, {p[2]:+.2f})"
             )
         self._block = False
         self._sync_list_selection()
@@ -609,12 +621,12 @@ class PropertyPanel(QtWidgets.QWidget):
             return
         self._gyaw.setEnabled(not self._gauto.isChecked())
         self.gate_changed.emit(self._selected, {
-            "x": self._gx.value(),
-            "y": self._gy.value(),
-            "z": self._gz.value(),
-            "yaw":   float(np.radians(self._gyaw.value())),
-            "pitch": float(np.radians(self._gpitch.value())),
-            "roll":  float(np.radians(self._groll.value())),
+            "position": [self._gx.value(), self._gy.value(), self._gz.value()],
+            "rotation": [
+                float(self._groll.value()),
+                float(self._gpitch.value()),
+                float(self._gyaw.value()),
+            ],
             "auto_yaw": self._gauto.isChecked(),
         })
 
@@ -770,7 +782,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open track", str(self._suggest_dir()),
-            "Track JSON (*.json);;All files (*)",
+            "Track YAML (*.yaml);;All files (*)",
         )
         if path:
             self.open_path(Path(path))
@@ -796,14 +808,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_as(self) -> bool:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save track", str(self._suggest_dir() / "track.json"),
-            "Track JSON (*.json)",
+            self, "Save track", str(self._suggest_dir() / "track.yaml"),
+            "Track YAML (*.yaml)",
         )
         if not path:
             return False
         p = Path(path)
         if p.suffix == "":
-            p = p.with_suffix(".json")
+            p = p.with_suffix(".yaml")
         return self._save_to(p)
 
     def _save_to(self, path: Path) -> bool:
@@ -892,6 +904,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_gate_edit(self, idx: int, fields: dict):
         self.top.update_gate(idx, **fields)
+        self.panel.refresh()
 
     def _on_panel_select(self, idx):
         self.top.select(idx)
@@ -903,7 +916,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.top.reorder(idx, direction)
 
     def _on_mouse(self, x: float, y: float):
-        n = len(self.top.track["gates"])
+        n = len(self.top.track["gate_track"])
         self.statusBar().showMessage(f"x={x:+.2f}  y={y:+.2f}   gates={n}")
 
     def _update_title(self):

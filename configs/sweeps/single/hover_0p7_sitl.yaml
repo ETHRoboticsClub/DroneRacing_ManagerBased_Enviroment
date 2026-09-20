@@ -1,3 +1,9 @@
+# NOTE: written against the pre-merge hovering reward set from fix/hovering_dime.
+# main's hovering uses a different formulation, so 7 of these overrides no longer
+# resolve: spawn_xy_jitter, spawn_z_jitter, rewards.moving_to_target,
+# rewards.goal_collected, rewards.high_thrust, rewards.penalty_rate_tracking,
+# rewards.penalty_orientation. Retune against main's terms before running.
+# The SITL actuator model itself is unaffected; see sitl_parity_hover_v2.yaml.
 # Single-run SITL-parity hover policy for deployment bringup.
 #
 # This is intentionally not a waypoint/racing task. It trains one fixed

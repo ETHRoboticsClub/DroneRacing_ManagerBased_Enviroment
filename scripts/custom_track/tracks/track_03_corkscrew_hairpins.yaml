@@ -1,0 +1,68 @@
+schema_version: 1
+track_name: Corkscrew Hairpins
+description: Tests corkscrew (two gates same direction with power-loop between) and
+  180-degree turns (hairpin U-turns). Multiple corkscrews and hairpins in a circuit.
+elements_tested:
+- corkscrew
+- 180_turn
+- simple_gate
+gate_size: 0.7
+bar_thickness: 0.05
+loop_closed: true
+gate_track:
+- position: [-14.21, -6.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G1: Start heading +X'
+- position: [-6.21, -6.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G2: Straight approach'
+- position: [1.79, -9.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G3: Corkscrew gate 1 (same direction as G4, offset laterally)'
+- position: [1.79, -3.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G4: Corkscrew gate 2 (power loop from G3 to G4, same heading)'
+- position: [7.79, -0.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G5: Transition gate'
+- position: [13.79, -0.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G6: 180-turn entry (heading +X)'
+- position: [18.79, 3.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G7: 180-turn apex (sweeping right)'
+- position: [13.79, 7.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G8: 180-turn exit (now heading -X)'
+- position: [5.79, 7.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G9: Straight return'
+- position: [-2.21, 10.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G10: Corkscrew 2 gate 1 (offset +Y)'
+- position: [-2.21, 4.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G11: Corkscrew 2 gate 2 (power loop, same heading)'
+- position: [-8.21, 1.21, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G12: 180-turn 2 entry'
+- position: [-14.21, -0.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G13: 180-turn 2 apex'
+- position: [-16.21, -3.79, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G14: Final approach back to start'

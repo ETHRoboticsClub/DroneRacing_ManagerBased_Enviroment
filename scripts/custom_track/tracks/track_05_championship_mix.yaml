@@ -1,0 +1,78 @@
+schema_version: 1
+track_name: Championship Mix
+description: Full test of all 8 track elements - simple gate, 180-turn, slalom,
+  split-s, corkscrew, carousel, ladder, hurdle. 15 gates covering every element in
+  one circuit.
+elements_tested:
+- simple_gate
+- 180_turn
+- slalom
+- split_s
+- corkscrew
+- carousel
+- ladder
+- hurdle
+gate_size: 0.7
+bar_thickness: 0.05
+loop_closed: true
+gate_track:
+- position: [-25.0, -10.8, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G1: Start - simple gate'
+- position: [-18.0, -7.8, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G2: Slalom right'
+- position: [-11.0, -13.8, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G3: Slalom left'
+- position: [-4.0, -10.8, 3.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G4: Split-S top gate (fly over high)'
+- position: [0.0, -6.8, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G5: Split-S bottom gate (drop down, exit low)'
+- position: [5.0, -2.8, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G6: Hurdle entry (low)'
+- position: [11.0, -2.8, 3.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G7: Hurdle top (pop over)'
+- position: [17.0, -2.8, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G8: Hurdle exit (low)'
+- position: [21.0, 3.2, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G9: 180-turn entry'
+- position: [17.0, 9.2, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G10: 180-turn exit (heading back -X)'
+- position: [9.0, 9.2, 3.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G11: Ladder top gate'
+- position: [3.0, 7.2, 1.0]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G12: Ladder bottom gate (circle down)'
+- position: [-5.0, 7.2, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G13: Corkscrew gate 1 (same heading as G14)'
+- position: [-5.0, 13.2, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G14: Corkscrew gate 2 (power loop from G13)'
+- position: [-15.0, 9.2, 1.5]
+  rotation: [0.0, 0.0, 0.0]
+  auto_yaw: true
+  comment: 'G15: Carousel arc start (sweeping left back to start)'

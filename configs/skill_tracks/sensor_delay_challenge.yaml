@@ -1,0 +1,33 @@
+# Sensor-delay challenge — policy receives observations delayed by obs_delay_steps steps.
+# Open, fast layout with moderate altitude changes so the policy must commit to
+# trajectories well before it can sense the result, making latency punishing.
+# rotation: [roll, pitch, yaw] in degrees.
+
+gate_track:
+  # 0 — start gate, heading north (+Y), low entry
+  - position: [7.5, 2.0, 1.5]
+    rotation: [0, 0, 0]
+
+  # 1 — sweep right, climbing
+  - position: [12.0, 5.5, 3.0]
+    rotation: [0, 0, 60]
+
+  # 2 — top-right corner, high
+  - position: [13.0, 10.0, 4.5]
+    rotation: [0, 0, 100]
+
+  # 3 — back straight, heading south-west
+  - position: [9.0, 13.0, 4.0]
+    rotation: [0, 0, 160]
+
+  # 4 — top-left, descending arc
+  - position: [4.5, 11.5, 3.0]
+    rotation: [0, 0, 220]
+
+  # 5 — mid-left, low return
+  - position: [2.5, 7.5, 1.8]
+    rotation: [0, 0, 270]
+
+  # 6 — bottom-left, heading east
+  - position: [4.0, 3.5, 2.5]
+    rotation: [0, 0, 330]

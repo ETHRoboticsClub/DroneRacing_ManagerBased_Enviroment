@@ -44,23 +44,27 @@ def base_lin_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     """
     return env.scene[asset_cfg.name].data.root_lin_vel_b
 
-def base_pos_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """World-frame position. Shape [N, 3]."""
-    return env.scene[asset_cfg.name].data.root_pos_w
+
+def mocap_lin_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Filtered body-frame velocity estimated from consecutive mocap poses.
+
+    Returning zero columns cleanly removes this term from both actor and
+    critic vectors without mutating shared observation configuration objects.
+    """
+    if not env.cfg.mocap_velocity_obs_enabled:
+        return torch.empty((env.num_envs, 0), device=env.device)
+    return env._mocap_lin_vel_b
 
 
-def next_waypoints_rel_body(env: ManagerBasedRLEnv, num_waypoints: int = 2) -> torch.Tensor:
+def next_waypoints_rel_body(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Relative positions of the next two waypoints in body frame. Shape [N, 6].
 
     The lookahead wraps modulo per-env waypoint count, so even short tracks
     produce a valid 6-vector. Output is scaled by ``_REL_POSITION_SCALE``.
     """
     n = env.num_envs
-    k = num_waypoints
+    k = 2
     drone_pos_w = env._robot.data.root_pos_w  # [N, 3]
-    
-
-
     drone_quat_w = env._robot.data.root_quat_w  # [N, 4]
 
     counts = env._waypoint_counts.clamp(min=1).unsqueeze(1)  # [N, 1]
@@ -71,13 +75,9 @@ def next_waypoints_rel_body(env: ManagerBasedRLEnv, num_waypoints: int = 2) -> t
     wp_pos_w = torch.gather(env._waypoint_positions, dim=1, index=idx3)  # [N, K, 3]
 
     offset_w = wp_pos_w - drone_pos_w.unsqueeze(1)  # [N, K, 3]
-    
-
-
     q = drone_quat_w.unsqueeze(1).expand(-1, k, -1)  # [N, K, 4]
     offset_b = quat_apply_inverse(q, offset_w) / _REL_POSITION_SCALE
 
-    #return offset_w.reshape(n, k * 3)
     return offset_b.reshape(n, k * 3)
 
 
@@ -106,14 +106,5 @@ def collection_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def last_action(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Raw 4-dim policy output before clamp / noise / delay. Shape [N, 4].
-
-    Read from ``env._unclamped_actions_buf``, snapshot at the top of each
-    ``HoveringQuadcopterRLEnv.step`` before the action term processes it.
-    """
-    return env._unclamped_actions_buf
-
-
-def betaflight_applied_wrench(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Betaflight pipeline wrench debug: [thrust_N, Mx, My, Mz]. Shape [N, 4]."""
-    return env._bf_wrench_debug
+    """Last-applied 4-dim action. Shape [N, 4]."""
+    return env._actions_buf

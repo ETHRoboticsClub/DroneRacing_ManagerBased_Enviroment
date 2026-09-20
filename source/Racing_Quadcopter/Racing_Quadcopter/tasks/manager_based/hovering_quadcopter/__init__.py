@@ -31,15 +31,17 @@ gym.register(
     },
 )
 
-# Cardinal-spawn evaluation variant — mirrors test_controller_offline.py:
-# exactly 4 cells, drone spawned 1 m E/W/N/S of a fixed goal at [0, 0, 1].
-gym.register(
-    id="Isaac-Hovering-Eval-Quadcopter-Manager-v0",
-    entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:HoveringEvalQuadcopterEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
-    },
-)
+for _id, _cfg in (
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-v0", "HoveringQuadcopterEnvCfg"),
+    ("Isaac-Hovering-Quadcopter-Manager-RNN-Play-v0", "HoveringQuadcopterEnvCfg_PLAY"),
+):
+    gym.register(
+        id=_id,
+        entry_point=f"{__name__}.hovering_quadcopter_env:HoveringQuadcopterRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.hovering_quadcopter_env_cfg:{_cfg}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HoveringQuadcopterRecurrentPPORunnerCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        },
+    )

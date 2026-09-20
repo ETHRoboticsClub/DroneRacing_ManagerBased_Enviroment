@@ -1,78 +1,72 @@
 """Track I/O utilities for the drone-racing custom track designer.
 
-Pure Python (numpy + scipy + stdlib only). No Isaac Lab or torch imports, so
-this module is safe to use both in the offline GUI designer and in any
-play-side script that loads the saved track and feeds it to a trained policy.
+Pure Python (numpy + scipy + PyYAML only). No Isaac Lab or torch imports.
 
-Disk format (JSON, ``schema_version == 1``)::
+Disk format (YAML, ``schema_version == 1``)::
 
-    {
-      "schema_version": 1,
-      "gate_size":     0.7,
-      "bar_thickness": 0.05,
-      "loop_closed":   true,
-      "gates": [
-        {"x": 0.0, "y": 0.0, "z": 1.5,
-         "yaw": 0.0, "pitch": 0.0, "roll": 0.0, "auto_yaw": true},
-        ...
-      ]
-    }
+    schema_version: 1
+    gate_size: 0.7
+    bar_thickness: 0.05
+    loop_closed: true
+    gate_track:
+      - position: [0.0, 0.0, 1.5]
+        rotation: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] in degrees
+        auto_yaw: true
+      - ...
 
 Conventions
 -----------
-- World frame, metres. ``x``/``y``/``z`` are the gate centre coordinates.
-- ``yaw``, ``pitch``, ``roll`` are intrinsic Z-X-Y Euler angles in **radians**:
-    1. yaw rotates about world ``+Z``,
-    2. pitch about gate-local ``+X`` (right) after yaw,
-    3. roll about gate-local ``+Y`` (passage direction) after yaw + pitch.
-  With ``pitch=roll=0`` the gate is upright and ``yaw=0`` means the passage
-  direction (gate-local ``+Y``) coincides with world ``+Y`` — matching
-  ``racing_gates._place_gates_along_trajectory``.
-- ``pitch`` and ``roll`` default to 0 on disk and on load; old tracks without
-  these fields are upgraded transparently.
-- ``auto_yaw=True`` overrides the stored yaw with the closed-loop spline
-  tangent direction at that gate when the track is exported via
-  ``track_to_arrays``. It does **not** touch pitch or roll.
+- World frame, metres.
+- ``rotation`` is ``[roll, pitch, yaw]`` in **degrees** (extrinsic XYZ / ROS RPY order):
+    1. roll  — rotation about gate-local +X (right bar axis)
+    2. pitch — rotation about gate-local +Y (passage direction)
+    3. yaw   — rotation about world +Z, **clockwise from +Y**:
+               0° → gate passage faces +Y, 90° → faces +X
+- ``auto_yaw=true`` overrides the stored yaw with the closed-loop spline tangent
+  direction at export time. It does **not** touch pitch or roll.
 
-The ``Gate`` ordering in the list is the order the drone visits them in
-(matches ``RacingQuadcopterEnv._gate_positions`` insertion order).
+Gate ordering in ``gate_track`` is the order the drone visits them, matching
+``RacingQuadcopterEnv._gate_positions`` insertion order.
+
+Loaded dict fields (returned by ``load_track``)
+------------------------------------------------
+  gate_track   : list of gate dicts {position, rotation, auto_yaw}
+  positions    : list[list[float]]  # [N, 3] — gate centres
+  orientations : list[list[float]]  # [N, 3] — [roll, pitch, yaw] degrees
+  gate_size    : float
+  bar_thickness: float
+  loop_closed  : bool
 """
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 
 import numpy as np
 
 SCHEMA_VERSION = 1
 
-CONFIG_FILE_PATH = 'scripts/custom_track/config.json'
+_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 
-def load_json_to_dict(file_path):
-    # Check if file exists
-    if not os.path.exists(file_path):
-        print(f"Error: File '{file_path}' does not exist.")
-        return None
+# ---------------------------------------------------------------------------
+# Load defaults from config.yaml
+# ---------------------------------------------------------------------------
 
+def _load_config() -> dict:
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data
+        import yaml
+    except ModuleNotFoundError:
+        return {"gate_size": 0.7, "bar_thickness": 0.05, "loop_closed": True}
+    if _CONFIG_PATH.exists():
+        cfg = yaml.safe_load(_CONFIG_PATH.read_text()) or {}
+        return {
+            "gate_size":     float(cfg.get("gate_size", 0.7)),
+            "bar_thickness": float(cfg.get("bar_thickness", 0.05)),
+            "loop_closed":   bool(cfg.get("loop_closed", True)),
+        }
+    return {"gate_size": 0.7, "bar_thickness": 0.05, "loop_closed": True}
 
-    except json.JSONDecodeError:
-        print(f"Error: File '{file_path}' is not valid JSON.")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
 
-    return None
-
-
-DEFAULTS = load_json_to_dict(CONFIG_FILE_PATH)
-
-if DEFAULTS is not None:
-    print("Default JSON config file loaded successfully:")
-    print(DEFAULTS)
+DEFAULTS: dict = _load_config()
 
 
 # ---------------------------------------------------------------------------
@@ -82,75 +76,112 @@ if DEFAULTS is not None:
 def default_track() -> dict:
     """Return an empty track populated with default global parameters."""
     return {
-        "schema_version": SCHEMA_VERSION,
-        "gate_size": DEFAULTS["gate_size"],
-        "bar_thickness": DEFAULTS["bar_thickness"],
-        "loop_closed": DEFAULTS["loop_closed"],
-        "gates": [],
+        "schema_version":  SCHEMA_VERSION,
+        "track_name":      "",
+        "description":     "",
+        "elements_tested": [],
+        "gate_size":       DEFAULTS["gate_size"],
+        "bar_thickness":   DEFAULTS["bar_thickness"],
+        "loop_closed":     DEFAULTS["loop_closed"],
+        "gate_track":      [],
+        "positions":       [],
+        "orientations":    [],
+    }
+
+
+def _gate_to_dict(g: dict) -> dict:
+    """Normalise a gate to the canonical on-disk form."""
+    pos = g.get("position", [0.0, 0.0, 1.5])
+    rot = g.get("rotation", [0.0, 0.0, 0.0])
+    return {
+        "position": [float(pos[0]), float(pos[1]), float(pos[2])],
+        "rotation": [float(rot[0]), float(rot[1]), float(rot[2])],
+        "auto_yaw": bool(g.get("auto_yaw", True)),
     }
 
 
 def save_track(path: str | Path, track: dict) -> None:
-    """Write track to disk as pretty-printed JSON. Strips non-schema fields."""
+    """Write track to disk as YAML. Strips non-schema fields."""
+    try:
+        import yaml
+    except ModuleNotFoundError as e:
+        raise RuntimeError("PyYAML is required to save tracks (pip install pyyaml).") from e
+
+    gates = track.get("gate_track", [])
     clean = {
-        "schema_version": SCHEMA_VERSION,
-        "gate_size": float(track.get("gate_size", DEFAULTS["gate_size"])),
-        "bar_thickness": float(track.get("bar_thickness", DEFAULTS["bar_thickness"])),
-        "loop_closed": bool(track.get("loop_closed", DEFAULTS["loop_closed"])),
-        "gates": [
-            {
-                "x": float(g["x"]),
-                "y": float(g["y"]),
-                "z": float(g["z"]),
-                "yaw":   float(g.get("yaw",   0.0)),
-                "pitch": float(g.get("pitch", 0.0)),
-                "roll":  float(g.get("roll",  0.0)),
-                "auto_yaw": bool(g.get("auto_yaw", True)),
-            }
-            for g in track.get("gates", [])
-        ],
+        "schema_version":  SCHEMA_VERSION,
+        "track_name":      str(track.get("track_name", "")),
+        "description":     str(track.get("description", "")),
+        "elements_tested": list(track.get("elements_tested", [])),
+        "gate_size":       float(track.get("gate_size",     DEFAULTS["gate_size"])),
+        "bar_thickness":   float(track.get("bar_thickness", DEFAULTS["bar_thickness"])),
+        "loop_closed":     bool(track.get("loop_closed",    DEFAULTS["loop_closed"])),
+        "gate_track": [_gate_to_dict(g) for g in gates],
     }
-    Path(path).write_text(json.dumps(clean, indent=2))
+    Path(path).write_text(yaml.dump(clean, default_flow_style=None, sort_keys=False))
 
 
 def load_track(path: str | Path) -> dict:
-    """Load and validate a track JSON from disk. Back-fills optional fields."""
-    data = json.loads(Path(path).read_text())
+    """Load and validate a track YAML from disk.
+
+    Returns a dict with:
+      gate_track   : list of gate dicts {position, rotation, auto_yaw}
+      positions    : list[list[float]]  # [N, 3]
+      orientations : list[list[float]]  # [N, 3] euler degrees [roll,pitch,yaw]
+      gate_size, bar_thickness, loop_closed
+    """
+    try:
+        import yaml
+    except ModuleNotFoundError as e:
+        raise RuntimeError("PyYAML is required to load tracks (pip install pyyaml).") from e
+
+    data = yaml.safe_load(Path(path).read_text())
     sv = data.get("schema_version")
     if sv != SCHEMA_VERSION:
         raise ValueError(
             f"Unsupported track schema_version: {sv!r} (expected {SCHEMA_VERSION})"
         )
-    for k, v in DEFAULTS.items():
-        data.setdefault(k, v)
-    for g in data.get("gates", []):
-        g.setdefault("auto_yaw", True)
-        g.setdefault("yaw",   0.0)
-        g.setdefault("pitch", 0.0)  # added — old tracks default to upright
-        g.setdefault("roll",  0.0)
-    return data
+
+    gate_track_raw = data.get("gate_track", [])
+    gate_track: list[dict] = []
+    for g in gate_track_raw:
+        gate_track.append({
+            "position": [float(v) for v in g.get("position", [0.0, 0.0, 1.5])],
+            "rotation": [float(v) for v in g.get("rotation", [0.0, 0.0, 0.0])],
+            "auto_yaw": bool(g.get("auto_yaw", True)),
+        })
+
+    # Extract flat lists for convenient access; convert to numpy on first use.
+    positions:    list[list[float]] = [g["position"] for g in gate_track]
+    orientations: list[list[float]] = [g["rotation"] for g in gate_track]
+
+    return {
+        "schema_version":  SCHEMA_VERSION,
+        "track_name":      str(data.get("track_name", "")),
+        "description":     str(data.get("description", "")),
+        "elements_tested": list(data.get("elements_tested", [])),
+        "gate_size":       float(data.get("gate_size",     DEFAULTS["gate_size"])),
+        "bar_thickness":   float(data.get("bar_thickness", DEFAULTS["bar_thickness"])),
+        "loop_closed":     bool(data.get("loop_closed",    DEFAULTS["loop_closed"])),
+        "gate_track":      gate_track,
+        "positions":       positions,
+        "orientations":    orientations,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Spline utilities
 # ---------------------------------------------------------------------------
-# Chord-length parameterised periodic CubicSpline. Mirrors the construction
-# used by racing_gates._generate_random_track so the visual feedback in the
-# designer matches what the simulator renders.
 
 def _build_spline(centres: np.ndarray, closed: bool):
-    """Return (CubicSpline, knot_array u, total_length) or None if degenerate."""
+    """Return (CubicSpline, knots, total_length) or None if degenerate."""
     from scipy.interpolate import CubicSpline
 
     centres = np.asarray(centres, dtype=float)
     if centres.shape[0] < 2:
         return None
 
-    if closed:
-        ext = np.vstack([centres, centres[:1]])
-    else:
-        ext = centres
-
+    ext = np.vstack([centres, centres[:1]]) if closed else centres
     diffs = np.linalg.norm(np.diff(ext, axis=0), axis=1)
     u = np.concatenate([[0.0], np.cumsum(diffs)])
     if u[-1] <= 0.0:
@@ -160,8 +191,6 @@ def _build_spline(centres: np.ndarray, closed: bool):
     try:
         cs = CubicSpline(u, ext, bc_type=bc, axis=0)
     except ValueError:
-        # Periodic BC requires identical endpoints (we ensured that) AND
-        # at least 3 knots; if it still fails, fall back to natural BC.
         cs = CubicSpline(u, ext, bc_type="natural", axis=0)
     return cs, u, float(u[-1])
 
@@ -175,9 +204,7 @@ def interpolate_loop(
 
     Returns:
         waypoints: ``[num_samples, 3]``
-        tangents:  ``[num_samples, 3]`` unit vectors (zero where degenerate)
-
-    For < 2 input centres returns the input as-is and zero tangents.
+        tangents:  ``[num_samples, 3]`` unit vectors
     """
     centres = np.asarray(centres, dtype=float)
     if centres.shape[0] < 2:
@@ -188,7 +215,6 @@ def interpolate_loop(
         return centres.copy(), np.zeros_like(centres)
     cs, u, total = built
 
-    # endpoint=False on closed loops avoids a duplicated sample at the seam.
     ts = np.linspace(0.0, total, num_samples, endpoint=not closed)
     pts = cs(ts)
     tng = cs(ts, 1)
@@ -201,7 +227,7 @@ def gate_tangents_from_spline(
     centres: np.ndarray,
     closed: bool = True,
 ) -> np.ndarray:
-    """Unit tangent at each input centre. Used for auto-yaw."""
+    """Unit tangent at each input centre. Used for auto-yaw resolution."""
     centres = np.asarray(centres, dtype=float)
     if centres.shape[0] < 2:
         return np.zeros_like(centres)
@@ -211,7 +237,6 @@ def gate_tangents_from_spline(
         return np.zeros_like(centres)
     cs, u, _ = built
 
-    # On closed loops u has N+1 knots (last duplicates first); drop the duplicate.
     knots = u[:-1] if closed else u
     d = cs(knots, 1)
     norms = np.linalg.norm(d, axis=1, keepdims=True)
@@ -222,54 +247,39 @@ def gate_tangents_from_spline(
 # ---------------------------------------------------------------------------
 # Euler / quaternion conversion
 # ---------------------------------------------------------------------------
-# Convention: intrinsic Z-X-Y Euler with angles [yaw, pitch, roll]
-#   1. yaw   — rotation about world +Z
-#   2. pitch — rotation about gate-local +X (right) AFTER yaw
-#   3. roll  — rotation about gate-local +Y (passage direction) AFTER yaw + pitch
+# Convention: extrinsic XYZ (= ROS RPY) with angles [roll, pitch, yaw_deg]
+#   roll  — about world +X
+#   pitch — about world +Y (after roll in extrinsic)
+#   yaw   — about world +Z, clockwise from +Y (0°→+Y, 90°→+X)
 #
-# Why this order?
-#   - yaw spins the gate around the vertical axis (the racing-natural DoF)
-#   - pitch tips the gate forward/back (top moves toward/away from the drone)
-#   - roll banks the gate left/right around the line the drone flies through
-#
-# With pitch=roll=0 this reduces to (cos(yaw/2), 0, 0, sin(yaw/2)) — the
-# upright-gate quaternion that the simulator's procedural generator produces,
-# so existing tracks keep their semantics.
-#
-# Auto-yaw still resolves only the yaw component; pitch and roll are always
-# whatever the user set in the editor.
+# Since scipy uses counter-clockwise conventions, yaw is negated on entry.
 
-def euler_to_quat_wxyz(yaw: float, pitch: float = 0.0, roll: float = 0.0) -> np.ndarray:
-    """IsaacLab-order ``(w, x, y, z)`` quaternion for intrinsic ZXY Euler."""
+def euler_to_quat_wxyz(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    """IsaacLab-order ``(w, x, y, z)`` quaternion for extrinsic XYZ Euler.
+
+    Args:
+        roll_deg:  rotation about +X, degrees
+        pitch_deg: rotation about +Y, degrees
+        yaw_deg:   clockwise rotation about +Z from +Y, degrees
+    """
     from scipy.spatial.transform import Rotation as R
-    qx, qy, qz, qw = R.from_euler("ZXY", [float(yaw), float(pitch), float(roll)]).as_quat()
+    qx, qy, qz, qw = R.from_euler(
+        "xyz", [float(roll_deg), float(pitch_deg), -float(yaw_deg)], degrees=True
+    ).as_quat()
     return np.array([qw, qx, qy, qz])
-
-
-def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
-    """Upright-gate quaternion. Kept for backward compat; equals euler_to_quat_wxyz(yaw, 0, 0)."""
-    half = 0.5 * float(yaw)
-    return np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
-
-
-def yaw_from_horizontal_tangent(tx: float, ty: float) -> float:
-    """Yaw angle such that gate-local +Y aligns with horizontal direction (tx, ty)."""
-    return float(np.arctan2(-tx, ty))
 
 
 def quat_axes_wxyz(quats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply each ``(w,x,y,z)`` quaternion to the canonical basis.
 
-    Returns ``(right, forward, up)`` — three ``[N, 3]`` arrays of the world-
-    frame directions corresponding to gate-local ``+X``, ``+Y``, ``+Z``.
-    Useful for renderers that want to draw a tilted aperture without
-    re-implementing quaternion rotation.
+    Returns ``(right, forward, up)`` — ``[N, 3]`` arrays of world-frame directions
+    for gate-local ``+X``, ``+Y``, ``+Z``.
     """
     from scipy.spatial.transform import Rotation as R
     if quats.shape[0] == 0:
         z = np.zeros((0, 3))
         return z, z, z
-    sci = quats[:, [1, 2, 3, 0]]  # wxyz → xyzw
+    sci = quats[:, [1, 2, 3, 0]]   # wxyz → xyzw
     rot = R.from_quat(sci)
     return (
         rot.apply(np.array([1.0, 0.0, 0.0])),
@@ -285,41 +295,48 @@ def quat_axes_wxyz(quats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
 def track_to_arrays(track: dict) -> tuple[np.ndarray, np.ndarray, dict]:
     """Convert a track dict to ``(positions, quats_wxyz, meta)``.
 
-    Positions are world frame metres ``[N, 3]``. Quaternions are IsaacLab
-    order ``(w, x, y, z)`` ``[N, 4]``.  Auto-yaw gates are resolved against
-    the closed-loop spline tangent here (manual yaws pass through unchanged).
+    Converts ``positions: list[list]`` and ``orientations: list[list]`` to numpy
+    arrays immediately for performance.  Auto-yaw gates resolve yaw against the
+    closed-loop spline tangent; pitch and roll always come from the stored value.
 
-    For an empty track returns shape ``(0, 3)`` and ``(0, 4)`` arrays.
+    Returns:
+        positions:  ``[N, 3]`` gate centres, world frame metres
+        quats_wxyz: ``[N, 4]`` quaternions (w, x, y, z), IsaacLab order
+        meta:       dict with gate_size, bar_thickness, loop_closed
     """
-    gates = track.get("gates", [])
-    meta = {k: track.get(k, v) for k, v in DEFAULTS.items()}
+    gate_track = track.get("gate_track", [])
+    meta = {
+        "gate_size":     float(track.get("gate_size",     DEFAULTS["gate_size"])),
+        "bar_thickness": float(track.get("bar_thickness", DEFAULTS["bar_thickness"])),
+        "loop_closed":   bool(track.get("loop_closed",    DEFAULTS["loop_closed"])),
+    }
 
-    if len(gates) == 0:
+    if not gate_track:
         return np.zeros((0, 3)), np.zeros((0, 4)), meta
 
-    positions = np.array([[g["x"], g["y"], g["z"]] for g in gates], dtype=float)
-    yaws    = np.array([float(g.get("yaw",   0.0)) for g in gates])
-    pitches = np.array([float(g.get("pitch", 0.0)) for g in gates])
-    rolls   = np.array([float(g.get("roll",  0.0)) for g in gates])
-    auto_mask = np.array([bool(g.get("auto_yaw", True)) for g in gates])
+    # Convert lists to numpy immediately.
+    positions = np.array(track["positions"], dtype=float)
+    rolls  = np.array([g["rotation"][0] for g in gate_track], dtype=float)
+    pitches = np.array([g["rotation"][1] for g in gate_track], dtype=float)
+    yaws   = np.array([g["rotation"][2] for g in gate_track], dtype=float)
+    auto_mask = np.array([g.get("auto_yaw", True) for g in gate_track], dtype=bool)
 
-    # Resolve auto-yaw against the spline tangent (horizontal projection).
-    # Pitch and roll are always whatever the user set — auto-yaw only ever
-    # touches the yaw component.
-    if auto_mask.any() and len(gates) >= 2:
-        closed = bool(meta["loop_closed"])
+    # Resolve auto-yaw: yaw_cw_deg = degrees(arctan2(tx, ty)).
+    if auto_mask.any() and len(gate_track) >= 2:
+        closed = meta["loop_closed"]
         tangents = gate_tangents_from_spline(positions, closed=closed)
         th = tangents.copy()
         th[:, 2] = 0.0
         n = np.linalg.norm(th, axis=1, keepdims=True)
         n[n < 1e-9] = 1.0
         th /= n
-        auto_yaws = np.arctan2(-th[:, 0], th[:, 1])
+        auto_yaws = np.degrees(np.arctan2(th[:, 0], th[:, 1]))
         yaws = np.where(auto_mask, auto_yaws, yaws)
 
-    quats = np.stack([
-        euler_to_quat_wxyz(y, p, r) for y, p, r in zip(yaws, pitches, rolls)
-    ], axis=0)
+    quats = np.stack(
+        [euler_to_quat_wxyz(r, p, y) for r, p, y in zip(rolls, pitches, yaws)],
+        axis=0,
+    )
     return positions, quats, meta
 
 
@@ -332,8 +349,6 @@ __all__ = [
     "interpolate_loop",
     "gate_tangents_from_spline",
     "euler_to_quat_wxyz",
-    "yaw_to_quat_wxyz",
-    "yaw_from_horizontal_tangent",
     "quat_axes_wxyz",
     "track_to_arrays",
 ]

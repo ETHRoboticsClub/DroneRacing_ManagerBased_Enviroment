@@ -17,8 +17,8 @@ Usage::
 
 ``--track`` accepts:
 
-  - a bare name like ``oval``  → resolves to ``scripts/custom_track/tracks/oval.json``
-  - a name with extension ``oval.json``
+  - a bare name like ``oval``  → resolves to ``scripts/custom_track/tracks/oval.yaml``
+  - a name with extension ``oval.yaml``
   - a relative or absolute path containing ``/``
 
 The grid is forced to 1×1 with the cell sized to enclose the track + margin,
@@ -45,7 +45,7 @@ parser.add_argument(
     required=True,
     help=(
         "Track to load. Bare name (resolved against scripts/custom_track/tracks/), "
-        "filename, or path to a track JSON saved by track_designer.py."
+        "filename, or path to a track YAML saved by track_designer.py."
     ),
 )
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
@@ -113,12 +113,12 @@ _TRACKS_DIR = _HERE / "tracks"
 
 
 def _resolve_track_path(arg: str) -> Path:
-    """Map a user-supplied track argument to an absolute JSON path."""
+    """Map a user-supplied track argument to an absolute YAML path."""
     if "/" in arg or "\\" in arg or arg.startswith(("./", "../")):
         p = Path(arg).expanduser().resolve()
     else:
-        # Bare name → look in tracks/ with .json extension if missing.
-        name = arg if arg.endswith(".json") else f"{arg}.json"
+        # Bare name → look in tracks/ with .yaml extension if missing.
+        name = arg if arg.endswith(".yaml") else f"{arg}.yaml"
         p = (_TRACKS_DIR / name).resolve()
     if not p.is_file():
         raise FileNotFoundError(f"Track not found: {p}")
@@ -188,7 +188,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from Racing_Quadcopter.terrains import racing_gates as _racing_gates
 from Racing_Quadcopter.terrains.racing_gates import (
     GateData,
-    clear_gate_registry,
 )
 from Racing_Quadcopter.terrains.racing_gates_cfg import MeshRacingGatesTerrainCfg
 
@@ -255,7 +254,7 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
         local_positions = positions + offset
 
         for pos, quat in zip(local_positions, quats_wxyz):
-            meshes_list.extend(_racing_gates._create_gate_frame(
+            meshes_list.extend(_racing_gates.create_gate_frame(
                 position=pos,
                 orientation=quat,
                 gate_size=gate_size,
@@ -267,7 +266,7 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
         # spline trajectory through the gates.
         local_waypoints = waypoints + offset
 
-        _racing_gates._gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
+        _racing_gates.gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
             positions=local_positions.copy(),
             orientations=quats_wxyz.copy(),
             gate_size=gate_size,
@@ -338,7 +337,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # Load + apply the custom track. Done as early as possible so any errors
     # surface before checkpoint resolution.
     track = track_io.load_track(_TRACK_PATH)
-    n_gates = len(track["gates"])
+    n_gates = len(track["gate_track"])
     if n_gates == 0:
         raise RuntimeError(f"Custom track {_TRACK_PATH} has no gates.")
     print(f"[INFO] Loaded {n_gates} gates from {_TRACK_PATH.name}; loop_closed={track['loop_closed']}")
@@ -353,7 +352,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # Replace the procedural generator with our single-cell custom one.
     # ``__post_init__`` already populated env_cfg.scene.terrain — we only swap
     # the ``terrain_generator`` field on it.
-    clear_gate_registry()  # drop any leftover entries from prior runs in the same process
+    _racing_gates.gate_registry.clear()  # drop any leftover entries from prior runs in the same process
     env_cfg.scene.terrain.terrain_generator = _custom_terrain_generator_cfg(
         track,
         margin=float(args_cli.cell_margin),

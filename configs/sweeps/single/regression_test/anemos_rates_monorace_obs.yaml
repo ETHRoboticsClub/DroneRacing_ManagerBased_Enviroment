@@ -1,0 +1,57 @@
+# DO NOT TOUCH THIS FILE
+# This config is used for regression testing
+
+# Note that this test uses not just different observatiosn but
+# also a different track layout, so it's not directly comparable
+
+task_train: Isaac-Racing-Quadcopter-Manager-Fixed-v0
+task_play:  Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0
+
+extra_train_args: ["--headless"]
+extra_play_args:  ["--headless"]
+
+env_vars:
+  DRONE_MODEL: "anemos_urdf"
+  ACTION_TYPE: "rates"
+  OBSERVATION_SPACE: "mono_race"
+
+sweep_mode: sequential
+
+num_envs: 4096
+
+train_iterations: 834  # 20016 steps
+eval_steps: 3000
+
+# rotation: [roll, pitch, yaw] in degrees (ROS/URDF RPY order).
+# yaw is CW-from-+Y: 0 -> drone passes in +Y, 90 -> +X.
+gate_track:
+  # 0 - low SW start, aimed up the long diagonal
+  - position: [1.5, 2.0, 1.5]
+    rotation: [0, 0, 45]
+
+  # 1 - top of the diagonal sprint (~15.6 m, +3.5 m climb)
+  #     turn over the NE corner heading roughly ESE
+  - position: [12.5, 13.0, 5.0]
+    rotation: [0, 0, 120]
+
+  # 2 - east wall, fully south-bound
+  - position: [13.5, 7.0, 4.0]
+    rotation: [0, 0, 180]
+
+  # 3 - SE corner, dive to low altitude, exit aimed WSW
+  - position: [12.0, 1.8, 1.8]
+    rotation: [0, 0, 250]
+
+  # 4 - long west-bound sprint along the bottom (~8.5 m) with a 2.7 m climb,
+  #     exits aimed NNE for the next leg
+  - position: [3.5, 2.0, 4.5]
+    rotation: [0, 0, 20]
+
+  # 5 - high gate on the west side, turn east to set up the closing dive
+  - position: [5.5, 11.0, 5.0]
+    rotation: [0, 0, 90]
+
+  # loop closure: ~9.8 m back to gate 0 with a 3.5 m descent
+
+param_grid:
+  episode_length_s: [30.0]
