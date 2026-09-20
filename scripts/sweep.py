@@ -144,6 +144,7 @@ RESULTS_CSV = RESULTS_DIR / f"results_{SWEEP_ID}.csv"
 
 CSV_FIELDS = ["exp_name"] + list(PARAM_GRID.keys()) + [
     "speed_kmh", "lap_pct", "mean_gates", "lap_time_s", "status",
+    "hover_mean_dist", "hover_max_dist", "hover_mean_omega", "hover_mean_tilt_deg", "crash_pct",
 ]
 
 _OVERRIDE_ERROR_MARKERS = (
@@ -310,6 +311,7 @@ def _apply_runtime_config(args: argparse.Namespace) -> None:
     # Recompute CSV columns after potential PARAM_GRID override from YAML.
     CSV_FIELDS = ["exp_name"] + list(PARAM_GRID.keys()) + [
         "speed_kmh", "lap_pct", "mean_gates", "lap_time_s", "status",
+        "hover_mean_dist", "hover_max_dist", "hover_mean_omega", "hover_mean_tilt_deg", "crash_pct",
     ]
 
 
@@ -501,12 +503,24 @@ def _parse_sweep_result(output: str) -> dict | None:
     )
     if m is None:
         return None
-    return {
+    result = {
         "speed_kmh":  float(m.group(1)),
         "lap_pct":    float(m.group(2)),
         "mean_gates": float(m.group(3)),
         "lap_time_s": float(m.group(4)),
     }
+    hover_map = {
+        "HoverMeanDist": "hover_mean_dist",
+        "HoverMaxDist": "hover_max_dist",
+        "HoverMeanOmega": "hover_mean_omega",
+        "HoverMeanTiltDeg": "hover_mean_tilt_deg",
+        "CrashPct": "crash_pct",
+    }
+    for printed_key, result_key in hover_map.items():
+        hm = re.search(rf"\b{printed_key}=(\S+)", output)
+        if hm:
+            result[result_key] = float(hm.group(1))
+    return result
 
 
 def _print_summary(rows: list[dict]) -> None:

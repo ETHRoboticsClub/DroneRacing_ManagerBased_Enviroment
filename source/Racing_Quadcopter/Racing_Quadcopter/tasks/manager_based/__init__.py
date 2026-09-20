@@ -5,5 +5,6 @@
 
 """Manager-based tasks — import subpackages to register Gym environments."""
 
+from . import hovering_quadcopter  # noqa: F401
 from . import racing_quadcopter  # noqa: F401
 from . import hovering_quadcopter  # noqa: F401

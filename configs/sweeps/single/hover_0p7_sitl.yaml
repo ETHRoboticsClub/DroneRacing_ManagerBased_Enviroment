@@ -1,0 +1,48 @@
+# NOTE: written against the pre-merge hovering reward set from fix/hovering_dime.
+# main's hovering uses a different formulation, so 7 of these overrides no longer
+# resolve: spawn_xy_jitter, spawn_z_jitter, rewards.moving_to_target,
+# rewards.goal_collected, rewards.high_thrust, rewards.penalty_rate_tracking,
+# rewards.penalty_orientation. Retune against main's terms before running.
+# The SITL actuator model itself is unaffected; see sitl_parity_hover_v2.yaml.
+# Single-run SITL-parity hover policy for deployment bringup.
+#
+# This is intentionally not a waypoint/racing task. It trains one fixed
+# 0.7 m hover target and evaluates the same target with deterministic resets.
+
+task_train: Isaac-Hovering-Quadcopter-Manager-v0
+task_play:  Isaac-Hovering-Quadcopter-Manager-Play-v0
+
+sweep_mode: sequential
+
+num_envs: 4096
+train_iterations: 250
+eval_steps: 2000
+
+extra_train_args:
+  - --headless
+
+extra_play_args:
+  - --headless
+
+env_vars:
+  WAYPOINTS: configs/waypoint_tracks/hover_0p7.yaml
+  HOVERING_DRONE_MODEL: anemos_sitl
+
+param_grid:
+  episode_length_s: [6.0]
+  collection_time_s: [999.0]
+  num_waypoints_range: ["(1, 1)"]
+  spawn_xy_jitter: [0.35]
+  spawn_z_jitter: ["(-0.55, 0.15)"]
+  waypoint_xy_range: [0.0]
+  waypoint_z_range: ["(0.7, 0.7)"]
+  min_waypoint_spacing: [0.0]
+  r_capture: [0.25]
+  r_hold: [0.45]
+  rewards.moving_to_target.weight: [0.0]
+  rewards.goal_collected.weight: [0.0]
+  rewards.high_thrust.weight: [-25.0]
+  rewards.penalty_rate_tracking.weight: [-0.2]
+  rewards.action_smoothness.weight: [-4.0]
+  rewards.action_magnitude.weight: [-0.2]
+  rewards.penalty_orientation.weight: [-10.0]

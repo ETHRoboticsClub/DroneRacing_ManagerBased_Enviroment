@@ -1,0 +1,233 @@
+<?xml version="1.0" ?>
+<!-- =================================================================================== -->
+<!-- |    Fixed URDF for Isaac Sim / IsaacLab compatibility                             | -->
+<!-- |    Changes: package:// paths -> relative, hyphens -> underscores,                | -->
+<!-- |             spaces in names -> underscores                                       | -->
+<!-- =================================================================================== -->
+<robot name="drone_acc_mass_sitl">
+  <material name="silver">
+    <color rgba="0.700 0.700 0.700 1.000"/>
+  </material>
+  <transmission name="Revolute_15_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="Revolute_15">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute_15_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute_16_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="Revolute_16">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute_16_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute_17_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="Revolute_17">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute_17_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute_18_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="Revolute_18">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute_18_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <gazebo>
+    <plugin filename="libgazebo_ros_control.so" name="control"/>
+  </gazebo>
+  <gazebo reference="base_link">
+    <material>Gazebo/Silver</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+    <selfCollide>true</selfCollide>
+    <gravity>true</gravity>
+  </gazebo>
+  <gazebo reference="FL_5_inch_CW_prop_1_1_1">
+    <material>Gazebo/Silver</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+    <selfCollide>true</selfCollide>
+  </gazebo>
+  <gazebo reference="FR_5_inch_CCW_prop_1_1_1">
+    <material>Gazebo/Silver</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+    <selfCollide>true</selfCollide>
+  </gazebo>
+  <gazebo reference="BL_5_inch_CCW_prop_1_1_1">
+    <material>Gazebo/Silver</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+    <selfCollide>true</selfCollide>
+  </gazebo>
+  <gazebo reference="BR_5_inch_CW_prop_1_1_1">
+    <material>Gazebo/Silver</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+    <selfCollide>true</selfCollide>
+  </gazebo>
+  <link name="base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.004839178109627602 0.0034084153156952045 0.00927557259352703"/>
+      <mass value="0.8351086449771665"/>
+      <inertia ixx="0.002158" ixy="1e-06" ixz="-8.5e-05" iyy="0.002919" iyz="-4.3e-05" izz="0.002743"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="FL_5_inch_CW_prop_1_1_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-4.954987216920781e-07 1.1728228729718237e-06 0.0049229474950758245"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="-0.088628 0.068017 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/FL_5_inch_CW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.088628 0.068017 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/FL_5_inch_CW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="FR_5_inch_CCW_prop_1_1_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="2.1208467563677003e-06 -1.0094753889744457e-07 0.00492294826402425"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="-0.088431 -0.072039 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/FR_5_inch_CCW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.088431 -0.072039 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/FR_5_inch_CCW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="BL_5_inch_CCW_prop_1_1_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="1.6896728732007649e-06 -4.6309921052090086e-07 0.004922948264024916"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0.082176 0.068017 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/BL_5_inch_CCW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0.082176 0.068017 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/BL_5_inch_CCW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="BR_5_inch_CW_prop_1_1_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="5.7189728425166564e-08 1.2673309276733935e-06 0.004922947500933514"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0.081841 -0.071798 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/BR_5_inch_CW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0.081841 -0.071798 -0.040514"/>
+      <geometry>
+        <mesh filename="meshes/BR_5_inch_CW_prop_1_1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <!--
+    camera_keypoint: marker frame vs base_link — translation only [85.196, 1.872, 67.774] mm,
+    same orientation as base_link (rpy=0). Isaac: find_bodies("camera_keypoint").
+    Tiny sphere visual required so URDF→USD converter resolves /visuals/camera_keypoint
+    in anemos_physics.usd (without it the anemos_base.usd reference is dangling).
+  -->
+  <link name="camera_keypoint">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="1e-9"/>
+      <inertia ixx="1e-15" ixy="0" ixz="0" iyy="1e-15" iyz="0" izz="1e-15"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <sphere radius="0.001"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="Revolute_15" type="continuous">
+    <origin rpy="0 0 0" xyz="0.088628 -0.068017 0.040514"/>
+    <parent link="base_link"/>
+    <child link="FL_5_inch_CW_prop_1_1_1"/>
+    <axis xyz="0.0 -0.0 1.0"/>
+  </joint>
+  <joint name="Revolute_16" type="continuous">
+    <origin rpy="0 0 0" xyz="0.088431 0.072039 0.040514"/>
+    <parent link="base_link"/>
+    <child link="FR_5_inch_CCW_prop_1_1_1"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+  <joint name="Revolute_17" type="continuous">
+    <origin rpy="0 0 0" xyz="-0.082176 -0.068017 0.040514"/>
+    <parent link="base_link"/>
+    <child link="BL_5_inch_CCW_prop_1_1_1"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+  <joint name="Revolute_18" type="continuous">
+    <origin rpy="0 0 0" xyz="-0.081841 0.071798 0.040514"/>
+    <parent link="base_link"/>
+    <child link="BR_5_inch_CW_prop_1_1_1"/>
+    <axis xyz="0.0 -0.0 1.0"/>
+  </joint>
+  <joint name="camera_keypoint_fixed" type="fixed">
+      <origin rpy="0 -0.523599 0" xyz="0.085196 0.001872 0.067774"/>
+      <parent link="base_link"/>
+      <child link="camera_keypoint"/>
+  </joint>
+</robot>

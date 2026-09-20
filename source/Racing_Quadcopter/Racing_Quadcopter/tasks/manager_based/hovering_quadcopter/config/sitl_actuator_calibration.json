@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "status": "identity_bootstrap_unmeasured",
+  "source": "sim/gazebo/models/drone_sitl/model.sdf",
+  "vehicle": {
+    "mass_kg": 0.8351086449771665,
+    "inertia_kg_m2": {
+      "ixx": 0.002158,
+      "iyy": 0.002919,
+      "izz": 0.002743,
+      "ixy": 0.000001,
+      "ixz": -0.000085,
+      "iyz": -0.000043
+    }
+  },
+  "actuator": {
+    "max_total_thrust_n": 32.7584728,
+    "yaw_torque_coefficient": 0.00125,
+    "yaw_damping_coefficient": 0.006,
+    "rotor_positions_body_m": [
+      [-0.081108, 0.086485, 0.044629],
+      [0.099477, 0.067468, 0.044629],
+      [-0.073632, -0.075213, 0.044629],
+      [0.086702, -0.054547, 0.044629]
+    ],
+    "rotor_directions": [-1.0, 1.0, 1.0, -1.0]
+  },
+  "throttle_to_motor_output": [
+    [0.0, 0.0],
+    [0.25, 0.25],
+    [0.5, 0.5],
+    [0.6, 0.6],
+    [1.0, 1.0]
+  ],
+  "rate_response": {
+    "status": "unmeasured",
+    "acceptance": {
+      "vertical_acceleration_tolerance_fraction": 0.10,
+      "rate_response_tolerance_fraction": 0.15
+    }
+  }
+}

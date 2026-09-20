@@ -280,7 +280,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     if args_cli.eval_steps > 0:
         _e = env
         for _ in range(8):
-            if hasattr(_e, "_speed_window"):
+            if hasattr(_e, "_speed_window") or hasattr(_e, "_curr_dist_to_waypoint"):
                 break
             _nxt = getattr(_e, "env", None) or getattr(_e, "unwrapped", None)
             if _nxt is None or _nxt is _e:
@@ -298,6 +298,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             print(
                 f"[SWEEP_RESULT] Speed={speed_kmh:.2f} Lap={lap_pct:.2f}"
                 f" Gates={mean_gates:.2f} LapTime={lap_time_s:.2f}",
+                flush=True,
+            )
+            _sys.stdout.flush()
+        elif hasattr(_e, "_curr_dist_to_waypoint"):
+            dist = _e._curr_dist_to_waypoint.detach()
+            speed = torch.linalg.norm(_e._robot.data.root_lin_vel_b, dim=1).detach()
+            omega = torch.linalg.norm(_e._robot.data.root_ang_vel_b, dim=1).detach()
+            tilt_xy = torch.linalg.norm(_e._robot.data.projected_gravity_b[:, :2], dim=1).detach()
+            collected = _e._episode_collected_count.detach()
+            z = _e._robot.data.root_pos_w[:, 2].detach()
+            crashed = (
+                (z < float(_e.cfg.min_height))
+                | (z > float(_e.cfg.max_height))
+                | (_e._robot.data.projected_gravity_b[:, 2] > float(_e.cfg.upside_down_threshold))
+            )
+            mean_dist = float(dist.mean().item())
+            max_dist = float(dist.max().item())
+            mean_speed = float(speed.mean().item())
+            mean_omega = float(omega.mean().item())
+            mean_tilt_deg = float(torch.rad2deg(torch.asin(tilt_xy.clamp(max=1.0))).mean().item())
+            collected_pct = float((collected > 0.0).float().mean().item() * 100.0)
+            crash_pct = float(crashed.float().mean().item() * 100.0)
+            import sys as _sys
+            print(
+                f"[SWEEP_RESULT] Speed={mean_speed:.3f} Lap={max(0.0, 100.0 - mean_dist * 100.0):.2f}"
+                f" Gates={collected_pct:.2f} LapTime={mean_dist:.4f}"
+                f" HoverMeanDist={mean_dist:.4f} HoverMaxDist={max_dist:.4f}"
+                f" HoverMeanOmega={mean_omega:.4f} HoverMeanTiltDeg={mean_tilt_deg:.2f}"
+                f" CrashPct={crash_pct:.2f}",
                 flush=True,
             )
             _sys.stdout.flush()

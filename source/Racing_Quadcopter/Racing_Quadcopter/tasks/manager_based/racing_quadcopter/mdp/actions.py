@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import json
 import numpy as np
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
@@ -16,10 +18,24 @@ from isaaclab.managers import ActionTermCfg
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.buffers.delay_buffer import DelayBuffer
+from isaaclab.utils.math import quat_apply_inverse
 from isaaclab.utils.math import quat_apply
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+_SITL_ROTOR_POSITIONS_BODY = (
+    (-0.081108, 0.086485, 0.044629),
+    (0.099477, 0.067468, 0.044629),
+    (-0.073632, -0.075213, 0.044629),
+    (0.086702, -0.054547, 0.044629),
+)
+_SITL_ROTOR_DIRECTIONS = (-1.0, 1.0, 1.0, -1.0)
+_SITL_MASS_KG = 0.8351086449771665
+_SITL_MAX_TOTAL_THRUST_N = 32.7584728
+_SITL_YAW_TORQUE_COEFFICIENT = 0.00125
+_SITL_YAW_DAMPING_COEFFICIENT = 0.006
 
 
 def build_quad_mixer_b_inv(k_t: float, k_d: float, arm_length_m: float) -> np.ndarray:
@@ -114,6 +130,8 @@ class QuadcopterMomentsAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         # Save previous applied (delayed) action for smoothness penalty before overwriting.
         if hasattr(self._env, "_prev_actions"):
+            if hasattr(self._env, "_prev_prev_actions") and hasattr(self._env, "_actions_buf"):
+                self._env._prev_prev_actions[:] = self._env._prev_actions
             if hasattr(self._env, "_actions_buf"):
                 self._env._prev_actions[:] = self._env._actions_buf
             else:
@@ -195,8 +213,13 @@ class QuadcopterRatesAction(ActionTerm):
     Per-axis gains follow Betaflight-style numerators × per-term scales from
     :class:`QuadcopterRatesActionCfg`. Optional ``pid_gain_randomization_frac`` rescales
     coefficients independently per env on each reset.
-    Torque uses :math:`\\tau = K_p e + K_i\\int e\\,dt - K_d \\dot\\omega + K_f \\dot\\omega^{des}`
-    with measured body rate :math:`\\omega` and rate setpoint :math:`\\omega^{des}`.
+    Torque (rate loop, derivative on measurement — no setpoint kick on D):
+
+        e = ω_des − ω
+        τ = Kp·e + Ki·∫e dt − Kd·ω_dot_meas + Kf·(ω_des − ω_des_prev)/Δt
+
+    ``pid_*`` numerators map to N·m via ``pid_scales`` and ``*term_scale`` (set
+    ``dterm_scale=1`` when ``pid_d`` holds physical Kd from ``design_rate_pd_gains.py``).
 
     Uses clamped actions only (no action delay buffer or env ``action_noise`` path).
     """
@@ -230,6 +253,22 @@ class QuadcopterRatesAction(ActionTerm):
         self._kd_base = _axis_coeff("pid_d", cfg.dterm_scale)
         self._kf_base = _axis_coeff("pid_f", cfg.feedforward_scale)
 
+        self._sitl_enabled = self.cfg.actuator_model == "betaflight_sitl"
+        self._sitl_max_thrust_per_motor = float(self.cfg.sitl_max_total_thrust) / 4.0
+        self._sitl_rotor_positions = torch.tensor(
+            self.cfg.sitl_rotor_positions_body,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._sitl_rotor_directions = torch.tensor(
+            self.cfg.sitl_rotor_directions,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._sitl_allocation = self._build_sitl_allocation_matrix()
+        self._sitl_allocation_pinv = torch.linalg.pinv(self._sitl_allocation)
+        self._sitl_throttle_curve_x, self._sitl_throttle_curve_y = self._load_sitl_throttle_curve()
+
         n = env.num_envs
         self._kp_rand = torch.ones(n, 3, device=self.device, dtype=torch.float32)
         self._ki_rand = torch.ones(n, 3, device=self.device, dtype=torch.float32)
@@ -253,6 +292,51 @@ class QuadcopterRatesAction(ActionTerm):
             if env_ids is None or isinstance(env_ids, slice)
             else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         )
+
+    def _build_sitl_allocation_matrix(self) -> torch.Tensor:
+        """Maps per-motor thrusts to body wrench [Tz, tau_x, tau_y, tau_z]."""
+        x = self._sitl_rotor_positions[:, 0]
+        y = self._sitl_rotor_positions[:, 1]
+        return torch.stack(
+            (
+                torch.ones(4, device=self.device, dtype=torch.float32),
+                y,
+                -x,
+                self._sitl_rotor_directions * float(self.cfg.sitl_yaw_torque_coefficient),
+            ),
+            dim=0,
+        )
+
+    def _load_sitl_throttle_curve(self) -> tuple[torch.Tensor, torch.Tensor]:
+        path = self.cfg.sitl_calibration_path
+        points = [(0.0, 0.0), (1.0, 1.0)]
+        if path:
+            p = Path(path).expanduser()
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            with p.open("r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            points = data.get("throttle_to_motor_output", points)
+        if len(points) < 2:
+            raise ValueError("SITL throttle calibration requires at least two points")
+        points = sorted((float(x), float(y)) for x, y in points)
+        xs = torch.tensor([p[0] for p in points], device=self.device, dtype=torch.float32)
+        ys = torch.tensor([p[1] for p in points], device=self.device, dtype=torch.float32)
+        if torch.any(xs[1:] <= xs[:-1]):
+            raise ValueError("SITL throttle calibration x values must be strictly increasing")
+        return xs, ys
+
+    def _sitl_throttle_to_motor_output(self, throttle: torch.Tensor) -> torch.Tensor:
+        x = self._sitl_throttle_curve_x
+        y = self._sitl_throttle_curve_y
+        throttle = throttle.clamp(float(x[0]), float(x[-1]))
+        idx = torch.searchsorted(x, throttle, right=True).clamp(1, x.numel() - 1)
+        x0 = x[idx - 1]
+        x1 = x[idx]
+        y0 = y[idx - 1]
+        y1 = y[idx]
+        alpha = (throttle - x0) / (x1 - x0)
+        return y0 + alpha * (y1 - y0)
 
     def _resample_pid_gain_randomization(self, env_ids: Sequence[int] | None) -> None:
         """Uniform multipliers in ``[1-f, 1+f]`` per env × axis for each PIDF term (``f`` from cfg)."""
@@ -421,6 +505,9 @@ class QuadcopterRatesAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         delayed_actions = self._compute_delayed_actions(actions)
         thrust_cmd = (delayed_actions[:, 0] + 1.0) * 0.5
+        # Betaflight SITL parity caps throttle (cfg default None = no cap).
+        if self.cfg.thrust_command_limit is not None:
+            thrust_cmd = thrust_cmd.clamp(max=float(self.cfg.thrust_command_limit))
         self._thrust.zero_()
         self._moment.zero_()
         self._thrust[:, 0, 2] = self._thrust_to_weight * self._robot_weight * thrust_cmd
@@ -438,38 +525,67 @@ class QuadcopterRatesAction(ActionTerm):
         if ilim is not None and ilim > 0.0:
             self._rate_integral.clamp_(-ilim, ilim)
 
-        omega_dot = torch.zeros_like(omega_meas)
-        omega_des_dot = torch.zeros_like(omega_meas)
-        mask_deriv = ~self._rate_pid_hold_derivative
-        omega_dot[mask_deriv] = (omega_meas[mask_deriv] - self._omega_prev[mask_deriv]) / dt
-        omega_des_dot[mask_deriv] = (omega_des[mask_deriv] - self._omega_des_prev[mask_deriv]) / dt
-        self._omega_prev[:] = omega_meas
+        # D on measured angular acceleration from physics (controller body frame):
+        #   body_ang_acc_w (world) -> selected body frame via body_quat_w[:, body_id]
+        alpha_w = self._asset.data.body_ang_acc_w[:, self._body_id, :]
+        if alpha_w.ndim == 3:
+            alpha_w = alpha_w.squeeze(1)
+        body_quat_w = self._asset.data.body_quat_w[:, self._body_id]
+        omega_dot_meas = quat_apply_inverse(body_quat_w, alpha_w)
+
+
+
+        use_deriv = ~self._rate_pid_hold_derivative
+        omega_des_dot = torch.zeros_like(omega_des)
+        omega_des_dot[use_deriv] = (omega_des[use_deriv] - self._omega_des_prev[use_deriv]) / dt
+
         self._omega_des_prev[:] = omega_des
         self._rate_pid_hold_derivative[:] = False
 
-        tau = (
-            self._kp_rand * self._kp_base * err
-            + self._ki_rand * self._ki_base * self._rate_integral
-            - self._kd_rand * self._kd_base * omega_dot
-            + self._kf_rand * self._kf_base * omega_des_dot
-        )
+        kp = self._kp_rand * self._kp_base
+        ki = self._ki_rand * self._ki_base
+        kd = self._kd_rand * self._kd_base
+        kf = self._kf_rand * self._kf_base
+        tau = kp * err + ki * self._rate_integral - kd * omega_dot_meas + kf * omega_des_dot
+
 
         tlim = self.cfg.torque_limit
         if tlim is not None and tlim > 0.0:
             tau = tau.clamp(-tlim, tlim)
 
-        self._moment[:, 0, :] = tau
-        if self.cfg.aero_randomization_enable:
-            lin_vel_b = self._asset.data.root_lin_vel_b
-            ang_vel_b = self._asset.data.root_ang_vel_b
-            self._thrust[:, 0, :] += (
-                -self._linear_drag * lin_vel_b
-                - self._quadratic_drag * lin_vel_b.abs() * lin_vel_b
+        if self._sitl_enabled:
+            motor_cmd = self._sitl_throttle_to_motor_output(thrust_cmd)
+            base_motor_thrust = self._sitl_max_thrust_per_motor * motor_cmd.square()
+            desired_wrench = torch.cat(
+                ((base_motor_thrust * 4.0).unsqueeze(-1), tau),
+                dim=-1,
             )
-            self._moment[:, 0, :] += -self._angular_drag * ang_vel_b
+            motor_thrusts = desired_wrench @ self._sitl_allocation_pinv.T
+            motor_thrusts = motor_thrusts.clamp(0.0, self._sitl_max_thrust_per_motor)
+            realized_wrench = motor_thrusts @ self._sitl_allocation.T
+            yaw_damping = -float(self.cfg.sitl_yaw_damping_coefficient) * omega_meas[:, 2]
+            self._thrust[:, 0, 2] = realized_wrench[:, 0]
+            self._moment[:, 0, 0] = realized_wrench[:, 1]
+            self._moment[:, 0, 1] = realized_wrench[:, 2]
+            self._moment[:, 0, 2] = realized_wrench[:, 3] + yaw_damping
+            if hasattr(self._env, "_motor_speeds"):
+                self._env._motor_speeds[:] = torch.sqrt(
+                    motor_thrusts / self._sitl_max_thrust_per_motor
+                )
+        else:
+            # self._thrust[:, 0, 2] was already set from thrust_cmd above.
+            self._moment[:, 0, :] = tau
+            if self.cfg.aero_randomization_enable:
+                lin_vel_b = self._asset.data.root_lin_vel_b
+                ang_vel_b = self._asset.data.root_ang_vel_b
+                self._thrust[:, 0, :] += (
+                    -self._linear_drag * lin_vel_b
+                    - self._quadratic_drag * lin_vel_b.abs() * lin_vel_b
+                )
+                self._moment[:, 0, :] += -self._angular_drag * ang_vel_b
         self._processed_actions[:] = delayed_actions
 
-        if hasattr(self._env, "_mixer_b_inv") and hasattr(self._env, "_motor_speeds"):
+        if not self._sitl_enabled and hasattr(self._env, "_mixer_b_inv") and hasattr(self._env, "_motor_speeds"):
             T_col = self._thrust[:, 0, 2]
             tau_b = self._moment[:, 0, :]
             wrench = torch.cat([T_col.unsqueeze(-1), tau_b], dim=-1).to(
@@ -508,6 +624,11 @@ class QuadcopterRatesActionCfg(ActionTermCfg):
     #: Maps normalized rate sticks ``[-1, 1]`` to desired body angular rates [rad/s].
     rate_command_scale: float = 20.0 #This has to be defined based on the drone body rates limits
 
+    #: ``direct`` keeps the original body thrust + direct body torque model.
+    #: ``betaflight_sitl`` allocates the requested wrench through the SITL rotor geometry.
+    actuator_model: str = "direct"
+    thrust_command_limit: float | None = None
+
     #: Source for default values: ``https://github.com/betaflight/betaflight/blob/master/src/main/flight/pid.h``
     pterm_scale: float = 0.032029
     iterm_scale: float = 0.244381
@@ -538,6 +659,33 @@ class QuadcopterRatesActionCfg(ActionTermCfg):
     #: Per-axis torque magnitude limit [N·m]; ``None`` disables.
     torque_limit: float | None = None
 
+    sitl_mass_kg: float = _SITL_MASS_KG
+    sitl_max_total_thrust: float = _SITL_MAX_TOTAL_THRUST_N
+    sitl_yaw_torque_coefficient: float = _SITL_YAW_TORQUE_COEFFICIENT
+    sitl_yaw_damping_coefficient: float = _SITL_YAW_DAMPING_COEFFICIENT
+    sitl_rotor_positions_body: tuple[tuple[float, float, float], ...] = _SITL_ROTOR_POSITIONS_BODY
+    sitl_rotor_directions: tuple[float, float, float, float] = _SITL_ROTOR_DIRECTIONS
+    sitl_calibration_path: str | None = None
+
+
+@configclass
+class BetaflightSitlSurrogateActionCfg(QuadcopterRatesActionCfg):
+    """SITL-parity rates action using Betaflight/Gazebo rotor semantics."""
+
+    actuator_model: str = "betaflight_sitl"
+    thrust_to_weight: float = 4.0
+    rate_command_scale: float = 9.0
+    thrust_command_limit: float | None = 0.6
+    pterm_scale: float = 1.0
+    iterm_scale: float = 0.0
+    dterm_scale: float = 0.0
+    feedforward_scale: float = 0.0
+    pid_scales: float = 1.0
+    pid_p: tuple[float, float, float] = (0.281, 0.281, 0.281)
+    pid_i: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pid_d: tuple[float, float, float] = (0.04, 0.04, 0.04)
+    pid_f: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    torque_limit: float | None = 2.0
 
 class QuadcopterSecondOrderRatesAction(QuadcopterRatesAction):
     """Apply thrust as a body force and impose second-order body-rate tracking directly.
