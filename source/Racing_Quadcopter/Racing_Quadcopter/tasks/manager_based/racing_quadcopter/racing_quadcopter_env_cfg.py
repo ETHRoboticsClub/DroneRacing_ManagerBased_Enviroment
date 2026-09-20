@@ -732,6 +732,12 @@ class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
         """
         if not self.enable_fpv_camera:
             return
+        if not DRONE_MODEL.startswith("anemos"):
+            raise ValueError(
+                f"The FPV camera mounts on the Anemos 'camera_keypoint' body, which the "
+                f"{DRONE_MODEL!r} profile does not have. Set "
+                f"{DRONE_MODEL_ENV_VAR}=anemos_urdf (see fpv_play.sh)."
+            )
         self.scene.fpv_camera = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/camera_keypoint/fpv_camera",
             update_period=1 / 30,
