@@ -1094,4 +1094,8 @@ class RacingQuadcopterEnvCfg_FIXED_PLAY_FPV(RacingQuadcopterEnvCfg_FIXED_PLAY):
         self.terminations.time_out = None
         self.episode_length_s = 1.0e6
 
+        # The adaptive curricula key off the lap_complete termination, which no longer
+        # exists here. This is a demo config, so no curriculum should run anyway.
+        self.adaptive_curriculum_enabled = False
+
         print("[INFO] FPV race evaluation mode is ON (main=env_0, opponent=env_1).")
