@@ -251,9 +251,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping (SKRL 2.0.0 added a required `states` positional arg)
+            # agent stepping — some SKRL versions add an extra positional slot
+            # (e.g. RNN hidden state) before ``timestep``/``timesteps``; others
+            # just renamed the observations param to ``states`` without adding
+            # one. Checking the param *count* (not just the name ``states``)
+            # tells the two apart: 4 params means the extra slot exists.
             _act_sig = inspect.signature(runner.agent.act).parameters
-            if "states" in _act_sig:
+            if len(_act_sig) >= 4:
                 outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
             else:
                 outputs = runner.agent.act(obs, timestep=0, timesteps=0)

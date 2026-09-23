@@ -438,10 +438,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
         with torch.inference_mode():
             # skrl agent APIs differ across versions/algorithms in whether
-            # ``act`` takes a ``states`` arg — inspect the signature once per
-            # step rather than hardcoding a version.
+            # ``act`` takes an extra positional slot (e.g. RNN hidden state)
+            # before ``timestep``/``timesteps`` — some versions instead just
+            # renamed the observations param to ``states`` without adding
+            # one. Param *count* (not the name ``states``) tells them apart:
+            # 4 params means the extra slot exists.
             _act_sig = inspect.signature(runner.agent.act).parameters
-            if "states" in _act_sig:
+            if len(_act_sig) >= 4:
                 outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
             else:
                 outputs = runner.agent.act(obs, timestep=0, timesteps=0)
