@@ -70,8 +70,33 @@ def penalty_ang_vel(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def penalty_action_magnitude(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """``‖a‖²`` — mild regulariser. No dt scaling (event-like)."""
-    return env._actions_buf.square().sum(dim=1)
+    """``‖a_rates‖²`` — mild regulariser on the 3 rate channels only.
+
+    Deliberately excludes the thrust channel (index 0): penalizing it toward
+    ``a=0`` implicitly biases the policy toward whatever thrust ``a=0``
+    happens to command, which is only the hover point by coincidence of a
+    particular ``thrust_to_weight``. See ``penalty_thrust_offset_from_hover``
+    for the term that correctly targets the T2W-dependent hover action.
+    """
+    return env._actions_buf[:, 1:].square().sum(dim=1)
+
+
+def penalty_thrust_offset_from_hover(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """``(a_thrust - a_hover)²`` — pulls the thrust action toward the hover point.
+
+    ``a_thrust=0`` maps to ``thrust_to_weight/2`` g of thrust (see
+    ``QuadcopterRatesAction.process_actions``), which only coincides with the
+    1g hover point when ``thrust_to_weight == 2``. At the racing profile's
+    T2W=4.1, ``a=0`` commands ~2g (net climb) and the true hover action is
+    ``2/T2W - 1 ≈ -0.51`` — far from the policy's initial mean (~0, with
+    ``init_noise_std=1.0``), so an untrained policy is as likely to climb
+    into the ceiling termination as to find the hover reward basin by chance.
+    This term gives a dense gradient toward the correct equilibrium from the
+    first rollout, independent of whatever T2W the drone profile uses.
+    """
+    t2w = env.cfg.actions.rates.thrust_to_weight
+    hover_action = 2.0 / t2w - 1.0
+    return (env._actions_buf[:, 0] - hover_action).square()
 
 
 def penalty_oversaturation(env: ManagerBasedRLEnv) -> torch.Tensor:

@@ -45,7 +45,7 @@ DRONE_MODEL_ENV_VAR = "HOVERING_DRONE_MODEL"
 WAYPOINTS_ENV_VAR = "WAYPOINTS"
 
 _ALLOWED_DRONE_MODELS = ("anemos_usd", "anemos_urdf")
-DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_usd")
+DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_urdf")
 assert DRONE_MODEL in _ALLOWED_DRONE_MODELS, (
     f"Invalid {DRONE_MODEL_ENV_VAR}={DRONE_MODEL!r}. Allowed: {_ALLOWED_DRONE_MODELS}"
 )
@@ -71,6 +71,12 @@ class WaypointRewardWeights:
     LIN_VEL: float = -0.04                 # -0.2 * 0.2 (old direct-env value)
     ANG_VEL: float = -0.1
     ACTION_MAGNITUDE: float = -0.01
+    # Dense shaping toward the T2W-correct hover thrust action; see
+    # ``rewards.penalty_thrust_offset_from_hover``. Needed because at the
+    # racing profile's T2W=4.1, a=0 commands ~2g (climb), not hover, so the
+    # untrained policy (mean~0) has no natural gradient toward the hover
+    # basin without this term.
+    THRUST_HOVER_BIAS: float = -0.05
     OVERSATURATION: float = -0.0001
     ACTION_SMOOTHNESS: float = -0.025
     CRASH: float = -2000.0
@@ -226,6 +232,9 @@ class RewardsCfg:
     ang_vel = RewTerm(func=rewards.penalty_ang_vel, weight=WaypointRewardWeights.ANG_VEL)
     action_magnitude = RewTerm(
         func=rewards.penalty_action_magnitude, weight=WaypointRewardWeights.ACTION_MAGNITUDE
+    )
+    thrust_hover_bias = RewTerm(
+        func=rewards.penalty_thrust_offset_from_hover, weight=WaypointRewardWeights.THRUST_HOVER_BIAS
     )
     oversaturation = RewTerm(
         func=rewards.penalty_oversaturation, weight=WaypointRewardWeights.OVERSATURATION

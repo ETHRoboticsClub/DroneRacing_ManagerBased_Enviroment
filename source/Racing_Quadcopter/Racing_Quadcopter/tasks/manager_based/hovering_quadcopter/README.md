@@ -65,13 +65,17 @@ WAYPOINTS=configs/waypoint_tracks/example.yaml \
 python scripts/skrl/train.py --task Isaac-Hovering-Quadcopter-Manager-v0 --headless
 ```
 
-**Drone model** (default `anemos_usd`; deliberately a separate env var from
+**Drone model** (default `anemos_urdf`; deliberately a separate env var from
 racing's `DRONE_MODEL` so the two tasks can run side-by-side with different
 drones):
 
 ```bash
-HOVERING_DRONE_MODEL=anemos_urdf python scripts/skrl/train.py --task Isaac-Hovering-Quadcopter-Manager-v0 --headless
+HOVERING_DRONE_MODEL=anemos_usd python scripts/skrl/train.py --task Isaac-Hovering-Quadcopter-Manager-v0 --headless
 ```
+
+`anemos_usd` requires a pre-converted USD (see
+`scripts/tools/generate_anemos_usd.py`); the URDF default needs no conversion
+step.
 
 ### RSL-RL — works, but check the reward scale first
 
