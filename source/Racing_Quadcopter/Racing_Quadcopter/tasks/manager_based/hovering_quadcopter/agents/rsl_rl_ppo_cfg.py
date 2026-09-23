@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""PPO runner config for the hovering env under the ``rsl_rl`` library.
+"""
+
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
@@ -10,7 +13,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class HoveringQuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 48
+    num_steps_per_env = 48  # rollout length per env before each PPO update
     max_iterations = 10000
     save_interval = 500
     experiment_name = "hovering_quadcopter_manager"
@@ -30,9 +33,9 @@ class HoveringQuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
-        schedule="adaptive",
+        schedule="adaptive",  # adapts LR based on desired_kl
         gamma=0.99,
-        lam=0.95,
+        lam=0.95,  # GAE lambda
         desired_kl=0.01,
         max_grad_norm=1.0,
     )

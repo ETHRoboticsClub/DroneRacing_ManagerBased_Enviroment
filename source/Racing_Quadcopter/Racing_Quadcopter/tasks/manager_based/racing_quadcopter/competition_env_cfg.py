@@ -36,14 +36,13 @@ from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import matrix_from_quat, quat_apply
 
-from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_URDF
 from Racing_Quadcopter.terrains import load_gates_from_yaml
 from Racing_Quadcopter.terrains.racing_gates_cfg import MeshFixedGatesTerrainCfg
 
 from .mdp import events, observations
 from .mdp.actions import QuadcopterRatesActionCfg
 from .mdp.noise import drone_noise_model_factory
-from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, TRACK_YAML_ENV_VAR, _make_profile
+from .racing_quadcopter_env_cfg import RacingQuadcopterEnvCfg, TRACK_YAML_ENV_VAR, DRONE_PROFILES
 
 # ---------------------------------------------------------------------------
 # Track frame
@@ -125,27 +124,15 @@ def create_competition_gate_frame(
 
 # ---------------------------------------------------------------------------
 # Custom racing-drone profile.
-# A ~0.85 kg 5"-class racing airframe (Anemos URDF, converted on the fly). The
-# control parameters are tuned for that airframe; the env consumes
-# ``thrust_to_weight`` + the body-rate PID gains for the collective-thrust /
-# body-rates action (no direct motor mixing is used here).
+# A ~0.85 kg 5"-class racing airframe (Anemos URDF, converted on the fly).
+# References the same DRONE_PROFILES["anemos_urdf"] entry racing uses, rather
+# than a hand-copied literal, so any future re-tuning of Anemos from flight
+# data lands here automatically instead of silently drifting out of sync. The
+# env consumes ``thrust_to_weight`` + the body-rate PID gains for the
+# collective-thrust / body-rates action (no direct motor mixing is used here;
+# ``moment_scale`` on the profile is unused by this action type).
 # ---------------------------------------------------------------------------
-COMPETITION_PROFILE = _make_profile(
-    ANEMOS_DRONE_CFG_URDF,
-    body_name="base_link",
-    thrust_to_weight=4.1056,
-    moment_scale=(1.16, 1.40, 0.020),  # unused by the rates action; kept for completeness
-    motor_k_t=8.54858e-6,
-    motor_k_d=1e-8,
-    motor_arm_length_m=0.110,
-    motor_omega_max_rad_s=1000.0,
-    rate_command_scale=30.0,           # full stick -> 30 rad/s body-rate setpoint
-    pid_scales=0.005,
-    pid_p=(45.0, 47.0, 0.64),
-    pid_i=(0.0, 0.0, 0.0),
-    pid_d=(32.0, 34.0, 0.45),
-    pid_f=(0.0, 0.0, 0.0),
-)
+COMPETITION_PROFILE = DRONE_PROFILES["anemos_urdf"]
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +428,14 @@ class CompetitionEventsCfg:
             "recompute_inertia": True,
         },
     )
+    randomize_base_com = EventTerm(
+        func=events.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
+        },
+    )
     randomize_robot_actuator_gains = EventTerm(
         func=events.randomize_actuator_gains,
         mode="startup",
@@ -605,6 +600,7 @@ class CompetitionEnvCfg(RacingQuadcopterEnvCfg):
         # --- standalone domain randomization (no base _apply_dr_flags) ---
         if not self.domain_randomization:
             self.events.randomize_robot_mass = None
+            self.events.randomize_base_com = None
             self.events.randomize_robot_actuator_gains = None
             self.events.base_external_force_torque = None
         self.observations.policy.enable_corruption = self.domain_randomization

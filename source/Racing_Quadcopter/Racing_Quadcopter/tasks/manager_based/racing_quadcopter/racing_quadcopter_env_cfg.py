@@ -136,8 +136,10 @@ DRONE_PROFILES: dict[str, DroneProfile] = {
         rate_command_scale=30.0,
         pid_scales=0.005,
         # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
-        # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
-        #      D=0: yaw authority is too low for derivative term to add meaningful damping
+        # yaw: pid_p=0.64, pid_d=0.45 — nonzero derivative damping. Yaw authority
+        #      is by far the tightest of the three axes (moment_scale=0.020 N·m,
+        #      vs 1.16/1.40 for roll/pitch), so gains here stay proportionally
+        #      much smaller to avoid saturating that torque budget.
         pid_p=(45.0, 47.0, 0.64),
         pid_i=(0.0, 0.0, 0.0),
         pid_d=(32.0, 34.0, 0.45),
@@ -190,7 +192,7 @@ OBSERVATION_SPACE_ENV_VAR = "OBSERVATION_SPACE"
 _ACTION_TYPES = ("rates", "moments")
 _OBSERVATION_SPACES = ("mono_race", "ours")
 
-DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "crazyflie")
+DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_urdf")
 ACTION_TYPE = _os.environ.get(ACTION_TYPE_ENV_VAR, "moments")
 OBSERVATION_SPACE = _os.environ.get(OBSERVATION_SPACE_ENV_VAR, "ours")
 
@@ -664,29 +666,11 @@ class RacingQuadcopterEnvCfg_PLAY(RacingQuadcopterEnvCfg):
 # ---------------------------------------------------------------------------
 # Tracks are defined in YAML under ``configs/tracks/``. The path is set on
 # ``RacingQuadcopterEnvCfg_FIXED.gate_track_yaml`` and can be overridden via the
-# ``RACING_GATE_TRACK_YAML`` env variable (read in __post_init__ before terrain
+# ``TRACK_YAML`` env variable (read in __post_init__ before terrain
 # generation, so it works through subprocess launches like the sweep runner).
-#
-# Legacy hard-coded layouts kept for reference — see configs/tracks/default.yaml
-# and configs/tracks/simple.yaml for the YAML equivalents.
+# See configs/tracks/default.yaml (full circuit) and configs/tracks/simple.yaml
+# (4-gate diamond) for the shipped layouts.
 # ---------------------------------------------------------------------------
-# FIXED_GATES (full circuit, see configs/tracks/default.yaml):
-#   GateSpec(position=(7.5,  2.0, 1.2), yaw_deg=0),
-#   GateSpec(position=(12.5, 4.5, 2.5), yaw_deg=65),
-#   GateSpec(position=(13.5, 9.0, 4.5), yaw_deg=105),
-#   GateSpec(position=(10.5, 13.0, 4.5), yaw_deg=160),
-#   GateSpec(position=(7.5, 13.5, 4.2), yaw_deg=180),  # SPLIT-S entry
-#   GateSpec(position=(7.5, 12.0, 1.5), yaw_deg=0),    # SPLIT-S exit
-#   GateSpec(position=(4.0, 10.5, 2.0), yaw_deg=270),
-#   GateSpec(position=(1.8,  7.5, 1.5), yaw_deg=230),
-#   GateSpec(position=(3.5,  3.5, 1.8), yaw_deg=350),
-#   GateSpec(position=(5.5,  2.0, 2.5), yaw_deg=25),
-#
-# FIXED_GATES_simple (4-gate diamond, see configs/tracks/simple.yaml):
-#   GateSpec(position=(7.5, 5.0, 4.5), yaw_deg=45),
-#   GateSpec(position=(7.5, 7.5, 4.5), yaw_deg=315),
-#   GateSpec(position=(5.0, 7.5, 4.5), yaw_deg=225),
-#   GateSpec(position=(5.0, 5.0, 4.5), yaw_deg=135),
 
 
 @configclass
@@ -694,7 +678,7 @@ class RacingQuadcopterEnvCfg_FIXED(RacingQuadcopterEnvCfg):
     """Training config with a fixed, deterministic racing circuit.
 
     The track is loaded from ``gate_track_yaml`` (a path to a track YAML, see
-    ``configs/tracks/default.yaml`` for the format). The ``RACING_GATE_TRACK_YAML``
+    ``configs/tracks/default.yaml`` for the format). The ``TRACK_YAML``
     environment variable takes precedence — useful for subprocess overrides
     (sweep runner) since cfg-attribute overrides via ``--override`` are applied
     *after* ``__post_init__`` and therefore too late to influence track generation.

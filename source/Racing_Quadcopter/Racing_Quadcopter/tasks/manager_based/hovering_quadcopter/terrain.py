@@ -48,7 +48,7 @@ def create_waypoint_terrain(
     num_cols: int = 8,
     cell_size: tuple[float, float] = (15.0, 15.0),
 ) -> TerrainGeneratorCfg:
-    """Return a TerrainGeneratorCfg that tiles an ``num_rows × num_cols`` grid
+    """Return a TerrainGeneratorCfg that tiles an ``num_rows x num_cols`` grid
     of flat plane cells. The env stores ``terrain_origins`` and uses one
     pre-generated waypoint track per cell.
     """

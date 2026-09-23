@@ -56,25 +56,24 @@ PROFILE = DRONE_PROFILES[DRONE_MODEL]
 # Weight dataclass (scaled by 100 so SKRL's rewards_shaper_scale=0.01 restores
 # the human-readable magnitudes — matches the racing convention)
 # ---------------------------------------------------------------------------
-# Mirror of the old direct-env hovering weights, pre-multiplied by the old
-# env's ``reward_scale = 0.2``. ``@scale_dataclass_attributes(100.0)`` then
-# scales by 100 so SKRL's ``rewards_shaper_scale = 0.01`` recovers the
-# original effective magnitudes.
-#
-# Source values (from the direct env's ``RewardWeights`` dataclass):
-#   lin_vel = -0.2,  ang_vel = -0.05,  distance_to_goal = -1.0,
-#   action_magnitude = -0.02,  oversaturation = -0.03,
-#   action_smoothness = -0.02,  crashed = -100.0,  reward_scale = 0.2
+# Weights below started as the old direct-env hovering weights pre-multiplied
+# by that env's ``reward_scale = 0.2``, but ANG_VEL / ACTION_MAGNITUDE /
+# OVERSATURATION / ACTION_SMOOTHNESS have since been re-tuned away from that
+# formula (only DISTANCE_TO_WAYPOINT and LIN_VEL still equal source * 0.2) —
+# treat the values below as the current, deliberately-tuned ground truth, not
+# as still being derived from the old env. ``@scale_dataclass_attributes(100.0)``
+# scales all of them by 100 so SKRL's ``rewards_shaper_scale = 0.01`` recovers
+# these magnitudes at the effective-reward level.
 @scale_dataclass_attributes(100.0)
 @dataclass
 class WaypointRewardWeights:
-    DISTANCE_TO_WAYPOINT: float = -0.2    # -1.0 * 0.2
-    LIN_VEL: float = -0.04                 # -0.2 * 0.2
-    ANG_VEL: float = -0.1                 # -0.05 * 0.2
-    ACTION_MAGNITUDE: float = -0.01       # -0.02 * 0.2
-    OVERSATURATION: float = -0.0001         # -0.03 * 0.2
-    ACTION_SMOOTHNESS: float = -0.025      # -0.02 * 0.2
-    CRASH: float = -2000.0 
+    DISTANCE_TO_WAYPOINT: float = -0.2    # -1.0 * 0.2 (old direct-env value)
+    LIN_VEL: float = -0.04                 # -0.2 * 0.2 (old direct-env value)
+    ANG_VEL: float = -0.1
+    ACTION_MAGNITUDE: float = -0.01
+    OVERSATURATION: float = -0.0001
+    ACTION_SMOOTHNESS: float = -0.025
+    CRASH: float = -2000.0
     # Waypoint-task extensions (not in the old direct env).
     WAYPOINT_COLLECTED: float = 1000.0       # sparse bonus on collection
     HOLDING: float = 2.0                   # optional; safe to comment out
@@ -120,18 +119,13 @@ class HoveringQuadcopterSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     rates: QuadcopterRatesActionCfg = QuadcopterRatesActionCfg(
         asset_name="robot",
-        # Override two racing-tuned profile values for a hovering task:
-        #
-        # * ``thrust_to_weight``: racing profile is 4.1, so action=0 produces
-        #   2g of thrust and the hover-equilibrium action is ≈ -0.51. With
-        #   ``initial_log_std=1.0`` the early actor centred at action≈0
-        #   climbs at 1g until it crashes the ceiling, never finding the
-        #   hover bonus. T2W=1.9 places hover at action ≈ 0 (matches the old
-        #   direct hovering env exactly).
-        # * ``rate_command_scale``: racing uses 30 rad/s; ±10 is plenty for
+        # * ``rate_command_scale``:  mapsthe roll/pitch/yaw action 
+        #  channels [-1,1] to a desired body rate in
+        # rad/s. Racing uses 30 rad/s; ±10 is plenty for
         #   hovering and prevents the yaw axis (very low PID-P on anemos)
         #   from drifting into a persistent spin.
-        thrust_to_weight=1.9,
+
+        thrust_to_weight=PROFILE.thrust_to_weight,
         action_dim=4,
         body_name=PROFILE.body_name,
         pid_scales=PROFILE.pid_scales,
@@ -139,6 +133,10 @@ class ActionsCfg:
         pid_i=PROFILE.pid_i,
         pid_d=PROFILE.pid_d,
         pid_f=PROFILE.pid_f,
+        # If this policy is ever deployed to the real
+        # Anemos, the flight controller's rate limit must be set to match
+        # (10 rad/s), or the real drone will respond more aggressively than
+        # what the policy learned in sim.
         rate_command_scale=10.0,
     )
 
@@ -183,10 +181,12 @@ class ObservationsCfg:
             func=observations.next_waypoints_rel_body,
             history_length=_HOVER_OBS_WINDOW,
         )
+        # Time it must spend at waypoints
         collection_time_const = ObsTerm(
             func=observations.collection_time_const,
             history_length=_HOVER_OBS_WINDOW,
         )
+        # Time spent at waypoints/Time it must spend
         collection_progress = ObsTerm(
             func=observations.collection_progress,
             history_length=_HOVER_OBS_WINDOW,
@@ -248,7 +248,7 @@ class RewardsCfg:
 # ---------------------------------------------------------------------------
 @configclass
 class EventsCfg:
-    '''randomize_robot_mass = EventTerm(
+    randomize_robot_mass = EventTerm(
         func=events.randomize_rigid_body_mass,
         mode="startup",
         params={
@@ -287,7 +287,8 @@ class EventsCfg:
             "force_range": (-0.02, 0.02),
             "torque_range": (-0.02, 0.02),
         },
-    )'''
+    )
+
     reset_scene_to_default = EventTerm(func=events.reset_scene_to_default, mode="reset")
     reset_waypoint_spawn = EventTerm(func=events.reset_waypoint_spawn, mode="reset")
 
@@ -365,7 +366,7 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     eval_mode: bool = False
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 50,
+        dt=0.02,
         render_interval=2,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -389,12 +390,14 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
             self.events.base_external_force_torque = None
 
     def __post_init__(self) -> None:
+        # Factory -> TerrainGeneratorCfg
         terrain_generator = create_waypoint_terrain(
             seed=self.seed,
             num_rows=self.terrain_num_rows,
             num_cols=self.terrain_num_cols,
             cell_size=self.cell_size,
         )
+        # Import to IsaacLab
         self.scene.terrain = TerrainImporterCfg(
             prim_path="/World/ground",
             terrain_type="generator",

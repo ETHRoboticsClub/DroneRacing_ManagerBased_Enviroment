@@ -21,9 +21,9 @@ Usage::
   - a name with extension ``oval.json``
   - a relative or absolute path containing ``/``
 
-The grid is forced to 1×1 with the cell sized to enclose the track + margin,
+The grid is forced to 1x1 with the cell sized to enclose the track + margin,
 and ``num_envs`` is forced to 1.  The simulator's racing-task code (rewards,
-spawn, vis, gate-passage detection) reads the same ``_gate_registry``
+spawn, vis, gate-passage detection) reads the same ``gate_registry``
 mechanism the procedural terrain uses, so no env code changes are needed.
 """
 
@@ -186,10 +186,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 from Racing_Quadcopter.terrains import racing_gates as _racing_gates
-from Racing_Quadcopter.terrains.racing_gates import (
-    GateData,
-    clear_gate_registry,
-)
+from Racing_Quadcopter.terrains import GateData, clear_gate_registry
 from Racing_Quadcopter.terrains.racing_gates_cfg import MeshRacingGatesTerrainCfg
 
 # Local import (track_io lives next to this script).
@@ -208,7 +205,7 @@ else:
 # ---------------------------------------------------------------------------
 # Custom-track terrain construction
 # ---------------------------------------------------------------------------
-# The simulator pulls gate data from the module-level ``_gate_registry`` in
+# The simulator pulls gate data from the module-level ``gate_registry`` in
 # Racing_Quadcopter.terrains.racing_gates (see racing_quadcopter_env.py:131).
 # To inject a custom track we replace the sub-terrain function with one that
 # writes our gates into that registry.  The env's centre-offset / origin
@@ -222,6 +219,11 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
     The closure captures the loaded track and emits gate trimesh frames at
     positions derived from it.  Each call also writes a ``GateData`` entry
     into the module-level registry so the env can pick it up at startup.
+
+    This factory runs once (in ``_custom_terrain_generator_cfg``) to parse the
+    JSON and interpolate the spline, since that only depends on the track, not
+    on ``difficulty``/``cfg`` — the closure reuses that result on every call
+    instead of recomputing it.
     """
     positions, quats_wxyz, meta = track_io.track_to_arrays(track)
     if positions.shape[0] == 0:
@@ -231,15 +233,12 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
     bar_thickness = float(meta["bar_thickness"])
     closed = bool(meta["loop_closed"])
 
-    # Pre-compute waypoints + first-tangent for the visualisers; they are the
-    # same data structure the procedural generator produces.
+    # Pre-compute waypoints for the visualisers; same data structure the
+    # procedural generator produces.
     if positions.shape[0] >= 2:
         waypoints, _ = track_io.interpolate_loop(positions, num_samples=300, closed=closed)
-        tangents = track_io.gate_tangents_from_spline(positions, closed=closed)
-        start_tangent = tangents[0]
     else:
         waypoints = positions.copy()
-        start_tangent = np.array([0.0, 1.0, 0.0])
 
     def custom_terrain_fn(difficulty: float, cfg) -> tuple[list, np.ndarray]:
         size = cfg.size
@@ -255,7 +254,7 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
         local_positions = positions + offset
 
         for pos, quat in zip(local_positions, quats_wxyz):
-            meshes_list.extend(_racing_gates._create_gate_frame(
+            meshes_list.extend(_racing_gates.create_gate_frame(
                 position=pos,
                 orientation=quat,
                 gate_size=gate_size,
@@ -267,13 +266,11 @@ def _build_custom_terrain_function(track: dict, gate_color=(1.0, 0.3, 0.0)):
         # spline trajectory through the gates.
         local_waypoints = waypoints + offset
 
-        _racing_gates._gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
+        _racing_gates.gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
             positions=local_positions.copy(),
             orientations=quats_wxyz.copy(),
             gate_size=gate_size,
             bar_thickness=bar_thickness,
-            start_position=local_positions[0].copy(),
-            start_tangent=start_tangent.copy(),
             waypoints=local_waypoints.copy(),
         )
 
@@ -290,7 +287,7 @@ def _custom_terrain_generator_cfg(
     margin: float,
     min_size: float,
 ) -> TerrainGeneratorCfg:
-    """Build a 1×1 ``TerrainGeneratorCfg`` whose single cell renders the track."""
+    """Build a 1x1 ``TerrainGeneratorCfg`` whose single cell renders the track."""
     positions, _, meta = track_io.track_to_arrays(track)
     if positions.shape[0] == 0:
         raise ValueError("Custom track contains no gates.")
@@ -331,7 +328,12 @@ def _custom_terrain_generator_cfg(
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, experiment_cfg: dict):
-    """Play with skrl agent on a custom track."""
+    """Play with skrl agent on a custom track.
+
+    Same flow as ``scripts/skrl/play.py`` (resolve checkpoint, build env,
+    run inference in a loop), with the terrain swapped for the custom track
+    before the env is constructed and ``num_envs`` pinned to 1.
+    """
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
 
@@ -368,6 +370,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     if args_cli.seed == -1:
         args_cli.seed = random.randint(0, 10000)
 
+    # Push the resolved seed into both the skrl experiment config and the env
+    # config so RNG-dependent behaviour (e.g. spawn jitter) is reproducible.
     experiment_cfg["seed"] = args_cli.seed if args_cli.seed is not None else experiment_cfg["seed"]
     env_cfg.seed = experiment_cfg["seed"]
 
@@ -389,6 +393,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     log_dir = os.path.dirname(os.path.dirname(resume_path))
     env_cfg.log_dir = log_dir
 
+    # Build the env with our patched env_cfg (custom terrain, num_envs=1).
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
@@ -432,11 +437,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         start_time = time.time()
 
         with torch.inference_mode():
+            # skrl agent APIs differ across versions/algorithms in whether
+            # ``act`` takes a ``states`` arg — inspect the signature once per
+            # step rather than hardcoding a version.
             _act_sig = inspect.signature(runner.agent.act).parameters
             if "states" in _act_sig:
                 outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
             else:
                 outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            # Prefer the deterministic mean action over a sampled one for
+            # evaluation/playback (no exploration noise).
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
             else:

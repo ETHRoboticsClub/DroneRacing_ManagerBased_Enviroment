@@ -188,7 +188,7 @@ class RacingQuadcopterRLEnv(ManagerBasedRLEnv):
             racing_gates_terrain() stores its output in a module-level dict because
             TerrainGenerator discards the function's return value. The dict is keyed
             by (difficulty, seed). TerrainGenerator differentiates the seed per cell,
-            so a 4×4 grid produces 16 unique registry entries — every cell has its own
+            so a 4x4 grid produces 16 unique registry entries — every cell has its own
             random gate layout. Difficulty varies per row (4 levels); columns within a
             row share difficulty but differ in seed, so their circuits are distinct.
 

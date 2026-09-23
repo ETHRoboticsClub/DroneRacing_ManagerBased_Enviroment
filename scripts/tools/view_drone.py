@@ -36,7 +36,7 @@ parser.add_argument(
     "--drone",
     type=str,
     choices=_DRONE_CHOICES,
-    default="crazyflie",
+    default="anemos_urdf",
     help="Robot profile from DRONE_PROFILES (same assets as the racing env).",
 )
 parser.add_argument(

@@ -8,11 +8,9 @@ scripts/custom_track/
 ├── track_designer.py      # PySide6 visual editor
 ├── play_custom_track.py   # load a saved track + run a trained policy
 ├── config.json            # default values for gate_size, bar_thickness, etc.
-├── tracks/                # where saved tracks live (JSON files)
-│   ├── track_01_slalom_straights.json
-│   └── ...
-└── tests/
-    └── test_play_custom_track.py   # offline smoke tests (no Isaac required)
+└── tracks/                # where saved tracks live (JSON files)
+    ├── track_01_slalom_straights.json
+    └── ...
 ```
 
 ---
@@ -34,6 +32,11 @@ Key functions:
 | `gate_tangents_from_spline(centres, closed)` | Unit tangent at each gate — used for auto-yaw |
 | `euler_to_quat_wxyz(yaw, pitch, roll)` | Intrinsic ZXY Euler → Isaac Lab `(w,x,y,z)` quaternion |
 | `quat_axes_wxyz(quats)` | Rotate canonical basis by each quaternion → `(right, forward, up)` |
+
+> `save_track()` only persists the schema fields listed below — it
+> silently drops any extra dict keys, e.g. `track_name`, `description`, `elements_tested`, or a
+> per-gate `comment`. Several of the shipped files under `tracks/*.json` carry that metadata;
+> opening one in the designer and saving over it discards it with no warning.
 
 **Track JSON format (schema v1):**
 ```json
@@ -57,6 +60,15 @@ Gate angles use **radians on disk**; the designer shows them in degrees.
 - `pitch` — tips the gate forward/back about its local right axis (`+X`, after yaw). Positive pitch tilts the top toward the incoming drone.
 - `roll` — banks the gate left/right about its local passage axis (`+Y`, after yaw + pitch).
 - `auto_yaw=true` — the stored yaw is ignored; the yaw is computed from the closed-loop spline tangent at that gate when `track_to_arrays` is called.
+
+> **Relationship to the environment's fixed-track YAML:** `configs/tracks/*.yaml`,
+> loaded by `Racing_Quadcopter.terrains.track_io.load_gates_from_yaml` for the actual gym tasks, is a
+> **different schema**: corner-origin local frame (not world frame), degrees (not radians), and yaw
+> measured **clockwise from +Y** (this JSON format's `yaw` is CCW from +Y, unnegated) — the same
+> numeric yaw value points in opposite physical directions between the two. There is currently no
+> converter between this JSON schema and that YAML schema; don't hand-port gate coordinates from one
+> to the other without re-deriving the angle. Full convention reference on the YAML side:
+> `source/Racing_Quadcopter/Racing_Quadcopter/terrains/README.md`.
 
 ---
 
@@ -84,15 +96,6 @@ python scripts/custom_track/play_custom_track.py \
 Pass a full path instead of a bare name if the track lives elsewhere:
 ```bash
 --track /absolute/path/to/track.json
-```
-
----
-
-### `tests/test_play_custom_track.py`
-Offline smoke tests that verify track-path resolution, terrain cell sizing, and the world↔local-frame coordinate round-trip. No Isaac Sim required.
-
-```bash
-python scripts/custom_track/tests/test_play_custom_track.py
 ```
 
 ---

@@ -40,7 +40,7 @@ class GateData:
     All arrays are in the sub-terrain's **local corner-origin frame** — i.e. the
     coordinate system where (0,0,0) is the corner of the terrain mesh as built by
     make_plane.  The environment must add the TerrainGenerator's centre-offset
-    (−size/2 in X and Y) and then the per-cell terrain_origin to convert to world
+    (-size/2 in X and Y) and then the per-cell terrain_origin to convert to world
     frame (see _setup_gate_tracking in racing_quadcopter_env.py).
     """
 
@@ -48,8 +48,6 @@ class GateData:
     orientations: np.ndarray    # [num_gates, 4]  quaternions (w, x, y, z), local frame
     gate_size: float            # aperture side length in metres (square gate)
     bar_thickness: float        # frame bar thickness in metres
-    start_position: np.ndarray  # [3]  first waypoint — informational
-    start_tangent: np.ndarray   # [3]  tangent at first waypoint — informational
     waypoints: np.ndarray       # [num_waypoints, 3]  trajectory sample points, local frame
 
 
@@ -85,7 +83,7 @@ def create_gate_frame(
 ) -> list[trimesh.Trimesh]:
     """Build a square gate frame from 4 axis-aligned box bars.
 
-    The gate opening is ``gate_size × gate_size`` in the gate's XZ plane (right × up).
+    The gate opening is ``gate_size x gate_size`` in the gate's XZ plane (right × up).
     Bars are extended by bar_thickness at each end so adjacent bars overlap at corners,
     avoiding visible gaps.
 

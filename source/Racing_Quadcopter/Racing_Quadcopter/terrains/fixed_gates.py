@@ -83,19 +83,11 @@ def fixed_gates_terrain(
     positions_arr = np.array(positions_list)
     orientations_arr = np.array(orientations_list)
 
-    # Forward direction of gate 0 (gate-local +Y rotated to world frame).
-    first_rot = tf.Rotation.from_quat(
-        [orientations_arr[0, 1], orientations_arr[0, 2], orientations_arr[0, 3], orientations_arr[0, 0]]
-    )
-    start_tangent = first_rot.apply([0.0, 1.0, 0.0])
-
     gate_registry[(round(difficulty, 6), cfg.seed)] = GateData(
         positions=positions_arr,
         orientations=orientations_arr,
         gate_size=cfg.gate_size,
         bar_thickness=cfg.bar_thickness,
-        start_position=positions_arr[0].copy(),
-        start_tangent=start_tangent,
         waypoints=positions_arr.copy(),  # gate centres used as trajectory waypoints for vis
     )
 

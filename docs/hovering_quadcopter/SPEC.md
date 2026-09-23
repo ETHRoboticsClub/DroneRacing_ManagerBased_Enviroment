@@ -151,7 +151,7 @@ effective magnitude in PPO equals the direct env's `weight × reward_scale`.
 | `action_smoothness`   | −0.025       | `‖a_t − a_{t-1}‖²`                                                       |
 | `crash`               | −2000.0      | indicator: `z < min_height ∨ z > max_height ∨ upside_down`               |
 | `waypoint_collected`  | +1000.0      | sparse +1 on the step the active target advances (new term)              |
-| `holding`             | +2.0         | +1 while inside `r_capture` (new, optional; safe to comment out)         |
+| `holding`             | +2.0         | +1 while in the holding state — from entering `r_capture` until drifting back out past `r_hold` (new, optional; safe to comment out) |
 
 ### Oversaturation plumbing
 
@@ -194,21 +194,23 @@ No collision termination (no obstacles in the hovering env).
 
 ### Active terms
 
-| event                    | mode  | params                                                   |
-|--------------------------|-------|----------------------------------------------------------|
-| `reset_scene_to_default` | reset | —                                                        |
-| `reset_waypoint_spawn`   | reset | spawn near waypoint 0 with ±0.3 m XY / ±0.1 m Z jitter   |
+| event                    | mode    | params                                                   |
+|--------------------------|---------|------------------------------------------------------------|
+| `reset_scene_to_default` | reset   | —                                                        |
+| `reset_waypoint_spawn`   | reset   | spawn near waypoint 0 with ±0.3 m XY / ±0.1 m Z jitter   |
+| `randomize_robot_mass`   | startup | mass scale ±10 %, `recompute_inertia=True`               |
+| `randomize_base_com`     | startup | CoM shift ±15 mm per axis                                |
+| `randomize_robot_actuator_gains` | startup | stiffness/damping scale ±10 %                     |
+| `base_external_force_torque` | interval (3-10 s) | force/torque ±0.02 (N / N·m)                  |
 
-### Commented-out DR (kept in source as a starting point)
+### DR toggle flags (all default off)
 
-`randomize_robot_mass`, `randomize_base_com`, `randomize_actuator_gains`,
-and `base_external_force_torque` are written in `EventsCfg` but commented
-out while the base reward / action setup is being stabilised. The matching
-flag fields on `HoveringQuadcopterEnvCfg`
-(`randomize_mass`, `randomize_com`, `randomize_actuator_gains`,
-`apply_external_disturbances`) and the `_apply_dr_flags()` helper are kept
-intact so DR can be re-enabled by uncommenting the block and flipping the
-flags.
+The four randomization terms above are defined in `EventsCfg` and gated by
+`HoveringQuadcopterEnvCfg` flags (`randomize_mass`, `randomize_com`,
+`randomize_actuator_gains`, `apply_external_disturbances`) via
+`_apply_dr_flags()`, which nulls out the corresponding `EventTerm` when its
+flag is `False`. All four flags default `False`, so DR is off by default —
+flip the relevant flag (e.g. `--override randomize_mass=True`) to enable it.
 
 `push_robot` (velocity-set kick) is intentionally **not** wired in — a
 deployed mocap drone is never physically pushed; aerodynamic / mass

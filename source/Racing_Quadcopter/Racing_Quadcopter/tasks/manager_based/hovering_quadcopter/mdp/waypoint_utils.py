@@ -40,7 +40,6 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
         env._all_collected_buf    [N] bool        episode-complete flag
         env._episode_collected_count [N] float    running total this episode
     """
-    n = env.num_envs
     drone_pos = env._robot.data.root_pos_w  # [N, 3]
     target_pos = _gather_current_waypoint(env)
     dist = torch.norm(target_pos - drone_pos, dim=1)  # [N]
@@ -56,14 +55,20 @@ def update_waypoint_state(env: ManagerBasedRLEnv) -> None:
     inside_capture = dist < r_capture
     inside_hold = dist < r_hold
 
+    # Snapshot pre-transition state: ``enter`` below mutates ``holding`` in
+    # place, and since entering the capture radius also satisfies inside_hold,
+    # reading ``holding`` (instead of this snapshot) for ``stay`` would give
+    # envs that just entered an extra +step_dt on top of the timer=0.0 just set.
+    was_holding = holding.clone()
+
     # Transition: idle → holding (entered tight radius).
-    enter = (~holding) & inside_capture
+    enter = (~was_holding) & inside_capture
     if enter.any():
         holding[enter] = True
         timer[enter] = 0.0
 
     # Stay in holding while we remain inside the lax radius — accumulate dwell.
-    stay = holding & inside_hold
+    stay = was_holding & inside_hold
     if stay.any():
         timer[stay] = timer[stay] + step_dt
 

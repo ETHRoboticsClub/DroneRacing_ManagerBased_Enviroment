@@ -22,7 +22,7 @@ regardless of policy frequency, matching the original direct env.
 Each function returns the **unweighted** factor for that term — shape [N].
 ``RewardManager`` multiplies by the configured weight from
 :class:`WaypointRewardWeights`. Each weight in the cfg is the original
-direct-env weight × the old env's ``reward_scale=0.2``; the
+direct-env weight x the old env's ``reward_scale=0.2``; the
 ``@scale_dataclass_attributes(100.0)`` decorator scales by 100 so SKRL's
 ``rewards_shaper_scale=0.01`` produces the original effective magnitudes.
 """
@@ -110,7 +110,12 @@ def reward_waypoint_collected(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def reward_holding(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """+1 while inside the capture radius. Shape [N].
+    """+1 while in the holding state. Shape [N].
+
+    ``env._holding`` is set True on entering ``r_capture`` and stays True
+    until the drone drifts back out past the looser ``r_hold`` radius (see
+    ``waypoint_utils.update_waypoint_state``) — so this reward covers the
+    whole holding zone, not just the tighter capture radius.
 
     Optional — designed to also work when the corresponding term is
     commented out of :class:`RewardsCfg`. The other terms (especially the

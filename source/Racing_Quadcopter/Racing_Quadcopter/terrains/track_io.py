@@ -25,6 +25,14 @@ from .racing_gates_cfg import GateSpec
 
 
 def _parse_rotation(raw) -> tuple[float, float, float]:
+    """
+    Args:
+        raw: None (defaults to 0), a 1-element sequence `[yaw]`, 
+            or a 3-element sequence `[roll, pitch, yaw]`.
+
+    Returns:
+        tuple[float, float, float]: `(roll, pitch, yaw)` in Euler angles.
+    """
     if raw is None:
         return 0.0, 0.0, 0.0
     if not isinstance(raw, (list, tuple)):

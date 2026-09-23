@@ -72,7 +72,7 @@ DroneRacing_ManagerBased_Enviroment/
 │           │       └── racing_quadcopter/
 │           │           ├── __init__.py                  # gym.register for all 4 tasks
 │           │           ├── racing_quadcopter_env.py     # RacingQuadcopterRLEnv class
-│           │           ├── racing_quadcopter_env_cfg.py # All configs + FIXED_GATES layout
+│           │           ├── racing_quadcopter_env_cfg.py # All configs; fixed tracks load from configs/tracks/*.yaml
 │           │           ├── agents/
 │           │           │   ├── skrl_ppo_cfg.yaml        # SKRL PPO hyperparameters
 │           │           │   └── rsl_rl_ppo_cfg.py        # RSL-RL PPO hyperparameters
@@ -541,9 +541,9 @@ class GateSpec:
     yaw_deg: float = 0.0                   # CW from +Y viewed from above
 ```
 
-The default `FIXED_GATES` (10-gate circuit in `racing_quadcopter_env_cfg.py`) includes a split-S maneuver (gates 4-5, 2.7 m altitude drop) and a chicane (gates 8-9).
+The default fixed track (`configs/tracks/default.yaml`, 10 gates) includes a split-S maneuver (gates 4-5, 2.7 m altitude drop) and a chicane (gates 8-9).
 
-An alternative `FIXED_GATES_` (4-gate square) is also defined for debugging.
+An alternative 4-gate diamond (`configs/tracks/simple.yaml`) is also available for debugging.
 
 ### 7.3 Gate Coordinate Convention
 
@@ -589,8 +589,6 @@ terrain_origin = terrain.terrain_origins[row, col]  # world origin of cell
 | `orientations` | `[G, 4]` np | Quaternions (w, x, y, z) |
 | `gate_size` | float | Aperture side length in metres |
 | `bar_thickness` | float | Bar diameter in metres |
-| `start_position` | `[3]` np | First trajectory waypoint |
-| `start_tangent` | `[3]` np | Tangent at first waypoint |
 | `waypoints` | `[W, 3]` np | Full trajectory sample points |
 
 **Env assignment:** env id `i` maps to cell `(row, col) = ((i // num_cols) % num_rows, i % num_cols)`. If `num_envs > num_cells`, the mapping wraps — multiple envs share the same layout but different terrain_origins.

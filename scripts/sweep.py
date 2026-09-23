@@ -234,7 +234,7 @@ def _apply_env_vars(env_vars: object) -> None:
 def _apply_gate_track(gate_track: object) -> None:
     """Dump an inline ``gate_track`` list to a temp YAML and expose it via env var.
 
-    The env_cfg reads ``RACING_GATE_TRACK_YAML`` in __post_init__ before terrain
+    The env_cfg reads ``TRACK_YAML`` in __post_init__ before terrain
     generation, which runs *before* ``--override`` is applied — so passing the
     track via env var (inherited by subprocesses) is the only way to inject it.
     """
@@ -254,8 +254,8 @@ def _apply_gate_track(gate_track: object) -> None:
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump({"gate_track": gate_track}, f, sort_keys=False)
 
-    os.environ["RACING_GATE_TRACK_YAML"] = track_path
-    print(f"[Sweep] Inline gate_track dumped to {track_path} (RACING_GATE_TRACK_YAML set).")
+    os.environ["TRACK_YAML"] = track_path
+    print(f"[Sweep] Inline gate_track dumped to {track_path} (TRACK_YAML set).")
 
 
 def _ensure_list(name: str, value: object) -> list:

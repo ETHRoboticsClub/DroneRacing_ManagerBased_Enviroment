@@ -39,14 +39,14 @@ class MeshRacingGatesTerrainCfg(SubTerrainBaseCfg):
     """Flat ground with racing gates placed along a procedural closed-loop trajectory.
 
     TerrainGenerator calls ``function(difficulty, cfg)`` once per terrain cell and
-    differentiates the seed per cell, so each of the 16 cells in a 4×4 grid receives
+    differentiates the seed per cell, so each of the 16 cells in a 4x4 grid receives
     a unique random gate layout.  Difficulty is assigned per row (4 rows → 4 levels);
     columns within a row share the same difficulty but differ in seed.
 
     Field reference
     ---------------
     trajectory_type     : "figure8" | "oval" | "random" (cubic-spline, most varied)
-    num_waypoints       : sample density along the trajectory (100–200 for 15×15 m)
+    num_waypoints       : sample density along the trajectory (100-200 for 15x15 m)
     seed                : overwritten by TerrainGenerator per cell — set here has no effect
     gate_spacing_range  : (min, max) metres between gates; use (n, n) for fixed spacing.
                           Gate count = int(total_arc / avg_spacing); no min/max guard.
@@ -56,7 +56,7 @@ class MeshRacingGatesTerrainCfg(SubTerrainBaseCfg):
     gate_height_range   : (min, max) metres above ground for gate centres.
                           Difficulty controls oscillation amplitude within this band.
     bar_thickness       : gate bar diameter in metres (visual only, no physics).
-    gate_color          : RGB in 0–1 range; face_colors applied after apply_transform.
+    gate_color          : RGB in 0-1 range; face_colors applied after apply_transform.
     """
 
     function = racing_gates.racing_gates_terrain
@@ -86,7 +86,7 @@ class MeshFixedGatesTerrainCfg(SubTerrainBaseCfg):
                    (yaw_deg, CW from +Y viewed from above; 0° → +Y, 90° → +X).
     gate_size    : Square aperture side length in metres.
     bar_thickness: Gate bar diameter in metres (visual only).
-    gate_color   : RGB in 0–1 range.
+    gate_color   : RGB in 0-1 range.
     """
 
     function = fixed_gates.fixed_gates_terrain

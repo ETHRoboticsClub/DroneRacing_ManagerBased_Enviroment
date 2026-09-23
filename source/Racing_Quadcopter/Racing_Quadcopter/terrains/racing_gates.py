@@ -52,7 +52,7 @@ def racing_gates_terrain(
     generator can compose the full scene.
 
     Args:
-        difficulty: 0–1 float assigned by TerrainGenerator (increases with row).
+        difficulty: 0-1 float assigned by TerrainGenerator (increases with row).
                     Higher difficulty → smaller gates, more complex trajectories.
         cfg: Sub-terrain configuration (seed already overwritten by generator).
 
@@ -107,8 +107,6 @@ def racing_gates_terrain(
         orientations=gate_orientations.copy(),
         gate_size=gate_size,
         bar_thickness=cfg.bar_thickness,
-        start_position=waypoints[0].copy(),
-        start_tangent=tangents[0].copy(),
         waypoints=waypoints.copy(),
     )
 
@@ -178,7 +176,8 @@ def _generate_figure8(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lemniscate-like figure-8 parametric trajectory.
 
-    The XY path is deterministic given cx/cy/rx/ry; only the Z variation uses rng.
+    The XY path is deterministic given cx/cy/rx/ry, where c represents the center 
+    and r the rays; only the Z variation uses rng.
     Tangents are computed as finite differences between consecutive waypoints and
     then normalised.  The loop closes because t is sampled on [0, 2π) endpoint=False.
     """
@@ -210,7 +209,8 @@ def _generate_oval(
     n: int, height_range: tuple[float, float], difficulty: float,
     rng: np.random.Generator
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Simple elliptical trajectory.
+    """Simple elliptical trajectory.C represents the center 
+    and r the rays; Z varies in height_range.
 
     Straightforward parametric ellipse; height varies with sin(2t).
     Less complex than random but useful for debugging gate passage logic.
@@ -243,7 +243,9 @@ def _spline_track(
     n: int,
     height_range: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fit a periodic CubicSpline through control points and sample n waypoints."""
+    """Fit a periodic CubicSpline through control points and sample n waypoints.
+    t_ctrl is an array of angular parameters, while ctrl_x,ctrl_y,ctrl_z 
+    are the coordinates of the control points (one per each value of t_ctrl)"""
     from scipy.interpolate import CubicSpline
     t_ext = np.append(t_ctrl, 2 * np.pi)
     cs_x = CubicSpline(t_ext, np.append(ctrl_x, ctrl_x[0]), bc_type="periodic")

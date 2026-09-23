@@ -35,6 +35,13 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
     def load_managers(self):
+        """Set up waypoint-task state before the base managers are built.
+
+        Overrides ``ManagerBasedRLEnv.load_managers`` because reward/observation
+        terms (e.g. ``collection_progress``, ``next_waypoints_rel_body``) read
+        the per-env buffers allocated by ``_prepare_waypoint_task`` as soon as
+        the managers are constructed — those buffers must exist first.
+        """
         # _prepare_waypoint_task allocates per-env GPU buffers that reward /
         # observation callables read at manager-construction time.
         self._prepare_waypoint_task()
@@ -46,6 +53,7 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
     # Task preparation
     # ------------------------------------------------------------------
     def _prepare_waypoint_task(self) -> None:
+        """Allocate per-env waypoint/dwell-tracking buffers and build the tracks."""
         self._robot = self.scene["robot"]
 
         self._actions_buf = torch.zeros(self.num_envs, 4, device=self.device)
@@ -150,6 +158,15 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
     # Step
     # ------------------------------------------------------------------
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        """Physics-decimated step, plus the waypoint-state refresh the base env doesn't do.
+
+        Mirrors ``ManagerBasedRLEnv.step`` (decimated physics loop, then
+        terminations/rewards/reset/observations) with one addition: the
+        waypoint proximity/dwell state is updated (``update_waypoint_state``)
+        after the physics loop but before terminations and rewards are
+        computed, since both read the resulting ``_collected_step_flag`` /
+        ``_holding`` / ``_current_wp_idx``.
+        """
         # Snapshot the raw policy output BEFORE the action term clamps and
         # applies noise/lag, so penalty_oversaturation can compare the raw
         # request against its clamped version.
@@ -204,6 +221,13 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        """Reset the given envs, preserving episode metrics the base reset would zero.
+
+        Wraps ``ManagerBasedRLEnv._reset_idx``: episode stats are snapshotted
+        first (reset events triggered inside ``super()._reset_idx`` clear the
+        underlying buffers), then merged into ``extras["log"]`` as scalar
+        float tensors, matching what SKRL's logger expects.
+        """
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
 
         # Snapshot metrics before super() triggers reset events that zero them.

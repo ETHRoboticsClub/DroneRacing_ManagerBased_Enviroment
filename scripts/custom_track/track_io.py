@@ -47,7 +47,7 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 
-CONFIG_FILE_PATH = 'scripts/custom_track/config.json'
+CONFIG_FILE_PATH = str(Path(__file__).resolve().parent / "config.json")
 
 def load_json_to_dict(file_path):
     # Check if file exists
@@ -172,6 +172,7 @@ def interpolate_loop(
     closed: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample the spline through ``centres`` at ``num_samples`` evenly-spaced points.
+    It is needed to visualize the trajectory.
 
     Returns:
         waypoints: ``[num_samples, 3]``
@@ -201,7 +202,8 @@ def gate_tangents_from_spline(
     centres: np.ndarray,
     closed: bool = True,
 ) -> np.ndarray:
-    """Unit tangent at each input centre. Used for auto-yaw."""
+    """Unit tangent at each input centre. 
+    Used for auto-yaw (gates are positioned at 90 degrees wrt to the trajectory)."""
     centres = np.asarray(centres, dtype=float)
     if centres.shape[0] < 2:
         return np.zeros_like(centres)
@@ -244,17 +246,6 @@ def euler_to_quat_wxyz(yaw: float, pitch: float = 0.0, roll: float = 0.0) -> np.
     from scipy.spatial.transform import Rotation as R
     qx, qy, qz, qw = R.from_euler("ZXY", [float(yaw), float(pitch), float(roll)]).as_quat()
     return np.array([qw, qx, qy, qz])
-
-
-def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
-    """Upright-gate quaternion. Kept for backward compat; equals euler_to_quat_wxyz(yaw, 0, 0)."""
-    half = 0.5 * float(yaw)
-    return np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
-
-
-def yaw_from_horizontal_tangent(tx: float, ty: float) -> float:
-    """Yaw angle such that gate-local +Y aligns with horizontal direction (tx, ty)."""
-    return float(np.arctan2(-tx, ty))
 
 
 def quat_axes_wxyz(quats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -332,8 +323,6 @@ __all__ = [
     "interpolate_loop",
     "gate_tangents_from_spline",
     "euler_to_quat_wxyz",
-    "yaw_to_quat_wxyz",
-    "yaw_from_horizontal_tangent",
     "quat_axes_wxyz",
     "track_to_arrays",
 ]
