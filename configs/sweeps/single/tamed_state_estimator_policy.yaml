@@ -1,3 +1,11 @@
+# NON-WORKING (as of 2026-09): `velocity_limit` below is no longer an env cfg field (the per-env
+# speed cap was replaced by `speed_limits.*`), so `--override velocity_limit=...` raises
+# "Unknown override key" and sweep.py aborts. Also: `rewards.velocity_limit.weight` is inert
+# under the default RACING_REWARD_PRESET=may (speed limits off), and `action_noise.lpf_alpha` has
+# no effect while `action_noise.per_episode_lpf_alpha` is True (the LPF uses `lpf_alpha_range`).
+# To revive: replace `velocity_limit` with `speed_limits.enabled: [true]` and
+# `speed_limits.linear_range: ["(10.0, 10.0)"]`, and set `action_noise.lpf_alpha_range`.
+
 # Tamed Policy Sweep Config for State Estimator Stability
 # Usage:
 #   make submit CONFIG=configs/sweeps/single/tamed_state_estimator_policy.yaml S3_KEY=runs/2026-07-22/tamed_policy/sweep.yaml

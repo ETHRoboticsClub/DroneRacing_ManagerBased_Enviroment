@@ -3,11 +3,11 @@
 # them to finish, downloads the results CSVs, and fails the workflow if a
 # chosen metric falls below (or above) a baseline.
 #
-# Four configs are tested in parallel via a matrix:
-#   - crazyflie_moments  (regression_test_crazyflie_moments.yaml, lap_pct >= 98 %)
-#   - crazyflie_rates    (regression_test_crazyflie_rates.yaml,   lap_pct >= 98 %)
-#   - anemos_moments     (regression_test_anemos_moments.yaml,    lap_pct >= 96 %)
-#   - anemos_rates       (regression_test_anemos_rates.yaml,      lap_pct >= 96 %)
+# Six configs (configs/sweeps/single/regression_test/) are tested in parallel via a matrix:
+#   - crazyflie_moments, crazyflie_rates, anemos_moments, anemos_rates,
+#     anemos_rates_monorace_obs                          (lap_pct >= 98 %)
+#   - anemos_rates_generalization                          (lap_pct >= 92 %)
+# None of them sets RACING_REWARD_PRESET, so they run the default "may" reward preset.
 #
 # Prerequisites (one-time):
 #   1. terraform apply (creates the OIDC provider + role)

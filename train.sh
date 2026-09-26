@@ -13,7 +13,7 @@ VIDEO_LENGTH=1000
 VIDEO_INTERVAL=4000
 
 
-DRONE_MODEL=$DRONE_MODEL python scripts/$RL_LIBRARY/train.py \
+DRONE_MODEL=$DRONE_MODEL HOVERING_DRONE_MODEL=$DRONE_MODEL python scripts/$RL_LIBRARY/train.py \
     --task $TASK \
     --num_envs $NUM_ENVS \
     $([ $HEADLESS -eq 1 ] && echo "--headless") \

@@ -1,0 +1,37 @@
+# AI-GP (AI Grand Prix) competition track — 6 gates, ~136 m long, ~26 m descent.
+# Reference copy. The AI-GP task reads its own frozen copies in
+# source/.../ai_gp_quadcopter/{june11,experimental}/tracks/competition.yaml.
+#
+# Source track, given in NED [X=North, Y=East, Z=Down]:
+#   0  [ -23.298,  -0.400,  -0.032]   w=h=2.72
+#   1  [ -46.894,  -2.500,   5.068]   w=h=2.72
+#   2  [ -74.594,   1.200,  13.668]   w=h=2.72
+#   3  [-111.494,  -5.100,  24.568]   w=h=2.72
+#   4  [-135.494,  -0.800,  25.356]   w=h=2.72
+#   5  [-159.194,  -4.400,  25.968]   w=h=2.72
+#
+# NED -> NWU (IsaacLab is North-West-Up): keep X, flip Y, flip Z.
+#   x =  N
+#   y = -E   (West)
+#   z = -D   (Up)   -> Down increases 0..26 along the track, so the course descends.
+# Then a single uniform shift T = (+165, +12, +28) moves the whole track into the
+# tile's positive [0, size] box (and lifts the lowest gate clear of the 0.2 m floor).
+# Subtract T to recover the NWU coordinates.
+#
+# yaw = 270  (CW-from-+Y): every gate faces world -X = the travel direction
+#            (gate 0 -> gate 5), one shared heading, upright (no roll/pitch).
+#            The drone spawns just behind gate 0 (+X side) and flies -X.
+
+gate_track:
+  - position: [141.702, 12.400, 28.032]   # gate 0 — start (highest)
+    rotation: [0, 0, 270]
+  - position: [118.106, 14.500, 22.932]   # gate 1
+    rotation: [0, 0, 270]
+  - position: [90.406, 10.800, 14.332]    # gate 2
+    rotation: [0, 0, 270]
+  - position: [53.506, 17.100, 3.432]     # gate 3
+    rotation: [0, 0, 270]
+  - position: [29.506, 12.800, 2.644]     # gate 4
+    rotation: [0, 0, 270]
+  - position: [5.806, 16.400, 2.032]      # gate 5 (lowest)
+    rotation: [0, 0, 270]

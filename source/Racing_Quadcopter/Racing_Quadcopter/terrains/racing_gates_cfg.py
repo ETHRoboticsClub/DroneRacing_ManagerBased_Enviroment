@@ -25,8 +25,10 @@ class GateSpec:
     **clockwise-from-+Y** convention when viewed from above:
       0°  → drone passes through in the +Y direction (tile's forward axis)
       90° → drone passes through in the +X direction (tile's right axis)
-    ``rotation[0]`` (roll) rotates about the passage axis; ``rotation[1]`` (pitch)
-    tilts the gate up/down.
+    ``rotation[0]`` (roll) rotates about the gate's +X bar axis and tilts the passage
+    axis up/down (roll 90° lays the gate flat: fly through vertically);
+    ``rotation[1]`` (pitch) rotates about the +Y passage axis and banks the gate.
+    See ``gate_base.gate_specs_to_gate_data`` (scipy extrinsic ``"xyz"``).
     """
 
     position: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.5])
@@ -95,7 +97,3 @@ class MeshFixedGatesTerrainCfg(SubTerrainBaseCfg):
     gate_size: float = 0.8
     bar_thickness: float = 0.05
     gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)
-    # Optional custom mesh builder with the same signature as
-    # ``gate_base.create_gate_frame(position, orientation, gate_size, bar_thickness, color)``.
-    # None -> default square frame centred on the aperture edges.
-    gate_frame_fn: object | None = None

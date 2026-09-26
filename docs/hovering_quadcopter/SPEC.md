@@ -40,27 +40,27 @@ Both radii and `T_c` are env-cfg fields.
 ## 2. Action space (mirrors racing)
 
 Collective thrust + body rates (4-dim) → inner-loop rate PID → body moments.
-Implemented by **re-using** `racing_quadcopter.mdp.actions.QuadcopterRatesActionCfg`
-unchanged. Drone profile (mass, PID gains) defaults to the **anemos** profile
-lifted from `racing_quadcopter_env_cfg.DRONE_PROFILES` (`anemos_usd` by
-default, switchable to `anemos_urdf` via the `HOVERING_DRONE_MODEL` env var —
-deliberately *not* the racing `DRONE_MODEL` env var, so the two tasks can run
-side-by-side with different drone choices). The crazyflie profile is
-intentionally not wired in.
+Implemented by **re-using** `mdp.actions.QuadcopterRatesActionCfg` (shared `tasks/manager_based/mdp`)
+unchanged. Drone profile (mass, PID gains) comes from hovering's **own**
+`HOVERING_DRONE_PROFILES` dict in `hovering_quadcopter_env_cfg.py` (a separate copy from racing's
+`DRONE_PROFILES`, so retuning one does not touch the other), defaulting to **`anemos_urdf`**,
+switchable to `anemos_usd` via the `HOVERING_DRONE_MODEL` env var — deliberately *not* the racing
+`DRONE_MODEL` env var, so the two tasks can run side-by-side with different drone choices. The
+crazyflie profile is intentionally not wired in.
 
 ### Profile overrides for hovering
 
 Two racing-tuned profile values are overridden in `ActionsCfg`:
 
-- **`thrust_to_weight = 1.9`** (was 4.1 from the racing profile). At T2W=4.1
+- **`thrust_to_weight = 1.9`** (was ≈4.1 from the anemos profile). At T2W≈4.1
   the hover-equilibrium thrust action is ≈ −0.51, far from the policy's
   initial mean of 0. With `initial_log_std=1.0` the early actor centred at
   action≈0 climbs at ~1g until it hits the ceiling, never settling. T2W=1.9
   puts hover at action ≈ 0 (matches the old direct hovering env).
-- **`rate_command_scale = 10.0`** rad/s (was 30 from the racing profile).
-  For a hovering task ±10 rad/s of commanded body rate is plenty; the
+- **`rate_command_scale = 6.5`** rad/s (was 30 from the racing profile).
+  For a hovering task a tight commanded body-rate envelope is plenty; the
   racing slew rate produces poor low-speed precision and lets the
-  under-authoritative yaw axis (`pid_p` for yaw is 70× weaker than
+  under-authoritative yaw axis (`pid_p` for yaw is far weaker than
   roll/pitch on anemos) drift into a persistent spin.
 
 ### Action noise / lag
@@ -82,7 +82,9 @@ yet). The **critic** sees a strict superset including the privileged
 `base_lin_vel_b` straight from sim — value-baseline quality improves without
 the actor inheriting a deployment-impossible signal.
 
-History window: **3** steps for both groups.
+History window: **1** step for both groups (`_HOVER_OBS_WINDOW = 1` in
+`hovering_quadcopter_env_cfg.py`; a GRU agent config owns temporal memory instead, so history is
+not duplicated in both the observation tensor and the recurrent hidden state).
 
 ### Actor (`policy` ObsGroup)
 
@@ -91,12 +93,13 @@ History window: **3** steps for both groups.
 | `projected_gravity_b`      | 3   | derived from quat (orientation-only)                        |
 | `base_ang_vel_b`           | 3   | gyro (IMU)                                                  |
 | `next_waypoints_rel_b`     | 6   | next + next-next waypoints in body frame (Δpos rotated)     |
+| `mocap_lin_vel_b`          | 3   | filtered finite-difference velocity from mocap poses (`mocap_velocity_obs_enabled`) |
 | `collection_time_const`    | 1   | constant `T_c` for the cell (lets policy modulate behaviour — race through if 0, dwell if large) |
 | `collection_progress`      | 1   | `timer / T_c` ∈ [0, 1] (0 if `T_c == 0`)                    |
-| `last_action`              | 4   | previous policy action                                      |
+| `last_action`              | 4   | last **applied** action (post noise/lag; `mdp.observations.last_applied_action`) |
+| `speed_limits`             | 2   | episode-conditioned `[linear, angular]` speed limits (always enabled for hovering) |
 
-Actor total per step: **18**. With `history_length=3` → policy network
-input ≈ **54**.
+Actor total per step: **23**.
 
 ### Critic (`critic` ObsGroup, inherits from `policy`)
 
@@ -106,8 +109,7 @@ All terms above **plus**:
 |----------------------------|-----|-------------------------------------------------------------|
 | `base_lin_vel_b`           | 3   | privileged — true body-frame linear velocity from sim       |
 
-Critic total per step: **21**. With `history_length=3` → value network
-input ≈ **63**.
+Critic total per step: **26**.
 
 ### Routing through SKRL
 
@@ -128,53 +130,46 @@ into the value-baseline path.
 
 ## 4. Reward terms
 
-Reward functions in `mdp/rewards.py` mirror the **old direct-env**
-`HoveringQuadcopterEnv.RewardManager` one-to-one, plus two waypoint-task
-extensions. Continuous-quantity terms (`lin_vel`, `ang_vel`,
-`distance_to_waypoint`) multiply by `env.step_dt` so the integrated penalty
-over an episode is independent of policy frequency.
+Reward functions live in the shared `mdp/rewards.py` (the waypoint-following section) and
+`mdp/shared_features.py`. Each callable returns the **unweighted factor** `[N]`; the
+`RewardManager` multiplies it by the `weight` configured in `WaypointRewardWeights`
+(`hovering_quadcopter_env_cfg.py`) and by `step_dt` — uniformly, for every term. There is no
+per-term manual `× env.step_dt` inside the reward functions themselves, and no
+`scale_dataclass_attributes` decorator on `WaypointRewardWeights`: the weights below are the
+direct `RewTerm` weights (SKRL's `rewards_shaper_scale` is not set for hovering, so no extra
+scaling is applied).
 
-Each callable returns the **unweighted factor**; `RewardManager` multiplies
-by the configured weight in `WaypointRewardWeights`. The weights are stored
-as `direct_weight × reward_scale (=0.2)` so they read like the old direct
-env. `@scale_dataclass_attributes(100.0)` then bumps them ×100, and SKRL's
-`rewards_shaper_scale = 0.01` divides back by 100 — net effect: the
-effective magnitude in PPO equals the direct env's `weight × reward_scale`.
+14 terms are registered on `RewardsCfg`:
 
-| term                  | weight (cfg) | function shape                                                           |
-|-----------------------|--------------|--------------------------------------------------------------------------|
-| `distance_to_waypoint`| −0.2         | `(d + 2)³ · dt` (cubic-shifted, dt-scaled, mirror of old env)            |
-| `lin_vel`             | −0.04        | `‖v_b‖² · dt` (sim-only signal, critic-relevant)                         |
-| `ang_vel`             | −0.1         | `‖ω_b‖² · dt` (without this the drone learns to circle)                  |
-| `action_magnitude`    | −0.01        | `‖a‖²`                                                                   |
-| `oversaturation`      | −0.0001      | `‖a_raw − a_raw.clamp(±1)‖²` — penalises asking for out-of-range actions |
-| `action_smoothness`   | −0.025       | `‖a_t − a_{t-1}‖²`                                                       |
-| `crash`               | −2000.0      | indicator: `z < min_height ∨ z > max_height ∨ upside_down`               |
-| `waypoint_collected`  | +1000.0      | sparse +1 on the step the active target advances (new term)              |
-| `holding`             | +2.0         | +1 while inside `r_capture` (new, optional; safe to comment out)         |
+| term                     | weight  | function                                    | shape                                                              |
+|--------------------------|---------|----------------------------------------------|---------------------------------------------------------------------|
+| `progress_to_waypoint`   | +0.4    | `reward_progress_to_waypoint`                | `tanh(Δdist / progress_to_waypoint_scale_m)` (scale = 0.10 m)       |
+| `waypoint_proximity`     | +0.2    | `reward_waypoint_proximity`                  | `1 - tanh(dist / waypoint_proximity_scale_m)` (scale = 1.25 m)      |
+| `waypoint_proximity_fine`| +0.14   | `reward_waypoint_proximity_fine`             | `1 - tanh(dist / waypoint_proximity_fine_scale_m)` (scale = 0.30 m) |
+| `lin_vel`                | −0.04   | `penalty_lin_vel`                            | `‖v_b‖²`                                                            |
+| `ang_vel`                | −0.1    | `penalty_ang_vel`                            | `‖ω_b‖²` (without this the drone learns to circle)                 |
+| `near_waypoint_lin_vel`  | −0.12   | `penalty_near_waypoint_lin_vel`              | `‖v_b‖² · exp(-(dist/0.75)²)` — extra braking cost near target      |
+| `near_waypoint_ang_vel`  | −0.20   | `penalty_near_waypoint_ang_vel`              | `‖ω_b‖² · exp(-(dist/0.75)²)`                                       |
+| `action_magnitude`       | −1.0    | `shared_features.penalty_action_magnitude`   | `‖a_raw‖²`, ×100 multiplier when `max(|a_raw|) > 1` (shared with racing) |
+| `action_smoothness`      | −5.0    | `penalty_action_smoothness` (`skip_first_step=False`) | `‖a_t − a_{t-1}‖²`                                         |
+| `crash`                  | −2000.0 | `penalty_out_of_bounds_or_upside_down`       | indicator: `z < min_height ∨ z > max_height ∨ upside_down`          |
+| `waypoint_collected`     | +300.0  | `reward_waypoint_collected`                  | sparse +1 on the step the active target advances                   |
+| `holding`                | +2.0    | `reward_holding`                             | +1 while inside the hold radius (`r_capture`/`r_hold` hysteresis; optional, safe to comment out) |
+| `velocity_limit`         | −0.12   | `shared_features.penalty_velocity_limit`     | quadratic excess above the episode's linear speed limit             |
+| `angular_velocity_limit` | −0.04   | `shared_features.penalty_angular_velocity_limit` | quadratic excess above the episode's angular speed limit        |
 
-### Oversaturation plumbing
-
-The env stores the raw policy output at the top of every `step` into
-`self._unclamped_actions_buf`, **before** the action term clamps to
-[−1, 1] and applies noise/lag. `penalty_oversaturation` then compares this
-against its own clamped version. Action-noise distortions are deliberately
-excluded from the penalty — only the policy's own request to overshoot
-counts.
+There is no `distance_to_waypoint` or `oversaturation` term (an earlier cubic-distance-penalty /
+`_unclamped_actions_buf` design has been replaced by the tanh-shaped progress/proximity terms
+above and the shared `penalty_action_magnitude`).
 
 ### Notes on weights
 
-- The crash weight is large on purpose. With `episode_length_s = 15` and the
-  cubic distance shape, the integrated distance penalty over a sustained
-  far-from-target trajectory can rival a one-shot crash; bumping crash to
-  −2000 makes "crash to end suffering" strictly worse than chasing the
-  target.
-- `WAYPOINT_COLLECTED = +1000` and `HOLDING = +2` are both large relative
-  to the original hovering terms; they shape the new collection mechanic
-  without overwhelming the position-tracking signal.
-- `OVERSATURATION = -0.0001` is intentionally tiny — the policy needs to
-  push toward saturation early in training to find the hover thrust
-  action; a stronger penalty here suppresses exploration.
+- The crash weight is large on purpose: with `episode_length_s = 15`, bumping crash to −2000
+  makes "crash to end suffering" strictly worse than chasing the target.
+- `WAYPOINT_COLLECTED = +300` and `HOLDING = +2` shape the collection mechanic without
+  overwhelming the dense progress/proximity signal.
+- `action_magnitude`'s ×100 excess multiplier (via the shared `clip_excess_multiplier` param)
+  mirrors the AI-GP experimental / racing `current`-preset action regularization.
 
 ---
 
@@ -198,6 +193,8 @@ No collision termination (no obstacles in the hovering env).
 |--------------------------|-------|----------------------------------------------------------|
 | `reset_scene_to_default` | reset | —                                                        |
 | `reset_waypoint_spawn`   | reset | spawn near waypoint 0 with ±0.3 m XY / ±0.1 m Z jitter   |
+| `reset_action_noise`     | reset | shared (`mdp/shared_features.py`) — samples the per-episode action-noise bias/LPF state |
+| `randomize_speed_limits` | reset | shared — samples the per-episode `[linear, angular]` speed limits (hovering has `speed_limits.enabled=True` by default) |
 
 ### Commented-out DR (kept in source as a starting point)
 
@@ -268,12 +265,12 @@ Format under `configs/waypoint_tracks/`:
 
 ```yaml
 # configs/waypoint_tracks/example.yaml
-collection_time_s: 1.0   # optional; falls back to cfg default
+collection_time_s: 0.0   # optional; falls back to cfg default
 waypoint_track:
-  - position: [0.0, 0.0, 1.0]
-  - position: [1.0, 0.0, 1.5]
-  - position: [1.0, 1.0, 1.0]
-  - position: [0.0, 1.0, 1.5]
+  - position: [7.5, 6.0, 2.0]
+  - position: [9.5, 7.5, 2.5]
+  - position: [7.5, 9.0, 2.0]
+  - position: [5.5, 7.5, 2.5]
 ```
 
 A separate loader `mdp/waypoint_io.py` (NOT `track_io.py`) parses these files
@@ -299,7 +296,7 @@ fixed red dots, which is enough for the user's validation workflow.
 Toggle: `HoveringQuadcopterEnvCfg.draw_waypoints: bool = True`.
 
 Implementation lives in `vis.py` next to the env (mirroring the racing
-`vis/trajectory_vis.py` placement but minimal).
+`trajectory_vis.py` placement but minimal).
 
 ---
 
@@ -309,10 +306,13 @@ In `hovering_quadcopter/__init__.py`:
 
 - `Isaac-Hovering-Quadcopter-Manager-v0` → `HoveringQuadcopterEnvCfg`
 - `Isaac-Hovering-Quadcopter-Manager-Play-v0` → `HoveringQuadcopterEnvCfg_PLAY`
+- `Isaac-Hovering-Quadcopter-Manager-RNN-v0` → `HoveringQuadcopterEnvCfg` (recurrent agent config)
+- `Isaac-Hovering-Quadcopter-Manager-RNN-Play-v0` → `HoveringQuadcopterEnvCfg_PLAY` (recurrent agent config)
 
 Each env points at a **hovering-specific `agents/` folder** inside the
-package, with its own `rsl_rl_ppo_cfg.py` (`HoveringQuadcopterPPORunnerCfg`,
-experiment name `hovering_quadcopter_manager`) and `skrl_ppo_cfg.yaml`.
+package, with its own `rsl_rl_ppo_cfg.py` (`HoveringQuadcopterPPORunnerCfg` /
+`HoveringQuadcopterRecurrentPPORunnerCfg` for the RNN ids, experiment names
+`hovering_quadcopter_manager` / `hovering_quadcopter_manager_gru`) and `skrl_ppo_cfg.yaml`.
 Initial hyperparameters are copied from the racing agent configs; the
 experiment name change is what makes logs land in a separate directory.
 
@@ -352,5 +352,5 @@ Per-reward-term episode sums are emitted automatically by the
 | `max_height`                         | 5.0 m                                     |
 | `upside_down_threshold`              | 0.7                                       |
 | action `thrust_to_weight` (override) | 1.9                                       |
-| action `rate_command_scale` (override)| 10.0 rad/s                               |
-| drone profile (default)              | `anemos_usd` (`HOVERING_DRONE_MODEL` env) |
+| action `rate_command_scale` (override)| 6.5 rad/s                                |
+| drone profile (default)              | `anemos_urdf` (`HOVERING_DRONE_MODEL` env) |

@@ -1,6 +1,9 @@
 # Cartesian sweep (full permutations).
 # Usage:
-#   python3 scripts/sweep.py --config configs/sweeps/cartesian/default.yaml
+#   python3 scripts/sweep.py --config configs/sweeps/grid/default.yaml
+# NOTE (as of 2026-09): `action_noise.lpf_alpha` has no effect while
+# `action_noise.per_episode_lpf_alpha` is True (default); override `action_noise.lpf_alpha_range`.
+# The duplicate `task_train` key below is harmless (YAML keeps the last value).
 
 
 ##############

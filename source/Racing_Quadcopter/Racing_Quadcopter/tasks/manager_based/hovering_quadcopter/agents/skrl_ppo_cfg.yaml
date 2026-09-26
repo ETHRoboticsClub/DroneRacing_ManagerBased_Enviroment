@@ -65,7 +65,9 @@ agent:
   entropy_loss_scale: 0.01
   value_loss_scale: 1.0
   kl_threshold: 0.0
-  rewards_shaper_scale: 0.01
+  # 1.0: hovering reward weights are direct values (no x100 convention); matches rsl_rl, which
+  # applies no reward scaling. (Was 0.01, which made skrl rewards 100x smaller than rsl_rl's.)
+  rewards_shaper_scale: 1.0
   time_limit_bootstrap: False
   experiment:
     directory: "hovering_quadcopter"

@@ -19,20 +19,20 @@ from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.utils.math import quat_apply_inverse
 
 from Racing_Quadcopter.tasks.manager_based.action_diagnostics import ActionDiagnostics
-from Racing_Quadcopter.tasks.manager_based.route_progress import (
+from Racing_Quadcopter.tasks.manager_based.mdp.route_progress import (
     begin_hovering_routes,
     initialize_route_progress,
 )
-from Racing_Quadcopter.tasks.manager_based.shared_features import (
+from Racing_Quadcopter.tasks.manager_based.mdp.shared_features import (
     initialize_action_noise,
     initialize_speed_limits,
     validate_shared_feature_events,
 )
 
 from .hovering_quadcopter_env_cfg import HoveringQuadcopterEnvCfg, WAYPOINTS_ENV_VAR
-from .mdp.events import collect_episode_metrics_before_reset
-from .mdp.waypoint_io import load_waypoints_from_yaml
-from .mdp.waypoint_utils import update_waypoint_state
+from Racing_Quadcopter.tasks.manager_based.mdp.events import collect_waypoint_episode_metrics_before_reset
+from Racing_Quadcopter.tasks.manager_based.mdp.waypoint_io import load_waypoints_from_yaml
+from Racing_Quadcopter.tasks.manager_based.mdp.waypoint_utils import update_waypoint_state
 from .terrain import broadcast_yaml_track, generate_random_tracks
 from .vis import draw_waypoints
 
@@ -253,7 +253,7 @@ class HoveringQuadcopterRLEnv(ManagerBasedRLEnv):
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
 
         # Snapshot metrics before super() triggers reset events that zero them.
-        log_extra = collect_episode_metrics_before_reset(self, env_ids_tensor)
+        log_extra = collect_waypoint_episode_metrics_before_reset(self, env_ids_tensor)
 
         super()._reset_idx(env_ids)
         begin_hovering_routes(self, env_ids_tensor)

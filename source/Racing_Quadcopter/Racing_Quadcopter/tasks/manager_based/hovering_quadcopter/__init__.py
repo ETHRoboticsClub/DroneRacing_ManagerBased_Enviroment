@@ -31,6 +31,7 @@ gym.register(
     },
 )
 
+# GRU policy (rsl_rl only; skrl uses the MLP config for these IDs too).
 for _id, _cfg in (
     ("Isaac-Hovering-Quadcopter-Manager-RNN-v0", "HoveringQuadcopterEnvCfg"),
     ("Isaac-Hovering-Quadcopter-Manager-RNN-Play-v0", "HoveringQuadcopterEnvCfg_PLAY"),

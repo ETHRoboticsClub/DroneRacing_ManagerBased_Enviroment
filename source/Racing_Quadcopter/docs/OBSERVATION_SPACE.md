@@ -14,15 +14,24 @@ prior work.
 
 ## 1. Frames
 
-Three frames, all NED-style (z points **down**):
+Three frames, as used by the **MonoRace / ICRA-2025 reference code** (NED-style, z points
+**down**):
 
-- **World frame `W`** — inertial. NED-down confirmed by the env code:
+- **World frame `W`** — inertial. NED-down confirmed by the reference env code:
   `pos[2] > 0` ⇒ ground collision, `pos[2] < −7` ⇒ ceiling.
 - **Body frame `B`** — standard FRD aircraft body axes.
   Body angular rates `(p, q, r)` and propeller speeds live here.
 - **Gate frame `G_i`** — origin at the geometric center of gate `i`,
   obtained from `W` by a **pure yaw rotation about the world z-axis** by
   `yaw_{g_i}`. The gate's x-axis is its outward normal (passing direction).
+
+> **NOTE — this repo's frames differ from the reference paper's.** `Racing_Quadcopter` is an
+> IsaacLab environment: the simulator's world frame is **Z-up** (not NED-down) and its body frame
+> is **FLU** (forward-left-up), not FRD. `mdp/observations.py`'s `mono_race_*` functions operate
+> directly in the sim's native Z-up/FLU frames — there is no NED/FRD conversion anywhere in this
+> codebase. Read the rest of this section as describing the *reference* MonoRace/ICRA code's own
+> convention, not this repo's; the "gate frame" construction (yaw-only rotation, or full SO(3) for
+> our tilted gates per the note below) is the part that carries over.
 
 Rotation conventions (from `quad_race_env.py`):
 - Euler angles `λ = (φ, θ, ψ)` are **ZYX intrinsic**,
@@ -64,10 +73,17 @@ Index map. Total = `16 + 4 · gates_ahead`. MonoRace ⇒ `gates_ahead = 2` ⇒ 2
 | 20..22  | `p^{g_i}_{g_{i+2}}`          | 3   | `G_i`   | center of gate `i+2` relative to gate `i`, expressed in `G_i`                            |
 | 23      | `ψ^{g_i}_{g_{i+2}}`          | 1   | G_i→G_{i+2} | yaw of gate `i+2` relative to `G_i`, wrapped                                            |
 
-**Env implementation:** `mono_race_future_gates_pose_in_current_gate_frame` in `mdp/observations.py` generalises this block to `k` future gates (`k = 2` in the table above): for each `m ∈ {1,…,k}` it outputs `p^{g_i}_{g_{i+m}}` (3, in `G_i`) then `ψ^{g_i}_{g_{i+m}}` (1, yaw from ZYX of `q_{G_i→W}^{-1} ⊗ q_{G_{i+m}→W}`). Count `k` defaults from `cfg.observation.mono_race_future_gates_pose_ahead` or override via the observation term `params` key `num_future_gates`.
+**Env implementation:** `mono_race_future_gates_pose_in_current_gate_frame` in `mdp/observations.py` generalises this block to `k` future gates (`k = 2` in the table above, from `cfg.observation.mono_race_future_gates_pose_ahead`): for each `m ∈ {1,…,k}` it outputs **6 values** — `p^{g_i}_{g_{i+m}}` (3, position in `G_i`) followed by the **full relative attitude** `(φ, θ, ψ)` (3, ZYX Euler of `q_{G_i→W}^{-1} ⊗ q_{G_{i+m}→W}`) — not just a single yaw scalar, since gates in this environment can have non-zero roll/pitch (see the note above). There is no `params`/`num_future_gates` override on the `ObsTerm`; `k` is read only from the cfg field.
 
-If a future-gate slot would index past the last gate (and the track is not
-looped), the code pads those four entries with zeros.
+Future-gate indices **wrap modulo the env's gate count** (`% env._gate_counts`) rather than being
+zero-padded past the last gate — every track behaves as a closed loop for this observation.
+
+**This repo's `mono_race` observation vector is not 24D.** `OBSERVATION_SPACE=mono_race`
+(`MonoRaceObservationsCfg` in `racing_quadcopter_env_cfg.py`) concatenates:
+`mono_race_gate_position_velocity_gate_frame` (6, `k=1` from `mono_race_num_next_gates`) +
+`mono_race_gate_orientations` (3) + `mono_race_future_gates_pose_in_current_gate_frame` (12,
+`k=2`) + `base_ang_vel` (3, scaled) + `motor_speeds_obs` (4) = **28**, plus 2 more
+(`speed_limits`) when `speed_limits.enabled=True` (RACING_REWARD_PRESET=`current`) → **30**.
 
 ---
 

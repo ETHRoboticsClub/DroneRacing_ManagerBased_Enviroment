@@ -8,8 +8,10 @@ The replay is **direct-actuation**: no env wrapper, no manager system, no rate-P
 
 - [scripts/deployment/replay_actions.py](../scripts/deployment/replay_actions.py) — applies actions, logs sim state.
 - [scripts/deployment/visualize_trajectories.py](../scripts/deployment/visualize_trajectories.py) — overlays real vs sim, or plots either alone.
-- [scripts/deployment/tests/run_validation.py](../scripts/deployment/tests/run_validation.py) — sim-in-the-loop validator.
-- [scripts/deployment/examples/](../scripts/deployment/examples/) — reference recordings with analytical truth.
+- [scripts/deployment/examples/](../scripts/deployment/examples/) — reference recordings (`hover_test.json`, `climb_test.json`, `ballistic_test.json`, `aggressive/`).
+
+There is currently no `scripts/deployment/tests/run_validation.py` or `tests/` directory — the
+`## Validation` section below describes a workflow that does not exist yet in this repo.
 
 ## JSON schema
 
@@ -59,13 +61,12 @@ python scripts/deployment/visualize_trajectories.py \
 
 ## Validation
 
-```bash
-python scripts/deployment/tests/run_validation.py --headless
-```
+There is no automated validator script in this repo (`scripts/deployment/tests/run_validation.py`
+does not exist). The `examples/` recordings can still be replayed manually with
+`replay_actions.py` and compared visually via `visualize_trajectories.py`.
 
-Runs every JSON in [scripts/deployment/examples/](../scripts/deployment/examples/) through the replay and checks the sim trajectory against the analytical reference embedded in each file. Exit `0` on all pass, `1` on any fail. Pass `--save_sim_runs` to dump each test's sim trajectory under `logs/deployment/validation/<ts>/`.
-
-To validate your own recording, add a `metadata.validation` block:
+If a validator is added later, the convention would be to check the sim trajectory against a
+`metadata.validation` block on the recording:
 
 ```json
 "validation": {
@@ -86,7 +87,7 @@ THRUST_MAX_N: float = 34.192         # only used by --clip_thrust
 KP_RATE: float      = 0.28           # rate-error → torque [N·m / (rad/s)]
 ```
 
-`KP_RATE` is the **only** rate-loop term — strict proportional. Sets the rate-tracking time constant roughly to `I / KP_RATE`; bump it if the drone tracks too sluggishly, drop it if it oscillates. It matches the P-gain the racing env's full PID uses on this drone ([racing_quadcopter/mdp/actions.py:131](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/actions.py#L131)).
+`KP_RATE` is the **only** rate-loop term — strict proportional. Sets the rate-tracking time constant roughly to `I / KP_RATE`; bump it if the drone tracks too sluggishly, drop it if it oscillates. `KP_RATE=0.28` numerically matches the `anemos_sitl` drone profile's raw `pid_p` (`0.281`, `racing_quadcopter_env_cfg.py`) — but the replay script actually spawns the `anemos_usd` profile (`PROFILE = DRONE_PROFILES["anemos_usd"]` in `replay_actions.py`), whose effective rate-loop gain is `pid_p × pid_scales` (≈ `45.0 × 0.005 = 0.225` roll, `47.0 × 0.005 = 0.235` pitch — not `0.28`). Treat `KP_RATE` as an independently-tuned proportional gain for this bare-PhysX replay, not as "the same PID the racing env uses". `anemos.usd` must be generated first via `scripts/tools/generate_anemos_usd.py` before this script (or anything else selecting `anemos_usd`) will run.
 
 ## Common gotchas
 

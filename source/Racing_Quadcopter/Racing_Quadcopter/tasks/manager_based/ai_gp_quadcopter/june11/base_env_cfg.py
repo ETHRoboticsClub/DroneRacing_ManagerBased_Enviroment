@@ -1,0 +1,646 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Racing quadcopter manager env configuration (standalone)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.common import ViewerCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils.noise import GaussianNoiseCfg
+from .terrains.racing_terrain import create_fixed_track_terrain, create_racing_gates_terrain
+from isaaclab.utils import configclass
+
+from isaaclab_assets import CRAZYFLIE_CFG
+from .assets.robots_cfg import ANEMOS_DRONE_CFG_USD, ANEMOS_DRONE_CFG_URDF
+
+from .mdp import observations, events, rewards, terminations, scale_dataclass_attributes
+from .mdp.actions import QuadcopterRatesActionCfg, QuadcopterMomentsActionCfg
+from .mdp.curriculums import apply_staged_curriculum
+from .mdp.noise import drone_noise_model_factory
+
+@dataclass
+class DroneProfile:
+    """Bundle a robot config with the physics parameters tuned for it."""
+
+    robot_cfg: ArticulationCfg
+    body_name: str
+    thrust_to_weight: float
+    moment_scale: tuple[float, float, float]  #: Per-axis (roll, pitch, yaw) moment scales [N·m] mapping action ±1 → full physical authority.
+    motor_k_t: float #: Thrust coefficient :math:`k_T` [N/(rad/s)²] for :math:`T_i = k_T \Omega_i^2`.
+    motor_k_d: float #: Drag torque coefficient :math:`k_D` [N·m/(rad/s)²] for yaw mixing row in :math:`B`.
+    motor_arm_length_m: float #: Diagonal arm length :math:`l` [m] in the X-frame mixer :math:`B` (center to rotor).
+    #: Nominal max rotor speed [rad/s] for scaling motor-speed observations (see ``motor_speeds_obs``).
+    motor_omega_max_rad_s: float
+    rate_command_scale: float
+    pid_scales: float
+    pid_p: tuple[float, float, float]
+    pid_i: tuple[float, float, float]
+    pid_d: tuple[float, float, float]
+    pid_f: tuple[float, float, float]
+
+
+def _make_profile(
+    cfg: ArticulationCfg,
+    body_name: str,
+    thrust_to_weight: float,
+    moment_scale: tuple[float, float, float],
+    *,
+    motor_k_t: float,
+    motor_k_d: float,
+    motor_arm_length_m: float,
+    motor_omega_max_rad_s: float,
+    rate_command_scale: float,
+    pid_scales: float,
+    pid_p: tuple[float, float, float],
+    pid_i: tuple[float, float, float],
+    pid_d: tuple[float, float, float],
+    pid_f: tuple[float, float, float],
+) -> DroneProfile:
+    return DroneProfile(
+        robot_cfg=cfg.replace(prim_path="{ENV_REGEX_NS}/Robot").replace(
+            spawn=cfg.spawn.replace(activate_contact_sensors=True)
+        ),
+        body_name=body_name,
+        thrust_to_weight=thrust_to_weight,
+        moment_scale=moment_scale,
+        motor_k_t=motor_k_t,
+        motor_k_d=motor_k_d,
+        motor_arm_length_m=motor_arm_length_m,
+        motor_omega_max_rad_s=motor_omega_max_rad_s,
+        rate_command_scale=rate_command_scale,
+        pid_scales=pid_scales,
+        pid_p=pid_p,
+        pid_i=pid_i,
+        pid_d=pid_d,
+        pid_f=pid_f,
+    )
+
+
+# Anemos: ~0.85 kg total (base_link 0.835 + 4 props), inertia ixx≈2.16e-3, iyy≈2.92e-3.
+#
+# moment_scale derivation (per-axis, from URDF geometry and k_t/k_d):
+#   τ_roll_max  = min(Σ|y_left| , Σ|y_right|) × k_t × Ω_max²
+#               = min(0.1438, 0.1360) × 8.54858 = 1.16 N·m   (motors at y=±0.068–0.072 m)
+#   τ_pitch_max = min(Σ|x_back| , Σ|x_front|) × k_t × Ω_max²
+#               = min(0.1640, 0.1771) × 8.54858 = 1.40 N·m   (motors at x=±0.082–0.089 m)
+#   τ_yaw_max   = 2 × k_d × Ω_max²
+#               = 2 × 1e-8 × 1e6 = 0.020 N·m
+#   Conservative: min of both ± directions so action ±1 is achievable without saturation.
+DRONE_PROFILES: dict[str, DroneProfile] = {
+    # Motor values taken from Crazyflie 2.0:
+    # https://skoge.folk.ntnu.no/prost/proceedings/ICSTCC-2018-Sinaia/ICSTCC2018/papers/0157.pdf
+    # Crazyflie moment_scale: roll/pitch max ≈ 0.011 N·m, yaw max ≈ 0.010 N·m → (0.01, 0.01, 0.01) is correct.
+    "crazyflie": _make_profile(
+        CRAZYFLIE_CFG,
+        body_name="body",
+        thrust_to_weight=1.9,
+        moment_scale=(0.01, 0.01, 0.01),
+        motor_k_t=2.9e-8,
+        motor_k_d=7.3e-10,
+        motor_arm_length_m=0.0397,
+        motor_omega_max_rad_s=2600.0,
+        rate_command_scale=30.0,
+        pid_scales=0.00005,
+        pid_p=(45.0, 47.0, 45.0),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 32.0),
+        pid_f=(0.0, 0.0, 0.0),
+    ),
+    "anemos_usd": _make_profile(
+        ANEMOS_DRONE_CFG_USD,
+        body_name="base_link",
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
+        motor_k_t=8.54858e-6,
+        motor_k_d=1e-8,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
+        motor_omega_max_rad_s=1000.0,
+        rate_command_scale=30.0,
+        pid_scales=0.005,
+        # roll/pitch: 18-19% of τ_max at full rate error — unsaturated, ~3 rad/s bandwidth
+        # yaw: 3.0 → 70% of 0.020 N·m at full rate error — max usable given k_d=1e-8
+        #      D=0: yaw authority is too low for derivative term to add meaningful damping
+        pid_p=(45.0, 47.0, 0.64),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 0.45),
+        pid_f=(0.0, 0.0, 0.0),
+    ),
+    "anemos_urdf": _make_profile(
+        ANEMOS_DRONE_CFG_URDF,
+        body_name="base_link",
+        thrust_to_weight=4.1056,  # 4×k_t×Ω_max² / (m_total×g) = 34.194 / 8.329 N (from URDF masses)
+        moment_scale=(1.16, 1.40, 0.020),   # (roll, pitch, yaw) N·m — see derivation above
+        motor_k_t=8.54858e-6,
+        motor_k_d=1e-8,
+        motor_arm_length_m=0.110,  # mean centre-to-rotor from URDF joints: 0.107–0.114 m
+        motor_omega_max_rad_s=1000.0,
+        rate_command_scale=30.0,
+        pid_scales=0.005,
+        pid_p=(45.0, 47.0, 0.64),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 0.45),
+        pid_f=(0.0, 0.0, 0.0),
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Top-of-file experiment knobs — defaults below; each can be overridden by an
+# environment variable so you can switch without editing the file:
+#
+#   DRONE_MODEL=anemos_urdf TRACK_YAML=configs/tracks/simple.yaml \
+#       python scripts/skrl/train.py --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 ...
+#
+# DRONE_MODEL: one of the keys in DRONE_PROFILES.
+#              "anemos_usd" requires a pre-converted USD; generate it via
+#              scripts/tools/generate_anemos_usd.py.
+#              Motor mixer k_T, k_D, l and obs scale Ω_max live on DroneProfile;
+#              env builds B^{-1} once from RacingQuadcopterEnvCfg.
+# ACTION_TYPE: "rates"   — thrust + inner-loop rate PID → body torques (default).
+#              "moments" — direct thrust + body moments, no inner PID loop.
+# DEFAULT_TRACK_YAML: path to the gate track YAML (RPY in degrees, see
+#              configs/tracks/default.yaml for the format). Read in
+#              RacingQuadcopterEnvCfg_FIXED.__post_init__.
+# ---------------------------------------------------------------------------
+import os as _os
+from .terrains import load_gates_from_yaml as _load_gates_from_yaml
+
+DRONE_MODEL_ENV_VAR = "DRONE_MODEL"
+TRACK_YAML_ENV_VAR = "TRACK_YAML"
+ACTION_TYPE_ENV_VAR = "ACTION_TYPE"
+OBSERVATION_SPACE_ENV_VAR = "OBSERVATION_SPACE"
+
+_ACTION_TYPES = ("rates", "moments")
+_OBSERVATION_SPACES = ("mono_race", "ours")
+
+DRONE_MODEL = "crazyflie"  # frozen: June default, no longer read from the environment
+ACTION_TYPE = "moments"  # frozen: June default (competition overrides the actions anyway)
+OBSERVATION_SPACE = "ours"  # frozen: June default (competition overrides the observations)
+
+_REPO_ROOT = _os.path.normpath(
+    _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "..")
+)
+DEFAULT_TRACK_YAML = _os.path.join(_REPO_ROOT, "configs", "tracks", "default.yaml")
+
+assert DRONE_MODEL in DRONE_PROFILES, (
+    f"Invalid DRONE_MODEL={DRONE_MODEL!r}. Set ${DRONE_MODEL_ENV_VAR} to one of: {list(DRONE_PROFILES)}"
+)
+assert ACTION_TYPE in _ACTION_TYPES, (
+    f"Invalid ACTION_TYPE={ACTION_TYPE!r}. Set ${ACTION_TYPE_ENV_VAR} to one of: {list(_ACTION_TYPES)}"
+)
+assert OBSERVATION_SPACE in _OBSERVATION_SPACES, (
+    f"Invalid OBSERVATION_SPACE={OBSERVATION_SPACE!r}. Set ${OBSERVATION_SPACE_ENV_VAR} to one of: {list(_OBSERVATION_SPACES)}"
+)
+PROFILE = DRONE_PROFILES[DRONE_MODEL]
+
+
+# SKRL additionally applies rewards_shaper_scale=0.01 on top.
+@scale_dataclass_attributes(100.0)
+@dataclass
+class RewardWeights:
+    GATE_PASSAGE: float = 250.0
+    GATE_PROGRESS: float = 20.0
+    GATE_CENTERING: float = 0.5
+    VELOCITY_TOWARD_GATE: float = 2.0
+    VELOCITY_LIMIT: float = -0.05
+    PERCEPTION: float = -0.01
+    ORIENTATION: float = -0.005
+    ANGULAR_VELOCITY: float = -0.001
+    ACTION_SMOOTHNESS: float = -0.0001
+    ACTION_RATE_THRESH: float = -0.0005
+    LOW_ACTION: float = -0.001
+    ACTION_MAGNITUDE: float = -0.001
+    CRASH: float = -50.0
+    WRONG_SIDE: float = -0.1
+    
+    # Currently not in use
+    # WRONG_DIRECTION: float = -50.0
+
+
+
+@configclass
+class GateObservationConfig:
+    """Observation parameters."""
+
+    num_next_gates: int = 3
+    mono_race_num_next_gates: int = 1
+    mono_race_future_gates_pose_ahead: int = 2
+    include_velocity_limit: bool = True
+    # Fraction of the gate aperture to shrink off each side before reporting it as
+    # the 7th observation value (effective_half = half * (1 - 2*frac)). 0.0 reports
+    # the true aperture; 0.2 reports a conservative 60%-width inscribed area.
+    gate_size_obs_buffer_frac: float = 0.0
+
+
+@configclass
+class ActionNoiseCfg:
+    """Config for corrupting actions / simulating actuator noise/lag.
+
+    - gaussian_std: per-step additive noise on actions
+    - per_episode_bias: sampled bias added to actions each episode
+    - lpf_alpha: first-order low-pass applied to actions (1.0=no smoothing)
+    """
+
+    enable: bool = False
+    per_episode_bias: bool = True
+    gaussian_std: float = 0.0
+    bias_range: tuple[float, float] = (-0.0, 0.0)
+    lpf_alpha: float = 1.0 # No lag; set <1.0 to simulate actuator lag.
+    clip_actions: bool = True
+
+
+@configclass
+class RacingQuadcopterSceneCfg(InteractiveSceneCfg):
+    """Scene: racing-gates terrain, Crazyflie, contact sensor, dome light."""
+
+    terrain: TerrainImporterCfg | None = None
+
+    robot: ArticulationCfg = PROFILE.robot_cfg
+
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        history_length=2,
+        update_period=0.01,
+        track_air_time=False,
+    )
+
+    dome_light = AssetBaseCfg(
+        prim_path="/World/Light",
+        spawn=sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)),
+    )
+    replicate_physics: bool = False
+    clone_in_fabric: bool = False
+
+
+@configclass
+class ActionsCfg:
+    """Action space selected by ACTION_TYPE env var ('rates' or 'moments')."""
+
+    rates: QuadcopterRatesActionCfg | None = None
+    moments: QuadcopterMomentsActionCfg | None = None
+
+    def __post_init__(self):
+        if ACTION_TYPE == "rates":
+            self.rates = QuadcopterRatesActionCfg(
+                asset_name="robot",
+                thrust_to_weight=PROFILE.thrust_to_weight,
+                action_dim=4,
+                body_name=PROFILE.body_name,
+                pid_scales=PROFILE.pid_scales,
+                pid_p=PROFILE.pid_p,
+                pid_i=PROFILE.pid_i,
+                pid_d=PROFILE.pid_d,
+                pid_f=PROFILE.pid_f,
+                rate_command_scale=PROFILE.rate_command_scale,
+            )
+        else:  # moments
+            self.moments = QuadcopterMomentsActionCfg(
+                asset_name="robot",
+                thrust_to_weight=PROFILE.thrust_to_weight,
+                action_dim=4,
+                body_name=PROFILE.body_name,
+                moment_scale=PROFILE.moment_scale,
+            )
+
+# Observation history windows. Module-level (not class attributes): the ObservationManager
+# enumerates every attribute in a group's __dict__ as a term, and the name must not be
+# ``history_length`` (the inherited ObsGroup field, which would override every term).
+_OURS_OBS_WINDOW = 3
+_MONORACE_OBS_WINDOW = 1
+
+
+@configclass
+class ObservationsCfg:
+    """Policy observations."""
+    
+    @configclass
+    class OursObservationsCfg(ObsGroup):
+        enable_corruption: bool = False
+        concatenate_terms: bool = True
+        
+        
+        base_lin_vel = ObsTerm(
+            func=observations.base_lin_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(std_noise=0.05, std_bias=0.01, dropout=0.0),
+            history_length=_OURS_OBS_WINDOW,
+        )
+        
+        #IMU 
+        base_ang_vel = ObsTerm(
+            func=observations.base_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            history_length=_OURS_OBS_WINDOW,
+        )
+        projected_gravity = ObsTerm(
+            func=observations.projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            history_length=_OURS_OBS_WINDOW,
+        )
+
+        #ACTION
+        last_action = ObsTerm(
+            func=observations.last_action,
+            history_length=_OURS_OBS_WINDOW,
+        )
+
+
+        #Perception
+        obs_gates = ObsTerm(
+            func=observations.compute_next_gates_rel_and_fwd_body,
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.0, dropout=0.0),
+            history_length=_OURS_OBS_WINDOW,
+        )
+        
+        velocity_limit = ObsTerm(
+            func=observations.velocity_limit_obs,
+            history_length=_OURS_OBS_WINDOW,
+        )
+
+    @configclass
+    class MonoRaceObservationsCfg(ObsGroup):
+        enable_corruption: bool = False
+        concatenate_terms: bool = True
+
+
+        mono_race_gate_position_velocity_gate_frame = ObsTerm(
+            func=observations.mono_race_gate_position_velocity_gate_frame,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+        mono_race_gate_orientations = ObsTerm(
+            func=observations.mono_race_gate_orientations,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+        mono_race_future_gates_pose_in_current_gate_frame = ObsTerm(
+            func=observations.mono_race_future_gates_pose_in_current_gate_frame,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+        base_ang_vel = ObsTerm(
+            func=observations.base_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            noise=drone_noise_model_factory(std_noise=0.02, std_bias=0.005, dropout=0.0),
+            scale= 0.2,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+        motor_speeds = ObsTerm(
+            func=observations.motor_speeds_obs,
+            history_length=_MONORACE_OBS_WINDOW,
+        )
+
+
+    if OBSERVATION_SPACE == "mono_race":
+        policy = MonoRaceObservationsCfg()
+    else:
+        policy = OursObservationsCfg()
+
+
+@configclass
+class RewardsCfg:
+    """Same terms as direct ``GateRewardManager``; each callable returns unweighted factors in ``mdp.rewards``.
+
+    Weights are ``MANAGER_SCALE *`` the default coefficients from the direct task.
+    """
+
+    gate_passage = RewTerm(func=rewards.reward_gate_passage, weight=RewardWeights.GATE_PASSAGE)
+    gate_progress = RewTerm(func=rewards.reward_gate_progress, weight=RewardWeights.GATE_PROGRESS)
+    gate_centering = RewTerm(func=rewards.reward_gate_centering, weight=RewardWeights.GATE_CENTERING)
+    velocity_toward_gate = RewTerm(
+        func=rewards.reward_velocity_toward_gate, weight=RewardWeights.VELOCITY_TOWARD_GATE
+    )
+    velocity_limit = RewTerm(func=rewards.penalty_velocity_limit, weight=RewardWeights.VELOCITY_LIMIT)
+    
+    orientation = RewTerm(func=rewards.penalty_orientation, weight=RewardWeights.ORIENTATION)
+    angular_velocity = RewTerm(
+        func=rewards.penalty_angular_velocity, weight=RewardWeights.ANGULAR_VELOCITY
+    )
+    action_smoothness = RewTerm(
+        func=rewards.penalty_action_smoothness, weight=RewardWeights.ACTION_SMOOTHNESS
+    )
+
+    action_magnitude = RewTerm(
+        func=rewards.penalty_action_magnitude, weight=RewardWeights.ACTION_MAGNITUDE
+    )
+    crash = RewTerm(func=rewards.penalty_crash, weight=RewardWeights.CRASH)
+    wrong_side = RewTerm(func=rewards.penalty_wrong_side, weight=RewardWeights.WRONG_SIDE)
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = RewTerm(func=rewards.penalty_wrong_direction, weight=RewardWeights.WRONG_DIRECTION)
+
+    # perception = RewTerm(func=rewards.penalty_perception, weight=RewardWeights.PERCEPTION)
+
+
+@configclass
+class EventsCfg:
+    """Reset pipeline: Isaac scene defaults, then racing start pose and buffers."""
+
+    randomize_robot_mass = EventTerm(
+        func=events.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_base_com = EventTerm(
+        func=events.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
+            "com_range": {"x": (-0.015, 0.015), "y": (-0.015, 0.015), "z": (-0.015, 0.015)},
+        },
+    )
+    randomize_robot_actuator_gains = EventTerm(
+        func=events.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+    base_external_force_torque = EventTerm(
+        func=events.apply_external_force_torque,
+        mode="interval",
+        interval_range_s=(3.0, 10.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="body|base_link"),
+            "force_range": (-0.02, 0.02),
+            "torque_range": (-0.02, 0.02),
+        },
+    )
+    push_robot = EventTerm(
+        func=events.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(3.0, 10.0),
+        params={"velocity_range": {"x": (-0.3, 0.3), "y": (-0.3, 0.3), "z": (-0.3, 0.3)}},
+    )
+    reset_scene_to_default = EventTerm(func=events.reset_scene_to_default, mode="reset")
+    reset_racing_spawn = EventTerm(func=events.reset_racing_spawn, mode="reset", params={"method": "uniform"})
+
+
+@configclass
+class CurriculumCfg:
+    """Staged curriculum: stay-alive → full racing → recovery spawns."""
+
+    staged = CurrTerm(func=apply_staged_curriculum)
+
+
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=terminations.time_out, time_out=True)
+    upside_down = DoneTerm(func=terminations.upside_down, time_out=False)
+    below_height = DoneTerm(func=terminations.below_height_threshold, time_out=False)
+    runaway = DoneTerm(func=terminations.runaway_velocity, time_out=False)
+    collision = DoneTerm(func=terminations.collision_termination, time_out=False)
+    lap_complete = DoneTerm(func=terminations.lap_complete, time_out=True)
+    
+    # On most tracks this is irrelevant but on some it is necessary (and has to be activated at a later
+    # curriculum stage to avoid hindering early learning).
+    # wrong_direction = DoneTerm(func=terminations.wrong_direction_crossing, time_out=False)
+
+@configclass
+class RacingQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
+    """Configuration for manager-based racing quadcopter."""
+
+    seed: int = 42
+
+    scene: RacingQuadcopterSceneCfg = RacingQuadcopterSceneCfg(num_envs=4096, env_spacing=5.0, replicate_physics=False, clone_in_fabric=False)
+
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    events: EventsCfg = EventsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
+    observation: GateObservationConfig = GateObservationConfig()
+    action_noise: ActionNoiseCfg = ActionNoiseCfg()
+
+    decimation: int = 2
+    episode_length_s: float = 20.0
+
+    velocity_limit: float = 15.0
+    randomize_velocity_limit: bool = False
+    velocity_limit_range: tuple[float, float] = (8.0, 15.0)
+
+    upside_down_threshold: float = 0.7
+    min_height: float = 0.2
+    max_velocity: float = 50.0
+    collision_force_threshold: float = 0.001
+
+    eval_mode: bool = False
+    crash_termination: bool = True   # master switch; stage gate (>= 2) applies on top in training
+    fixed_spawn: bool = False        # if True, all drones spawn at gate 0 instead of a random gate
+    recovery_spawn_prob: float = 0.2 # fraction [0,1] of envs that spawn with random orientation + velocity
+
+    # ── Domain randomization flags ─────────────────────────────────────────────
+    # All default to False (no domain randomization). Set True individually to
+    # enable the corresponding perturbation.
+    randomize_mass: bool = False              # startup: scale robot mass ±10 %
+    randomize_com: bool = False               # startup: shift CoM ±15 mm per axis
+    randomize_actuator_gains: bool = False    # startup: scale stiffness/damping ±10 %
+    apply_external_disturbances: bool = False # interval: random force/torque + velocity push
+    observation_noise_enable: bool = False    # per-step obs Gaussian noise + per-episode bias
+    speed_log_interval_s: float = 10.0
+    stats_warmup_s: float = 0.0    # skip stats accumulation for this many simulation seconds at episode start
+    draw_trajectory: bool = True        # green closed-loop polyline through all waypoints (USD, no collision)
+    draw_gate_indicators: bool = True   # blue sticks showing each gate's forward (+Y) direction (USD, no collision)
+    draw_gate_labels: bool = True       # blue 7-segment gate index numbers floating above each gate (USD, no collision)
+
+    # Demo mode: dark scene + OmniPBR emissive glow on all vis prims and drones (RTX only).
+    demo_mode: bool = False
+    demo_emissive_intensity: float = 30.0        # emissive intensity for trajectory/label/indicator vis prims
+    demo_gate_color: tuple[float, float, float] = (1.0, 0.3, 0.0)   # orange, matching gate mesh color
+    demo_gate_outline_emissive: float = 20.0     # emissive intensity for gate outline overlay curves
+    demo_gate_outline_width: float = 0.06        # tube width of gate outline BasisCurves in metres
+    demo_gate_light_intensity: float = 3000.0    # UsdLux.SphereLight intensity in nits
+    demo_gate_light_radius: float = 1.5          # sphere light radius in metres — controls glow spread
+    demo_drone_glow_color: tuple[float, float, float] = (1.0, 0.5, 0.0)  # orange drone glow
+    demo_drone_glow_intensity: float = 5.0
+
+    curriculum_stage1_steps: int = 10000
+    curriculum_stage2_steps: int = 10000
+    curriculum_min_gates_passed: int = 10
+    curriculum_min_mean_velocity: float = 2.5
+    curriculum_max_center_offset: float = 0.25
+
+    # Motor mixing (:math:`B`, :math:`B^{-1}` built once in env from ``DRONE_PROFILE``).
+    motor_k_t: float = PROFILE.motor_k_t
+    motor_k_d: float = PROFILE.motor_k_d
+    motor_arm_length_m: float = PROFILE.motor_arm_length_m
+    motor_omega_max_rad_s: float = PROFILE.motor_omega_max_rad_s
+
+    #: Threshold Δu_thresh (rad/s): motor-speed penalty counts excess only above this per rotor per step.
+    motor_speed_delta_thresh_rad_s: float = 0.1
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 50,
+        render_interval=2,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    viewer: ViewerCfg = ViewerCfg(eye=(15.0, 15.0, 7.0), lookat=(3.0, 3.0, 0.0), origin_type="world")
+
+    def _apply_dr_flags(self) -> None:
+        """Wire domain-randomization flags into sub-configs. Called by every __post_init__."""
+        if not self.randomize_mass:
+            self.events.randomize_robot_mass = None
+        if not self.randomize_com:
+            self.events.randomize_base_com = None
+        if not self.randomize_actuator_gains:
+            self.events.randomize_robot_actuator_gains = None
+        if not self.apply_external_disturbances:
+            self.events.base_external_force_torque = None
+            self.events.push_robot = None
+        self.observations.policy.enable_corruption = self.observation_noise_enable
+
+    def __post_init__(self) -> None:
+        terrain_generator = create_racing_gates_terrain(self.seed)
+        self.scene.terrain = TerrainImporterCfg(
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=terrain_generator,
+            max_init_terrain_level=0,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            debug_vis=True,
+        )
+        self.sim.render_interval = self.decimation
+        self._apply_dr_flags()

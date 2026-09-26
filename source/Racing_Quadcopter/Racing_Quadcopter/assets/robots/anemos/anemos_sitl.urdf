@@ -183,8 +183,9 @@
     </collision>
   </link>
   <!--
-    camera_keypoint: marker frame vs base_link — translation only [85.196, 1.872, 67.774] mm,
-    same orientation as base_link (rpy=0). Isaac: find_bodies("camera_keypoint").
+    camera_keypoint: marker frame vs base_link — translation [85.196, 1.872, 67.774] mm
+    plus a pitch of -0.523599 rad (-30°) about Y (FPV-standard upward cam tilt). The
+    camera's optical axis is the keypoint's +X direction. Isaac: find_bodies("camera_keypoint").
     Tiny sphere visual required so URDF→USD converter resolves /visuals/camera_keypoint
     in anemos_physics.usd (without it the anemos_base.usd reference is dangling).
   -->

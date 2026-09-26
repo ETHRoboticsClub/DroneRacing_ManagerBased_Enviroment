@@ -205,7 +205,7 @@ def main() -> None:
     # Body id for force application — anemos uses 'base_link'. The wrench
     # composer accepts a list of body indices, so we keep ``body_ids`` as the
     # tuple/list returned by ``find_bodies`` to match the racing action term
-    # ([racing_quadcopter/mdp/actions.py] uses ``self._body_id`` the same way).
+    # ([tasks/manager_based/mdp/actions.py] uses ``self._body_id`` the same way).
     body_ids, _ = robot.find_bodies("base_link")
     if not body_ids:
         raise RuntimeError("Could not find 'base_link' body on the anemos articulation.")

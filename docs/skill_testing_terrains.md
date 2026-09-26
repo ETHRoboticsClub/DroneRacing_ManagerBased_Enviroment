@@ -10,7 +10,7 @@ different scenarios in parallel.
 ## 1. Entry points
 
 **Gym ID:** `Isaac-Racing-Quadcopter-Manager-SkillEval-v0`
-(registered in [tasks/manager_based/racing_quadcopter/__init__.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/__init__.py#L56))
+(registered in [tasks/manager_based/racing_quadcopter/__init__.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/__init__.py#L67))
 
 Use any standard play / eval script, e.g.
 `rsl_rl/play.py --task Isaac-Racing-Quadcopter-Manager-SkillEval-v0`.
@@ -19,9 +19,9 @@ observation/action noise and domain randomization.
 
 | File | Purpose |
 |---|---|
-| [racing_quadcopter_multi_track_cfg.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_multi_track_cfg.py) | `SkillTerrainCfg`, `RacingQuadcopterSkillEvalEnvCfg` — per-terrain settings and the eval cfg |
-| [racing_quadcopter_multi_track_env.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_multi_track_env.py) | env classes (`MultiTrackRLEnv`, `SkillEvalRLEnv`) |
-| [mdp/events.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/events.py) | `reset_skill_eval_spawn` and the `_apply_*_override` helpers |
+| [racing_quadcopter_env_cfg.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_env_cfg.py) | `SkillTerrainCfg`, `RacingQuadcopterSkillEvalEnvCfg` — per-terrain settings and the eval cfg |
+| [racing_quadcopter_env.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/racing_quadcopter_env.py) | env classes (`RacingQuadcopterMultiTrackRLEnv`, `RacingQuadcopterSkillEvalRLEnv`) |
+| [mdp/events.py](../source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/events.py) | `reset_skill_eval_spawn` and the `_apply_*_override` helpers |
 | [terrains/racing_terrain.py](../source/Racing_Quadcopter/Racing_Quadcopter/terrains/racing_terrain.py) | `create_multi_track_terrain` |
 | [configs/skill_tracks/](../configs/skill_tracks/) | track YAMLs |
 
@@ -33,13 +33,14 @@ the circuit built in that terrain and how drones behave there.
 
 ## 2. Current setup
 
-Three terrains, ordered left → right in the world:
+Four terrains, ordered left → right in the world:
 
-| # | YAML | Spawn flag | Description |
+| # | YAML | Spawn flag / other override | Description |
 |---|---|---|---|
 | 0 | [upside_down_challenge.yaml](../configs/skill_tracks/upside_down_challenge.yaml) | `spawn_upside_down` | 4-gate diamond at 4.5 m. Drones spawn behind gate 0 then get a 180° flip around X. Tests self-righting. |
 | 1 | [default_difficult.yaml](../configs/skill_tracks/default_difficult.yaml) | — | 10-gate circuit with split-S and chicane. Standard deterministic spawn. Reference baseline. |
 | 2 | [recovery_challenge.yaml](../configs/skill_tracks/recovery_challenge.yaml) | `spawn_recovery` | 8-gate circuit. Drones spawn with random attitude, 2–6 m/s linear velocity, ±3 rad/s angular velocity. Tests robustness to non-zero initial conditions. |
+| 3 | [sensor_delay_challenge.yaml](../configs/skill_tracks/sensor_delay_challenge.yaml) | `obs_delay_steps=5` | 7-gate open, fast circuit with altitude changes. The policy observation is delayed by 5 policy steps (5 × `step_dt` = 200 ms at the default 1/50 s `sim.dt` × decimation 2). Tests robustness to sensor/communication latency. |
 
 Other eval defaults set in `__post_init__`: `num_envs=256`, `eval_mode=True`,
 `force_collision_termination=True` (collisions terminate from step 0, bypassing
@@ -71,7 +72,7 @@ flag, write an `_apply_my_thing_override(env, env_ids)` helper in
 `env.cfg.skill_terrains[idx]` wherever you need them.
 
 ```python
-# racing_quadcopter_multi_track_cfg.py
+# racing_quadcopter_env_cfg.py
 @configclass
 class SkillTerrainCfg:
     track_yaml: str = ...
@@ -220,5 +221,5 @@ count distribution at startup.
 |---|---|
 | Wrong track in the j-th terrain | `skill_terrains` order doesn't match expected order, or `curriculum=True` was disabled |
 | Spawn override not applied | Flag name on `SkillTerrainCfg` doesn't match the `getattr(...)` lookup in `reset_skill_eval_spawn` |
-| `AttributeError: ... '_env_col_idx'` | Using `MultiTrackRLEnv` (no terrain-index tracking) instead of `SkillEvalRLEnv` |
-| No tensorboard scalars under `Episode_Metrics/...` | `tensorboard` not installed (check the startup warning), or you ran `MultiTrackRLEnv` instead of `SkillEvalRLEnv` |
+| `AttributeError: ... '_env_col_idx'` | Using `RacingQuadcopterMultiTrackRLEnv` (no terrain-index tracking) instead of `RacingQuadcopterSkillEvalRLEnv` |
+| No tensorboard scalars under `Episode_Metrics/...` | `tensorboard` not installed (check the startup warning), or you ran `RacingQuadcopterMultiTrackRLEnv` instead of `RacingQuadcopterSkillEvalRLEnv` |

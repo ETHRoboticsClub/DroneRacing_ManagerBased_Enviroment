@@ -13,6 +13,7 @@ It is intended for readers familiar with IsaacLab and reinforcement learning.
    - 2.2 [play.py](#22-playpy)
    - 2.3 [sweep.py](#23-sweeppy)
    - 2.4 [Common examples](#24-common-examples)
+   - 2.5 [RSL-RL entrypoints](#25-rsl-rl-entrypoints)
 3. [Task Variants](#3-task-variants)
 4. [Environment Architecture](#4-environment-architecture)
 5. [Physics Model](#5-physics-model)
@@ -62,39 +63,52 @@ DroneRacing_ManagerBased_Enviroment/
 │   │   ├── train.py             # SKRL training entrypoint
 │   │   ├── play.py              # SKRL evaluation / playback entrypoint
 │   │   └── override_utils.py    # Shared --override CLI helper
-│   └── sweep.py                 # Hyperparameter grid-search orchestrator
+│   ├── rsl_rl/
+│   │   ├── train.py / play.py   # RSL-RL entrypoints (Hydra overrides, no --override; see 2.5)
+│   │   └── cli_args.py          # RSL-RL flags (--experiment_name, --resume, --load_run, --logger, ...)
+│   ├── sweep.py                 # Hyperparameter grid-search orchestrator
+│   ├── list_envs.py / random_agent.py / zero_agent.py
+│   ├── custom_track/            # Qt track designer, play a checkpoint on a custom track
+│   ├── deployment/              # Replay recorded real-flight actions in sim
+│   └── tools/                   # generate_anemos_usd.py, view_drone.py, ...
 │
 ├── source/
 │   └── Racing_Quadcopter/
 │       └── Racing_Quadcopter/
 │           ├── tasks/
 │           │   └── manager_based/
-│           │       └── racing_quadcopter/
-│           │           ├── __init__.py                  # gym.register for all 4 tasks
-│           │           ├── racing_quadcopter_env.py     # RacingQuadcopterRLEnv class
-│           │           ├── racing_quadcopter_env_cfg.py # All configs + FIXED_GATES layout
-│           │           ├── agents/
-│           │           │   ├── skrl_ppo_cfg.yaml        # SKRL PPO hyperparameters
-│           │           │   └── rsl_rl_ppo_cfg.py        # RSL-RL PPO hyperparameters
-│           │           ├── mdp/
-│           │           │   ├── __init__.py              # Re-exports all mdp submodules
-│           │           │   ├── actions.py               # QuadcopterThrustAction + cfg
-│           │           │   ├── observations.py          # Gate observations + noise wrappers
-│           │           │   ├── rewards.py               # Reward/penalty functions + WEIGHT constants
-│           │           │   ├── terminations.py          # Termination conditions
-│           │           │   ├── events.py                # Episode reset + metrics collection
-│           │           │   ├── curriculums.py           # Staged curriculum + collision gating
-│           │           │   ├── gate_utils.py            # Gate helpers, passage detection, step update
-│           │           │   └── stats.py                 # Sliding-window statistics + console logging
-│           │           └── vis/
-│           │               └── trajectory_vis.py        # USD BasisCurves visualization
+│           │       ├── mdp/                             # ONE shared MDP package (racing + hovering; AI-GP snapshots have their own copies)
+│           │       │   ├── __init__.py                  # Re-exports isaaclab.envs.mdp + all modules below
+│           │       │   ├── actions.py                   # Rates / moments / SITL action terms
+│           │       │   ├── observations.py              # Gate-racing + waypoint observations
+│           │       │   ├── rewards.py                   # Gate-racing + waypoint reward/penalty functions
+│           │       │   ├── terminations.py              # Gate-racing + waypoint termination conditions
+│           │       │   ├── events.py                    # Spawns, reset metrics, mass/COM/inertia/actuator randomization
+│           │       │   ├── curriculums.py               # Staged curriculum + collision gating
+│           │       │   ├── adaptive_curriculums.py      # Route-progress reward/randomization curricula
+│           │       │   ├── shared_features.py           # Action noise + episode speed limits
+│           │       │   ├── noise.py                     # Observation noise models (per-term, opt-in)
+│           │       │   ├── route_progress.py            # Normalized route progress
+│           │       │   ├── gate_utils.py / stats.py     # Gate-racing state update + statistics
+│           │       │   └── waypoint_utils.py / waypoint_io.py  # Waypoint state + YAML loader
+│           │       ├── drone_profile.py                 # DroneProfile schema (values live per task)
+│           │       ├── action_diagnostics.py            # Action statistics logging
+│           │       ├── ai_gp_quadcopter/                # AI-GP task: FROZEN june11/ + experimental/ snapshots (self-contained; see its README)
+│           │       ├── racing_quadcopter/
+│           │       │   ├── __init__.py                  # gym.register (racing)
+│           │       │   ├── racing_quadcopter_env.py     # RacingQuadcopterRLEnv, _MultiTrackRLEnv, _SkillEvalRLEnv
+│           │       │   ├── racing_quadcopter_env_cfg.py # All racing config: scene/sim/managers, drone profiles, reward presets, SkillEval cfg
+│           │       │   ├── trajectory_vis.py            # USD BasisCurves visualization
+│           │       │   └── agents/                      # skrl YAML, rsl_rl runners
+│           │       └── hovering_quadcopter/             # Hovering env, cfg, agents, terrain (imports nothing from racing)
 │           └── terrains/
 │               ├── __init__.py
 │               ├── gate_base.py          # GateData, gate_registry, create_gate_frame
 │               ├── racing_gates.py       # Procedural track generator
 │               ├── racing_gates_cfg.py   # MeshRacingGatesTerrainCfg, MeshFixedGatesTerrainCfg
 │               ├── racing_terrain.py     # create_racing_gates_terrain, create_fixed_track_terrain
-│               └── fixed_gates.py       # Fixed circuit terrain function
+│               ├── fixed_gates.py        # Fixed circuit terrain function
+│               └── track_io.py           # load_gates_from_yaml (track YAML → GateSpec)
 │
 └── docs/
     ├── CODEBASE.md                  # This document
@@ -134,8 +148,11 @@ python scripts/skrl/train.py \
 | `--video_length N` | 200 | Steps per recorded video |
 | `--video_interval N` | 2000 | Steps between video recordings |
 | `--override KEY=VAL` | none | Override any `env_cfg` attribute; repeatable (see [Section 14](#14-override-utility)) |
+| `--agent NAME` | None | Agent config entry point to use; if unset, derived from `--algorithm` |
+| `--export_io_descriptors` | off | Export the env's observation/action IO descriptors |
+| `--ray-proc-id`, `-rid N` | None | Set automatically by the Isaac Lab Ray integration |
 
-Logs land in `logs/skrl/<task>/YYYY-MM-DD_HH-MM-SS_ppo_torch/`.
+Logs land in `logs/skrl/racing_quadcopter/YYYY-MM-DD_HH-MM-SS_ppo_torch/` (the directory name comes from `agent.experiment.directory` in `skrl_ppo_cfg.yaml`, not the gym task id).
 
 ### 2.2 play.py
 
@@ -166,8 +183,9 @@ python scripts/skrl/play.py \
 | `--video_length N` | 200 | Steps in the recorded video |
 | `--override KEY=VAL` | none | Override any `env_cfg` attribute; repeatable |
 | `--disable_fabric` | off | Force USD I/O instead of Fabric for debugging |
+| `--agent NAME` | None | Agent config entry point to use; if unset, derived from `--algorithm` |
 
-**Checkpoint auto-discovery:** if `--checkpoint` is not given, play.py searches `logs/skrl/<task>/` for the most recent directory matching `*_ppo_torch` and loads `best_agent.pt` from its `checkpoints/` subdirectory.
+**Checkpoint auto-discovery:** if `--checkpoint` is not given, play.py searches `logs/skrl/racing_quadcopter/` for the most recent directory matching `*_ppo_torch` and loads `best_agent.pt` from its `checkpoints/` subdirectory.
 
 ### 2.3 sweep.py
 
@@ -187,12 +205,12 @@ See [Section 13](#13-sweep-system) for the full sweep reference including YAML f
 ### 2.4 Common examples
 
 ```bash
-# Train with observation noise disabled and custom episode length
+# Train with a custom episode length (observation noise is opt-in per term via
+# mdp/noise.py and is off by default; see docs/README_randomization.md)
 python scripts/skrl/train.py \
     --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
     --num_envs 4096 --headless \
-    --override episode_length_s=30.0 \
-    --override observation_noise.enable=False
+    --override episode_length_s=30.0
 
 # Resume training from a checkpoint
 python scripts/skrl/train.py \
@@ -216,11 +234,32 @@ python scripts/skrl/play.py \
     --checkpoint <path>
 ```
 
+### 2.5 RSL-RL entrypoints
+
+`scripts/rsl_rl/train.py` and `scripts/rsl_rl/play.py` run the same tasks with the RSL-RL runner
+configs (`agents/rsl_rl_ppo_cfg.py`, see [Section 11.2](#112-rsl-rl-ppo-configuration)). They share
+`--task`, `--num_envs`, `--seed`, `--video*`, `--agent` and (train only) `--max_iterations` /
+`--export_io_descriptors` with the skrl scripts, and add the flags from `scripts/rsl_rl/cli_args.py`:
+
+| Flag | Description |
+|------|-------------|
+| `--experiment_name NAME` | Log folder under `logs/rsl_rl/` (default: the runner's `experiment_name`) |
+| `--run_name NAME` | Suffix for the run directory |
+| `--resume` | Resume training from a checkpoint |
+| `--load_run RUN` / `--checkpoint FILE` | Which run folder / checkpoint file to load (play and resume) |
+| `--logger {tensorboard,wandb,neptune}` | Logger backend |
+| `--log_project_name NAME` | Project name for wandb / neptune |
+
+There is no `--override`; config values are changed with Hydra arguments instead (e.g.
+`env.episode_length_s=30`). The same limitation applies: fields consumed in `__post_init__` cannot
+be changed this way.
+
 ---
 
 ## 3. Task Variants
 
-Four gymnasium tasks are registered in `__init__.py`:
+Ten racing gymnasium tasks are registered in `racing_quadcopter/__init__.py` (the hovering and
+AI-GP tasks are registered by their own packages):
 
 | Task ID | Config Class | Use |
 |---------|-------------|-----|
@@ -228,18 +267,21 @@ Four gymnasium tasks are registered in `__init__.py`:
 | `Isaac-Racing-Quadcopter-Manager-Play-v0` | `RacingQuadcopterEnvCfg_PLAY` | Evaluate random-track policy |
 | `Isaac-Racing-Quadcopter-Manager-Fixed-v0` | `RacingQuadcopterEnvCfg_FIXED` | Train on fixed deterministic circuit |
 | `Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0` | `RacingQuadcopterEnvCfg_FIXED_PLAY` | Evaluate fixed-track policy |
+| `Isaac-Racing-Quadcopter-Manager-Fixed-Play-FPV-v0` | `RacingQuadcopterEnvCfg_FIXED_PLAY_FPV` | Single-drone FPV demo/eval on the fixed circuit |
+| `Isaac-Racing-Quadcopter-Manager-SkillEval-v0` | `RacingQuadcopterSkillEvalEnvCfg` | Multi-terrain skill evaluation (see `docs/skill_testing_terrains.md`) |
+| `Isaac-Racing-Quadcopter-Manager-RNN-v0` / `-RNN-Play-v0` | `RacingQuadcopterEnvCfg` / `_PLAY` | Same as above, recurrent (GRU) agent config |
+| `Isaac-Racing-Quadcopter-Manager-Fixed-RNN-v0` / `-Fixed-RNN-Play-v0` | `RacingQuadcopterEnvCfg_FIXED` / `_FIXED_PLAY` | Fixed-circuit variants, recurrent agent config |
 
-**Training vs Play differences:**
+**Training vs Play differences** (`RacingQuadcopterEnvCfg_PLAY` / `_FIXED_PLAY` only override these three fields; every domain-randomization and noise flag already defaults to off in both, so play does not need to disable them):
 
 | Parameter | Training | Play |
 |-----------|----------|------|
 | `eval_mode` | `False` | `True` |
 | `fixed_spawn` | `False` | `True` |
 | `stats_warmup_s` | `0.0` | `30.0` |
-| `observation_noise.enable` | `True` | `False` |
-| `action_noise.enable` | `True` | `False` |
-| `randomize_robot_mass` | on | off |
-| `randomize_robot_actuator_gains` | on | off |
+| `scene.num_envs` | 4096 | 1024 |
+| `randomize_mass` / `randomize_com` / `randomize_inertia` / `randomize_actuator_gains` / `apply_external_disturbances` | `False` (default; opt-in via `--override`) | `False` (unchanged) |
+| `action_noise.enable` | `False` (default; opt-in) | `False` (unchanged) |
 | Curriculum | advances | frozen at stage 1000 |
 
 The Play configs set `eval_mode=True`, which:
@@ -259,12 +301,12 @@ IsaacLab's `ManagerBasedRLEnv` delegates every MDP component to a manager:
 
 | Manager | Config class | Description |
 |---------|-------------|-------------|
-| `ActionManager` | `ActionsCfg` | `QuadcopterThrustAction` |
+| `ActionManager` | `ActionsCfg` | `QuadcopterRatesAction` (default, `ACTION_TYPE=rates`) or `QuadcopterMomentsAction` (`ACTION_TYPE=moments`) |
 | `ObservationManager` | `ObservationsCfg` | Sensor + gate + noise |
-| `RewardManager` | `RewardsCfg` | 11 reward/penalty terms |
-| `TerminationManager` | `TerminationsCfg` | 5 termination conditions |
-| `EventManager` | `EventsCfg` | Mass/actuator randomization, spawn |
-| `CurriculumManager` | `CurriculumCfg` | Staged progression |
+| `RewardManager` | `RewardsCfg` | 13 reward/penalty terms |
+| `TerminationManager` | `TerminationsCfg` | 6 termination conditions |
+| `EventManager` | `EventsCfg` | Mass/COM/inertia/actuator randomization, disturbances, spawn |
+| `CurriculumManager` | `CurriculumCfg` | Staged progression + optional adaptive route-progress curricula |
 
 ### Initialization sequence
 
@@ -322,36 +364,47 @@ All buffers are allocated in `_prepare_racing_task()` on `self.device`.
 
 ### Robot
 
-**Crazyflie** from `isaaclab_assets`, loaded with `activate_contact_sensors=True` so all links contribute to the `ContactSensor`.
+Selected by the `DRONE_MODEL` env var (`crazyflie` default, or `anemos_usd` / `anemos_urdf` / `anemos_sitl`); each entry in `DRONE_PROFILES` (`racing_quadcopter_env_cfg.py`) is loaded with `activate_contact_sensors=True` so all links contribute to the `ContactSensor`.
 
 **Contact sensor** settings:
 - `history_length = 2` — keeps two steps of contact force history
-- `update_period = 0.01 s` — sensor refreshes every 10 ms (every physics step at 50 Hz → actual rate matches physics dt)
+- `update_period = 0.01 s` — shorter than the 0.02 s physics step (`sim.dt = 1/50`), so the sensor refreshes once per physics step (every 20 ms)
 
-### Thrust model (`actions.py`)
+### Thrust model (`mdp/actions.py`)
 
-The Crazyflie is driven by a `permanent_wrench_composer` (persistent force/torque applied to the body link each step). The action vector `[a0, a1, a2, a3]` maps to thrust and body moments:
+The drone is driven through `permanent_wrench_composer` (persistent force/torque applied to
+the body link each step). Two action terms exist, selected by `ACTION_TYPE`:
+
+- **`QuadcopterRatesAction`** (default, `ACTION_TYPE=rates`): `a0` maps to collective thrust;
+  `[a1, a2, a3]` are desired body rates (`× rate_command_scale` rad/s) tracked by an inner-loop
+  Betaflight-style PIDF controller (`τ = Kp·e + Ki·∫e − Kd·ω̇_meas + Kf·Δω_des/dt`) that outputs
+  body moments. Gains and `rate_command_scale` come from the active `DroneProfile`.
+- **`QuadcopterMomentsAction`** (`ACTION_TYPE=moments`): `a0` maps to collective thrust,
+  `[a1, a2, a3]` map directly to body moments via `moment_scale`, with no inner PID loop.
 
 ```
 thrust = thrust_to_weight × robot_weight × (a0 + 1) / 2    (N, body +Z)
-moment = moment_scale × [a1, a2, a3]                         (N·m, body XYZ)
 ```
 
-Parameters:
-- `thrust_to_weight = 1.9` — maximum thrust is 1.9× robot weight. At action `a0=0` (neutral), thrust = 0.95× weight → slight hover margin.
-- `moment_scale = 0.01` — scales moments to physically reasonable magnitudes for the Crazyflie.
+- `thrust_to_weight` and (for the moments action) `moment_scale` come from the selected drone
+  profile (e.g. crazyflie: 1.9; anemos: ~4.1).
 - Robot weight is computed once at startup: `sum(masses) × |gravity|`.
 
 **Action range:** all actions clipped to `[-1, 1]` before thrust/moment mapping. The normalized thrust command is `(a0 + 1) / 2`, mapping `[-1, 1] → [0, 1]`.
 
 ### Startup physics randomization
 
-| Event | Mode | Parameters |
-|-------|------|-----------|
-| `randomize_robot_mass` | startup | Scale in `[0.9, 1.1]`, uniform |
-| `randomize_robot_actuator_gains` | startup | Stiffness + damping scale `[0.9, 1.1]` |
+All default to `False`/disabled on both `RacingQuadcopterEnvCfg` and its Play subclasses; set
+the corresponding top-level flag (e.g. `--override randomize_mass=True`) to enable:
 
-Both are disabled in Play configs.
+| Event | Mode | Gated by flag | Parameters |
+|-------|------|----------------|-----------|
+| `randomize_robot_mass` | startup | `randomize_mass` | Scale in `[0.9, 1.1]`, uniform, recomputes inertia |
+| `randomize_base_com` | startup | `randomize_com` | Shift `±15 mm` per axis |
+| `randomize_robot_inertia` | startup | `randomize_inertia` | Scale principal inertias `[0.8, 1.2]`, uniform (runs after mass so it isn't overwritten by `recompute_inertia`) |
+| `randomize_robot_actuator_gains` | startup | `randomize_actuator_gains` | Stiffness + damping scale `[0.9, 1.1]` |
+| `base_external_force_torque` | interval (3-10 s) | `apply_external_disturbances` | Force/torque in `±0.02` N / N·m |
+| `push_robot` | interval (3-10 s) | `apply_external_disturbances` | Velocity kick in `±0.3` m/s per axis |
 
 ---
 
@@ -363,12 +416,15 @@ Both are disabled in Play configs.
 
 | Term | Dimension (per step) | Function | Description |
 |------|----------------------|----------|-------------|
-| `base_lin_vel` | 3 | `wrap_base_lin_vel` | Body-frame linear velocity (m/s) |
-| `base_ang_vel` | 3 | `wrap_base_ang_vel` | Body-frame angular velocity (rad/s) |
-| `projected_gravity` | 3 | `wrap_projected_gravity` | Gravity direction in body frame |
-| `last_action` | 4 | `wrap_last_action` | Previous step action `[a0..a3]` |
+| `base_lin_vel` | 3 | `base_lin_vel` (stock IsaacLab `isaaclab.envs.mdp.observations`) | Body-frame linear velocity (m/s) |
+| `base_ang_vel` | 3 | `base_ang_vel` (stock IsaacLab) | Body-frame angular velocity (rad/s) |
+| `projected_gravity` | 3 | `projected_gravity` (stock IsaacLab) | Gravity direction in body frame |
+| `last_action` | 4 | `last_action` (stock IsaacLab) | Previous step action `[a0..a3]` |
 | `obs_gates` | K×7 | `compute_next_gates_rel_and_fwd_body` | Next K gates: relative position, forward, aperture half-width |
 | `speed_limits` | 0 or 2 | `speed_limits_obs` | Disabled: no columns; enabled: linear and angular episode limits |
+
+`mdp/observations.py` does `from isaaclab.envs.mdp.observations import *`, so the first four terms
+are the stock IsaacLab functions re-exported, not custom wrappers.
 
 With default `K=3`, the base observation has 34 values. Enabling paired speed
 limits appends two values for a total of 36.
@@ -382,52 +438,70 @@ For each of the next K gates:
 
 All K gates are gathered simultaneously using vectorized `torch.gather` over the padded gate table with modular indexing.
 
-**`enable_corruption = False`** in `PolicyCfg.__post_init__`: the IsaacLab manager-level corruption pipeline is disabled. All noise is applied manually in `_apply_obs_noise` instead (see [Section 8](#8-observation-corruption)).
+**`enable_corruption = True`** on `PolicyCfg`: the IsaacLab manager-level corruption pipeline is active, but each term's `noise=` model (`mdp/noise.py::drone_noise_model_factory`) defaults to `enable=False`, so no noise is actually applied unless a term explicitly enables it or the adaptive-randomization curriculum turns it on (see [Section 8](#8-observation-corruption)).
 
 **`GateObservationConfig`:** `num_next_gates: int = 3` controls lookahead depth K.
 The paired limit observations are added only when `speed_limits.enabled=True`; this
 changes the policy input by two values and is incompatible with older checkpoints.
 
+**Alternative layout — `OBSERVATION_SPACE=mono_race`:** the table above is the default `ours`
+layout. `OBSERVATION_SPACE=mono_race` selects `MonoRaceObservationsCfg` instead: the next gate's
+position and velocity in the gate frame (6), gate orientations (3), the next two gates' poses in
+the current gate's frame (12), `base_ang_vel` (3) and motor speeds (4) — 28 values, 30 with speed
+limits. See [OBSERVATION_SPACE.md](../source/Racing_Quadcopter/docs/OBSERVATION_SPACE.md).
+
 ### 6.2 Action Space
 
-Continuous 4-dimensional, each component in `[-1, 1]`:
-- `a[0]` — collective thrust (mapped to `[0, 1]` via `(a+1)/2`)
-- `a[1]` — roll moment
-- `a[2]` — pitch moment
-- `a[3]` — yaw moment
+Continuous 4-dimensional, each component in `[-1, 1]`. Interpretation of `[a1, a2, a3]` depends on
+`ACTION_TYPE`:
+
+- **`ACTION_TYPE=rates`** (default): `a[0]` — collective thrust (mapped to `[0, 1]` via
+  `(a+1)/2`); `[a1, a2, a3]` — desired body roll/pitch/yaw **rates** (`× rate_command_scale`
+  rad/s), tracked by an inner-loop PID that outputs the actual body moments.
+- **`ACTION_TYPE=moments`**: `a[0]` — collective thrust (same mapping); `[a1, a2, a3]` — body
+  roll/pitch/yaw **moments** directly (`× moment_scale`), no inner PID loop.
 
 ### 6.3 Reward Terms
 
-All functions return an **unweighted** scalar per environment `[N]`. The `RewardManager` multiplies by `weight`. SKRL further scales by `rewards_shaper_scale=0.01`.
+All functions return an **unweighted** scalar per environment `[N]`. There is no `MANAGER_SCALE` —
+weights configured on `RewTerm` are used directly. The `RewardManager` multiplies each term's
+output by its `weight` and by `step_dt`. SKRL's `rewards_shaper_scale` for racing is `1.0` (no
+extra scaling).
 
-**Effective reward = function output × WEIGHT_* × 0.01 = function output × DIRECT_*.**
+13 terms are registered on `RewardsCfg`, with weights coming from the active
+`RACING_REWARD_PRESET` (`RACING_REWARD_PRESET` env var, `may` default or `current`;
+`racing_quadcopter_env_cfg.py`):
 
-| Term | Function | DIRECT weight | WEIGHT (×100) | Description |
-|------|----------|--------------|---------------|-------------|
-| `gate_passage` | `reward_gate_passage` | +250.0 | +25000 | Binary 1.0 on gate crossing frame |
-| `gate_progress` | `reward_gate_progress` | +20.0 | +2000 | Distance reduction toward current gate (clamped ±1 m) |
-| `gate_centering` | `reward_gate_centering` | +0.5 | +50 | Exponential alignment bonus on approach side |
-| `velocity_toward_gate` | `reward_velocity_toward_gate` | +2.0 | +200 | Velocity projection onto gate direction, approach side only |
-| `velocity_limit` | `penalty_velocity_limit` | −0.5 | −0.5 | Quadratic penalty for exceeding per-env speed cap |
-| `angular_velocity_limit` | `penalty_angular_velocity_limit` | −0.03 | −0.03 | Quadratic penalty for exceeding per-env angular speed cap |
-| `orientation` | `penalty_orientation` | −0.005 | −0.5 | Squared tilt angle from upright |
-| `angular_velocity` | `penalty_angular_velocity` | −0.001 | −0.1 | Sum of squared body angular rates |
-| `action_smoothness` | `penalty_action_smoothness` | −0.0001 | −0.01 | Squared action deltas between steps |
-| `action_magnitude` | `penalty_action_magnitude` | −0.001 | −0.1 | Squared action magnitudes |
-| `crash` | `penalty_crash` | −50.0 | −5000 | Binary 1.0 on collision OR upside-down |
-| `wrong_side` | `penalty_wrong_side` | −0.1 | −10 | 1.0 when drone is on the exit side of the gate |
+| Term | Function | `may` weight | `current` weight | Description |
+|------|----------|--------------|-------------------|-------------|
+| `gate_passage` | `reward_gate_passage` | +250.0 | +250.0 | Binary 1.0 on gate crossing frame |
+| `gate_progress` | `reward_gate_progress` | +20.0 | +20.0 | Distance reduction toward current gate (clamped ±1 m) |
+| `gate_centering` | `reward_gate_centering` | +0.5 | +4.0 | Alignment bonus on approach side, gated by forward speed |
+| `velocity_toward_gate` | `reward_velocity_toward_gate` | +2.0 | +2.0 | Velocity projection onto gate direction, approach side only |
+| `velocity_limit` | `penalty_velocity_limit` | −0.05 (inert: speed limits off) | −1.5 | Quadratic penalty for exceeding per-env speed cap |
+| `angular_velocity_limit` | `penalty_angular_velocity_limit` | 0.0 | −0.2 | Quadratic penalty for exceeding per-env angular speed cap |
+| `orientation` | `penalty_orientation` | −0.005 | −0.005 | Squared tilt angle from upright |
+| `angular_velocity` | `penalty_angular_velocity` | −0.001 | −0.03 | Sum of squared body angular rates |
+| `action_smoothness` | `penalty_action_smoothness` | −0.0001 | −5.0 | Squared action deltas between steps |
+| `action_magnitude` | `shared_features.penalty_action_magnitude` | −0.001 (clip_excess_multiplier ×1) | −1.0 (clip_excess_multiplier ×100 outside [-1,1]) | Squared raw action magnitude |
+| `crash` | `penalty_crash` | −50.0 | −50.0 | Binary 1.0 on collision OR upside-down |
+| `wrong_side` | `penalty_wrong_side` | −0.1 | −0.1 | 1.0 when drone is on the exit side of the gate |
+| `perception` | `penalty_perception` | −0.01 | −0.01 | Camera-FOV penalty for the next gate (active in both presets) |
+
+`may` additionally has `adaptive_curriculum_enabled=False` and `speed_limits.enabled=False`
+(so `velocity_limit`/`angular_velocity_limit` return zero); `current` has both enabled
+(speed limits: linear 2-15 m/s, angular 1-5 rad/s).
 
 **`gate_centering` formula:**
 ```
 centering_value = exp(-3 * lateral_dist / gate_size)
 proximity_factor = exp(-0.5 * |dist_to_plane|)
-reward = centering_value × proximity_factor × on_approach_side
+motion_factor = clamp(forward_speed / reference_speed, 0, 1)   # reference_speed = 15 m/s
+reward = centering_value × proximity_factor × motion_factor × on_approach_side
 ```
-Active only while `dist_to_plane <= 0` (approach side), preventing spurious centering reward behind the gate.
+Active only while `dist_to_plane <= 0` (approach side), preventing spurious centering reward behind the gate; `motion_factor` prevents a stationary drone from farming this term.
 
-**`wrong_side` note:** fires every step the drone is on the exit side without having passed. On a chicane track where the next gate faces the opposite direction, the drone will briefly be on the wrong side as it turns; the penalty is mild (−0.1 effective weight) but can discourage approach.
-
-**Unused term:** `penalty_perception` (camera FOV penalty) is defined but commented out in `RewardsCfg`.
+**`wrong_side` note:** fires every step the drone is on the exit side without having passed. On a chicane track where the next gate faces the opposite direction, the drone will briefly be on the wrong side as it turns; the penalty is mild (−0.1 weight) but can discourage approach.
 
 ### 6.4 Termination Conditions
 
@@ -463,7 +537,7 @@ Reset pipeline runs in this order on each env that terminates:
 | Mode | Description |
 |------|-------------|
 | `"ground"` | 2 m behind a random gate, heading directly at it, zero velocity |
-| `"uniform"` | Box on approach side: depth [1,4] m, ±1.5 m lateral, ±0.75 m vertical, random yaw, small random velocity |
+| `"uniform"` | Box on approach side: depth [1,4] m, ±1.5 m lateral, ±0.75 m vertical; attitude aimed so the FPV camera looks at the gate: yaw ±60° about the gate direction, pitch ±45° about the camera-aim pitch, roll ±45°; small random velocity |
 | `"mixed"` | Stochastically picks ground (prob=`ground_init_prob`) or uniform per env |
 | `"fixed"` | 8-lane grid behind gate 0, used in Play configs (`fixed_spawn=True`) |
 
@@ -484,20 +558,21 @@ columns and zero penalties. When enabled, both penalties enforce the configured 
 limits. After the one-way curriculum latch activates, the reset
 `randomize_speed_limits` event samples both limits for only the resetting environments. Evaluation
 activates enabled randomization immediately; equal range endpoints make evaluation deterministic.
-In the competition curriculum, both speed-limit reward weights can grow to 5× their
+In the AI-GP experimental curriculum (its own frozen copy), both speed-limit reward weights can grow to 5× their
 base magnitude when normalized route progress is high, and are held—not reduced—when progress declines.
 
 Adaptive curriculum decisions use a shared geometric score from
-`tasks/manager_based/route_progress.py`. It projects the episode start and final drone
+`tasks/manager_based/mdp/route_progress.py`. It projects the episode start and final drone
 positions onto the closest points of an ordered straight-segment polyline and divides
 covered arc length by the distance reachable at that episode's linear speed limit over
-the full episode duration. Every route prepends an origin (the official start for
-competition, otherwise the episode spawn) to its task points. Hovering uses its ordered
+the full episode duration. Every route prepends the episode spawn as its origin (the shared
+module dropped the optional "official start" prefix on 2026-09-26; the AI-GP experimental
+snapshot keeps its own copy of `route_progress.py` with that feature). Hovering uses its ordered
 target poses and subtracts their required dwell time
 from the travel budget. Original lap/gate and waypoint-completion computations are not
 removed; they remain independent metrics.
 The reward and randomization controllers are likewise task-independent and live in
-`tasks/manager_based/adaptive_curriculums.py`; task configs only provide target names,
+`tasks/manager_based/mdp/adaptive_curriculums.py`; task configs only provide target names,
 thresholds, and an optional completion term used for secondary logging.
 
 ### 6.6 Curriculum
@@ -542,41 +617,51 @@ An env that never passed a gate in the previous episode vacuously satisfies the 
 - 4 rows → 4 difficulty levels; 4 columns → 4 seeds per difficulty level → 16 unique circuits
 
 **Trajectory types** (selected randomly per cell when `trajectory_type="random"`):
-- Cubic spline with random control points — 16–30 control points at difficulty 0.7–1.0
+- Cubic spline with random control points — `max(12, int(16 + 14 × difficulty))` control points; the generator samples difficulty 0.7–1.0, so 25–30 in practice
 - Chicane — alternating lateral offsets producing tight S-curves; more sections at higher difficulty
 
 **Gate placement:**
-- Spacing: `gate_spacing_range = (1.0, 7.0)` m → average 4.0 m → ~10–16 gates per circuit
-- Gate size: `gate_size_range = (0.45, 0.8)` m; interpolated as `max - difficulty × (max - min)`
-  - difficulty=0.7 → size ≈ 0.69 m
-  - difficulty=1.0 → size = 0.45 m
+- Spacing: `gate_spacing_range = (7.5, 15.0)` m → average 11.25 m; gate count = `int(total_arc / avg_spacing)`, so it varies with the generated trajectory's arc length (no fixed guarantee)
+- Gate size: `gate_size_range = (0.7, 1.5)` m; interpolated as `max - difficulty × (max - min)`
+  - difficulty=0.7 → size ≈ 0.94 m
+  - difficulty=1.0 → size = 0.7 m
 - Gate height: `gate_height_range = (0.7, 4.5)` m, oscillating with difficulty-scaled amplitude
 
 **Out-of-bounds gates:** gates whose centre is closer than 0.5 m to any tile edge are skipped (the arc position still advances, so gate count may be lower than the computed upper bound).
 
 ### 7.2 Fixed Track (Deterministic)
 
-`create_fixed_track_terrain(gates, ...)` tiles the same circuit in all 16 cells. Gate positions are defined via `GateSpec`:
+`create_fixed_track_terrain(gates, ...)` tiles the same circuit in all 16 cells (grid size is
+configurable via `num_rows`/`num_cols`). Gate positions are loaded from a YAML file (path set by
+`gate_track_yaml`, overridable via the `TRACK_YAML` env var) through
+`terrains/track_io.py::load_gates_from_yaml`, which returns a list of `GateSpec`:
 
 ```python
 @dataclass
 class GateSpec:
-    position: tuple[float, float, float]   # corner-origin local frame (0-15 m)
-    yaw_deg: float = 0.0                   # CW from +Y viewed from above
+    position: list[float]   # [x, y, z], corner-origin local frame (0-15 m)
+    rotation: list[float]   # [roll, pitch, yaw] in degrees; yaw is CW from +Y viewed from above
 ```
 
-The default `FIXED_GATES` (10-gate circuit in `racing_quadcopter_env_cfg.py`) includes a split-S maneuver (gates 4-5, 2.7 m altitude drop) and a chicane (gates 8-9).
-
-An alternative `FIXED_GATES_` (4-gate square) is also defined for debugging.
+The default track is `configs/tracks/default.yaml` (a 10-gate circuit including a split-S
+maneuver and a chicane, per the comment above `RacingQuadcopterEnvCfg_FIXED` in
+`racing_quadcopter_env_cfg.py`); `configs/tracks/simple.yaml` is a 4-gate square used for
+debugging, and `configs/tracks/wide.yaml` (6 gates) is the track `fpv_play.sh` flies. `GateSpec`
+itself is defined in `terrains/racing_gates_cfg.py`. There is no longer a hard-coded `FIXED_GATES` / `FIXED_GATES_` Python list — both are
+YAML files now.
 
 ### 7.3 Gate Coordinate Convention
 
 Gates use a right-handed local frame:
 - **+X** = right (horizontal, along bar width)
 - **+Y** = forward = **passage direction** (drone flies through in +Y)
-- **+Z** = up (always world up — gates never tilt)
+- **+Z** = up
 
-`yaw_deg` in `GateSpec`: **clockwise from +Y** viewed from above:
+Procedurally generated (random-track) gates are always upright (roll = pitch = 0, +Z is world
+up). Gates loaded from a track YAML (`GateSpec.rotation = [roll, pitch, yaw]`) may have non-zero
+roll/pitch and can tilt.
+
+`rotation[2]` (yaw) in `GateSpec`: **clockwise from +Y** viewed from above:
 - 0° → drone passes in world +Y
 - 90° → drone passes in world +X
 
@@ -639,53 +724,36 @@ If passed:
 
 ## 8. Observation Corruption
 
-Configured via `ObservationNoiseCfg` in `env_cfg`. Applied in `_apply_obs_noise()`.
+There is no single `ObservationNoiseCfg`. Each observation term that wants noise gets its own
+`NoiseModelWithAdditiveBiasAndDropoutCfg` (`mdp/noise.py`, built by `drone_noise_model_factory`)
+passed as that `ObsTerm`'s `noise=` argument — this runs through IsaacLab's standard
+`ObsTerm.noise` pipeline (`enable_corruption=True`), it is not manual post-processing.
 
-All noise is applied manually by the custom `wrap_*` functions and `compute_next_gates_rel_and_fwd_body`, bypassing IsaacLab's built-in `ObsTerm.noise` pipeline (which is disabled by `enable_corruption=False`).
+**Per-term behaviour (applied in order, only while `cfg.enable=True`):**
 
-**Three corruption types (applied in order):**
+1. **Per-episode bias**: `NoiseModelWithAdditiveBias` samples a bias from `bias_noise_cfg` at each reset and adds it every step.
+2. **Per-step Gaussian noise**: additive noise from `noise_cfg` (`GaussianNoiseCfg`) each step.
+3. **Dropout** (`dropout` → `keep_prob = 1 - dropout`): entire term zeroed with probability `dropout` each step, independently per env.
 
-1. **Per-episode bias** (if `per_episode_bias=True`): a bias is sampled uniformly from `bias_range_<term>` at each reset and added every step. Simulates persistent sensor calibration errors.
-
-2. **Per-step Gaussian noise**: additive `N(0, gaussian_std_<term>²)` noise each step.
-
-3. **Dropout** (`dropout_prob`): entire term zeroed with probability `p` each step, independently per env. Applied as a binary mask over the first dimension.
-
-**Per-term standard deviations (training defaults):**
-
-| Term | `gaussian_std` | `bias_range` |
-|------|----------------|--------------|
-| `base_lin_vel` | 0.02 m/s | ±0.05 m/s |
-| `base_ang_vel` | 0.02 rad/s | ±0.02 rad/s |
-| `projected_gravity` | 0.01 | ±0.01 |
-| `obs_gates` | 0.02 (scaled units) | ±0.1 (scaled units ≈ ±1 m) |
-| `last_action` | 0.0 | ±0.05 |
-
-All noise is disabled in Play configs (`observation_noise.enable=False`).
+**Defaults:** every noise model built by `racing_quadcopter_env_cfg.py` (`base_lin_vel`, `base_ang_vel`, `projected_gravity`, `obs_gates`) is constructed with `enable` left at its default (`False`), so **no observation noise is applied by default** even though `std_noise`/`std_bias` values are set — those values are the *targets* the optional adaptive-randomization curriculum (`adaptive_curriculum_enabled=True`, off by default) lerps `enable`/`std` toward as route-progress improves. `last_action` and `speed_limits` have no noise model. See `docs/README_randomization.md`.
 
 ---
 
 ## 9. Action Corruption
 
-Configured via `ActionNoiseCfg` in `env_cfg`. Applied in `QuadcopterThrustAction.process_actions()`.
+Configured via `ActionNoiseCfg` (`mdp/shared_features.py`) on `env_cfg.action_noise`. Applied inside
+the action term's own `process_actions` (`QuadcopterRatesAction._compute_delayed_actions` /
+`QuadcopterMomentsAction.process_actions` in `mdp/actions.py`) — there is no separate
+`QuadcopterThrustAction` class.
 
-**Three corruption types:**
+**Corruption steps, in order (all gated by `action_noise.enable`, default `False`):**
 
-1. **Per-step Gaussian noise** (`gaussian_std=0.015`): additive noise on all 4 action channels.
+1. **Per-step Gaussian noise** (`gaussian_std`, default `0.0`): additive noise on all 4 action channels.
+2. **Per-episode bias** (`per_episode_bias=True` by default, `bias_range`, default `(0.0, 0.0)`): constant offset per episode, sampled at reset by the shared `reset_action_noise` event.
+3. **First-order low-pass filter**: `cmd_filtered = alpha × cmd_new + (1 - alpha) × cmd_prev`. `alpha` is per-episode-sampled from `lpf_alpha_range` (default `(1.0, 1.0)`, i.e. no filtering) when `per_episode_lpf_alpha=True` (default); otherwise the static `lpf_alpha` field (default `1.0`) is used.
+4. **Clipping** (`clip_actions=True` by default): after all corruption, actions are re-clamped to `[-1, 1]`.
 
-2. **Per-episode bias** (`per_episode_bias=True`, `bias_range=(-0.05, 0.05)`): constant offset per episode, sampled at reset. Simulates motor trim offsets.
-
-3. **First-order low-pass filter** (`lpf_alpha=0.9`):
-   ```
-   cmd_filtered = alpha × cmd_new + (1 - alpha) × cmd_prev
-   ```
-   `alpha=0.9` → ~10% of old command retained each step. Simulates actuator bandwidth limitation. `alpha=1.0` = no filtering.
-
-4. **Clipping** (`clip_actions=True`): after all corruption, actions are re-clamped to `[-1, 1]`.
-
-Applied corruption order: Gaussian → bias → LPF → clip. The `_prev_actions` buffer is read before updating so the LPF uses the previous **post-corruption** command.
-
-All corruption disabled in Play configs (`action_noise.enable=False`).
+With every field at its default, enabling `action_noise.enable=True` alone is a no-op — `gaussian_std=0`, `bias_range=(0,0)` and `lpf_alpha_range=(1,1)` add no actual corruption; each knob must be set explicitly (or the adaptive-randomization curriculum, which lerps them toward its profile's target values, must be enabled). See `docs/README_randomization.md`.
 
 ---
 
@@ -736,7 +804,7 @@ On warmup completion:
 
 After warmup, printed every `speed_log_interval_s` seconds (default 10 s):
 ```
-[EVAL Stats | n=NNN] Speed: X.X km/h  |  Gates/ep: X.X  |  Lap%: XX.X%  |  Lap time: X.X s
+[EVAL Stats | n=NNN] Avg speed: X.X km/h  |  Top speed: X.X km/h  |  Gates/ep: X.X  |  Lap%: XX.X%  |  Lap time: X.X s
 ```
 
 `n` = number of entries in `_run_window` at print time. The mode prefix (`TRAIN`, `EVAL`, or `RUN`) is set by the `RACING_RUN_MODE` environment variable, which train.py sets to `TRAIN` and play.py sets to `EVAL`.
@@ -791,10 +859,10 @@ Policy outputs a Gaussian distribution. During training: sample from distributio
 | `ratio_clip` | 0.2 | PPO clip ε |
 | `value_clip` | 0.2 | Value function clip |
 | `entropy_loss_scale` | 0.01 | Entropy bonus coefficient |
-| `rewards_shaper_scale` | 0.01 | Divides all rewards by 100 |
+| `rewards_shaper_scale` | 1.0 | No additional reward scaling |
 | `observation_preprocessor` | `RunningStandardScaler` | Online obs normalization |
 | `value_preprocessor` | `RunningStandardScaler` | Online value normalization |
-| `timesteps` | 20000 | Default total env steps (override with `--max_iterations`) |
+| `timesteps` | 10000 | Default total env steps (override with `--max_iterations`) |
 
 **Checkpoint path:** `logs/skrl/racing_quadcopter/<timestamp>_ppo_torch/checkpoints/`
 
@@ -802,18 +870,22 @@ Policy outputs a Gaussian distribution. During training: sample from distributio
 
 File: `agents/rsl_rl_ppo_cfg.py`
 
-A secondary trainer option (not used in sweep). Smaller network (128 × 64) and different step count (`num_steps_per_env=48`, `max_iterations=10000`).
+A secondary trainer option (not used in sweep). `RacingQuadcopterPPORunnerCfg`: network hidden dims `[200, 100]` (tanh activation), `num_steps_per_env=48`, `max_iterations=10000`.
+
+`RacingQuadcopterRecurrentPPORunnerCfg` (used by the `-RNN-*` task IDs): GRU actor and critic (`rnn_hidden_dim=128`, `rnn_num_layers=1`) in front of the same `[200, 100]` MLP heads, `num_steps_per_env=64`. The `-RNN-*` IDs only differ for rsl_rl; with skrl they load the normal MLP `skrl_ppo_cfg.yaml`.
 
 ### 11.3 Reward Scaling Chain
 
+There is no `MANAGER_SCALE` or manager-scale/direct-weight distinction: `RewTerm.weight` values
+in `RewardsCfg` (see [Section 6.3](#63-reward-terms)) are used as-is.
+
 ```
-function_output × WEIGHT_* × rewards_shaper_scale
-= function_output × (MANAGER_SCALE × DIRECT_*) × 0.01
-= function_output × (100 × DIRECT_*) × 0.01
-= function_output × DIRECT_*
+effective reward per step = function_output × weight × step_dt
 ```
 
-This ensures the effective reward magnitude matches the direct-env defaults. When sweeping `rewards.<term>.weight`, multiply the desired "direct" coefficient by 100 (or use the `DIRECT_` sweep shorthand — see [Section 13.3](#133-direct_-shorthand)).
+SKRL's `rewards_shaper_scale` for racing is `1.0`, so no extra scaling is applied on top of the
+`RewardManager`'s `weight × step_dt`. When sweeping reward weights, `DIRECT_<TERM>` in
+`scripts/sweep.py` maps 1:1 onto `rewards.<term>.weight` (see [Section 13.5](#135-direct_-shorthand)).
 
 ---
 
@@ -919,21 +991,24 @@ param_grid:
 **Key syntax:**
 - Simple attribute: `"recovery_spawn_prob"` → sets `env_cfg.recovery_spawn_prob`
 - Dotted path: `"rewards.crash.weight"` → sets `env_cfg.rewards.crash.weight`
-- Nested: `"observation_noise.gaussian_std_obs_gates"` → sets `env_cfg.observation_noise.gaussian_std_obs_gates`
+- Nested: `"action_noise.gaussian_std"` → sets `env_cfg.action_noise.gaussian_std`
 - Tuple strings: `"(8.0, 15.0)"` is parsed by `ast.literal_eval` and coerced to tuple
 
 ### 13.5 DIRECT_ Shorthand
 
-Keys starting with `DIRECT_` are converted to manager-scale `rewards.<term>.weight`:
+Keys starting with `DIRECT_` map 1:1 onto `rewards.<term>.weight`:
 
 ```yaml
 param_grid:
   DIRECT_VELOCITY_TOWARD_GATE: [0.1, 2.0]
-# → --override rewards.velocity_toward_gate.weight=10.0  (0.1 × 100)
-#   --override rewards.velocity_toward_gate.weight=200.0 (2.0 × 100)
+# → --override rewards.velocity_toward_gate.weight=0.1
+#   --override rewards.velocity_toward_gate.weight=2.0
 ```
 
-`MANAGER_SCALE` is read directly from `rewards.py` using regex, without importing the Racing_Quadcopter package, to avoid triggering Omniverse extension loading in the sweep script itself.
+`rewards.py` has no `MANAGER_SCALE` constant; `sweep.py` looks for one via regex (without
+importing the Racing_Quadcopter package, to avoid triggering Omniverse extension loading in the
+sweep script itself) and falls back to a scale of `1.0` when it isn't found, which is why the
+mapping above is 1:1.
 
 ### 13.6 Output and Metrics
 
@@ -976,7 +1051,8 @@ Both train.py and play.py support `--override KEY=VAL`. Multiple `--override` fl
 --override speed_limits.linear_range="(2.0, 15.0)"
 --override speed_limits.angular_range="(1.0, 8.0)"
 --override rewards.crash.weight=-8000.0
---override observation_noise.gaussian_std_obs_gates=0.05
+--override action_noise.enable=True
+--override action_noise.gaussian_std=0.02
 --override recovery_spawn_prob=0.3
 ```
 
@@ -1002,9 +1078,9 @@ Derived: `step_dt = decimation × dt = 0.04 s`, `max_episode_steps = episode_len
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scene.num_envs` | 1024 | Number of parallel environments |
+| `scene.num_envs` | 4096 (1024 on Play configs) | Number of parallel environments |
 | `scene.env_spacing` | 5.0 m | Spacing between env origins |
-| `scene.replicate_physics` | True | Use PhysX's scene replication |
+| `scene.replicate_physics` | False | Use PhysX's scene replication |
 
 ### Physics limits
 
@@ -1020,18 +1096,23 @@ Derived: `step_dt = decimation × dt = 0.04 s`, `max_episode_steps = episode_len
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `speed_limits.enabled` | False | Add paired observations, penalties, and curriculum-latched randomization |
-| `speed_limits.linear_range` | (0.0, 0.0) m/s | Disabled default; set a positive range when enabling |
-| `speed_limits.angular_range` | (0.0, 0.0) rad/s | Disabled default; set a positive range when enabling |
-| `adaptive_curriculum_enabled` | False | Enable shared reward/noise/dynamics progression outside competition |
+| `speed_limits.enabled` | Depends on `RACING_REWARD_PRESET`: `False` (`may`), `True` (`current`) | Add paired observations, penalties, and curriculum-latched randomization |
+| `speed_limits.linear_range` | (2.0, 15.0) m/s | Used only while `enabled=True` |
+| `speed_limits.angular_range` | (1.0, 5.0) rad/s | Used only while `enabled=True` |
+| `adaptive_curriculum_enabled` | Depends on `RACING_REWARD_PRESET`: `False` (`may`), `True` (`current`) | Enable shared reward/noise/dynamics progression |
 
 ### Spawn
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `fixed_spawn` | False | True → 8-lane grid at gate 0 (Play configs) |
-| `ground_init_prob` | 0.5 | Fraction using ground spawn in "mixed" mode |
 | `recovery_spawn_prob` | 0.2 | Fraction overwritten with random attitude in stage 2 |
+
+`EventsCfg.reset_racing_spawn` is configured with `params={"method": "uniform"}`, so every default
+training run uses the uniform-box spawn; `"mixed"` (which would read a `ground_init_prob`
+attribute via `getattr(env.cfg, "ground_init_prob", 0.5)`) is reachable in `mdp/events.py` but is
+never selected by any current task config, and `ground_init_prob` is not a declared field on any
+env cfg.
 
 ### Curriculum thresholds
 
@@ -1069,7 +1150,7 @@ Derived: `step_dt = decimation × dt = 0.04 s`, `max_episode_steps = episode_len
 
 All visualization objects are USD `BasisCurves` or `SphereLight` prims created in `_setup_gate_tracking()`. They have no `CollisionAPI`, so they are invisible to the physics engine.
 
-Functions in `vis/trajectory_vis.py`:
+Functions in `racing_quadcopter/trajectory_vis.py`:
 
 | Function | Controlled by | Description |
 |----------|--------------|-------------|
@@ -1130,7 +1211,7 @@ Printed during each reset:
 
 Printed every step:
 - `reward_buf` sample (first 5 envs)
-- Per-term unweighted output (mean), weight, and weighted mean for all 11 reward terms
+- Per-term unweighted output (mean), weight, and weighted mean for all 13 reward terms
 - Summed unweighted reward sample
 
 Usage:
@@ -1147,7 +1228,7 @@ DEBUG_TERRAIN=1 DEBUG_REWARDS=1 python scripts/skrl/play.py \
 
 ### Reward design
 
-- **`wrong_side` on chicane tracks:** if the next gate faces opposite to the drone's direction of travel (common on chicane/random tracks), the drone will briefly be on the exit side as it turns. The penalty is mild (DIRECT weight −0.1) but can create a small adverse gradient.
+- **`wrong_side` on chicane tracks:** if the next gate faces opposite to the drone's direction of travel (common on chicane/random tracks), the drone will briefly be on the exit side as it turns. The penalty is mild (weight −0.1) but can create a small adverse gradient.
 
 - **`gate_progress` after passage:** after passing a gate, `_current_gate_idx` advances. On the same step, `reward_gate_progress` computes progress toward the *new* gate, which may be far away, giving a temporary negative distance (increasing distance). This is expected behavior.
 
@@ -1177,4 +1258,4 @@ DEBUG_TERRAIN=1 DEBUG_REWARDS=1 python scripts/skrl/play.py \
 
 - **Permanent wrench vs. motor model:** this env uses a single aggregate wrench (thrust + 3 moments) rather than simulating 4 individual motors. This is a simplification: real Crazyflies have rotor speed limits and cross-coupling. The model is sufficient for learning gate navigation but does not capture motor saturation dynamics.
 
-- **Contact sensor update period:** `update_period=0.01 s` matches the 50 Hz physics rate. At `decimation=2`, the sensor refreshes twice per RL step; `net_forces_w_history` with `history_length=2` captures both sub-steps.
+- **Contact sensor update period:** `update_period=0.01 s` is shorter than the 0.02 s physics step, so the sensor refreshes once per physics step. At `decimation=2`, that is twice per RL step; `net_forces_w_history` with `history_length=2` captures both sub-steps.

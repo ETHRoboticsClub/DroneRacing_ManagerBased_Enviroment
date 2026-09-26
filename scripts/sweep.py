@@ -73,8 +73,8 @@ TASK_PLAY  = "Isaac-Racing-Quadcopter-Manager-Fixed-Play-v0"
 #   episode_length_s          float         Episode duration in seconds.  Longer = more gates
 #                                           per episode but slower reset throughput.
 #
-#   rewards.crash.weight      float         Crash penalty (negative).  Default: -5000.0
-#                                           (MANAGER_SCALE 100 × direct weight -50).
+#   rewards.crash.weight      float         Crash penalty (negative).  Default: -50.0
+#                                           (weights are direct values; x dt by the RewardManager).
 #                                           More negative → agent avoids crashes harder
 #                                           at the risk of being overly conservative.
 #
@@ -113,6 +113,9 @@ def _read_manager_scale() -> float:
 
     This avoids importing the Racing_Quadcopter package (which pulls in Omniverse
     extensions like `omni` that may not be available in this environment).
+
+    The x100 reward-weight convention was removed: cfg weights are the direct values, so the
+    fallback is 1.0 (DIRECT_<TERM>=v sets ``rewards.<term>.weight=v``).
     """
     rewards_path = (
         REPO_ROOT
@@ -121,7 +124,6 @@ def _read_manager_scale() -> float:
         / "Racing_Quadcopter"
         / "tasks"
         / "manager_based"
-        / "racing_quadcopter"
         / "mdp"
         / "rewards.py"
     )
@@ -132,7 +134,7 @@ def _read_manager_scale() -> float:
             return float(m.group(1))
     except Exception:
         pass
-    return 100.0
+    return 1.0
 
 
 MANAGER_SCALE = _read_manager_scale()
@@ -235,7 +237,7 @@ def _apply_env_vars(env_vars: object) -> None:
 def _apply_gate_track(gate_track: object) -> None:
     """Dump an inline ``gate_track`` list to a temp YAML and expose it via env var.
 
-    The env_cfg reads ``RACING_GATE_TRACK_YAML`` in __post_init__ before terrain
+    The env_cfg reads ``TRACK_YAML`` in __post_init__ before terrain
     generation, which runs *before* ``--override`` is applied — so passing the
     track via env var (inherited by subprocesses) is the only way to inject it.
     """
@@ -255,8 +257,8 @@ def _apply_gate_track(gate_track: object) -> None:
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump({"gate_track": gate_track}, f, sort_keys=False)
 
-    os.environ["RACING_GATE_TRACK_YAML"] = track_path
-    print(f"[Sweep] Inline gate_track dumped to {track_path} (RACING_GATE_TRACK_YAML set).")
+    os.environ["TRACK_YAML"] = track_path
+    print(f"[Sweep] Inline gate_track dumped to {track_path} (TRACK_YAML set).")
 
 
 def _ensure_list(name: str, value: object) -> list:

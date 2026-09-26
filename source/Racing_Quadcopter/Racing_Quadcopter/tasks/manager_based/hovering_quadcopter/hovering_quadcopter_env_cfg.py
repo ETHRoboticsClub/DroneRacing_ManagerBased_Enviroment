@@ -5,9 +5,9 @@
 
 """Hovering / waypoint-following env configuration.
 
-Sibling package to ``racing_quadcopter``. The only cross-package import is the
-:class:`QuadcopterRatesActionCfg` (and the anemos drone profile constants)
-from ``racing_quadcopter``, which the user explicitly asked to mirror as-is.
+Sibling package to ``racing_quadcopter``; it imports nothing from it. Hovering owns its drone
+profiles, managers and reward weights, and takes its terms (incl. the
+:class:`QuadcopterRatesActionCfg` action) from the shared ``tasks/manager_based/mdp`` package.
 """
 
 from __future__ import annotations
@@ -31,19 +31,19 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 
-# Reuse the rates-PID action term and the anemos drone profiles from racing.
-from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.mdp.actions import QuadcopterRatesActionCfg
-from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.racing_quadcopter_env_cfg import DRONE_PROFILES
-from Racing_Quadcopter.tasks.manager_based.adaptive_curriculums import (
+from Racing_Quadcopter.assets.robots_cfg import ANEMOS_DRONE_CFG_URDF, ANEMOS_DRONE_CFG_USD
+from Racing_Quadcopter.tasks.manager_based.mdp.actions import QuadcopterRatesActionCfg
+from Racing_Quadcopter.tasks.manager_based.drone_profile import make_drone_profile
+from Racing_Quadcopter.tasks.manager_based.mdp.adaptive_curriculums import (
     AdaptiveRandomizationFromRouteProgress,
     AdaptiveRewardScaleFromRouteProgress,
     get_randomization_profile,
 )
-from Racing_Quadcopter.tasks.manager_based import shared_features
-from Racing_Quadcopter.tasks.manager_based.noise import drone_noise_model_factory
-from Racing_Quadcopter.tasks.manager_based.shared_features import ActionNoiseCfg, SpeedLimitsCfg
+from Racing_Quadcopter.tasks.manager_based.mdp import shared_features
+from Racing_Quadcopter.tasks.manager_based.mdp.noise import drone_noise_model_factory
+from Racing_Quadcopter.tasks.manager_based.mdp.shared_features import ActionNoiseCfg, SpeedLimitsCfg
 
-from .mdp import events, observations, rewards, terminations, scale_dataclass_attributes
+from Racing_Quadcopter.tasks.manager_based.mdp import events, observations, rewards, terminations, scale_dataclass_attributes
 from .hovering_randomization import register_hovering_randomization_profile
 from .terrain import create_waypoint_terrain
 
@@ -53,17 +53,47 @@ HOVERING_RANDOMIZATION = get_randomization_profile("hovering")
 
 
 # ---------------------------------------------------------------------------
+# Drone profiles — hovering's own copy; retuning racing's profiles does not touch these.
+# Anemos: ~0.85 kg (URDF), T/W 4.1056 from 4·k_t·Ω_max² / (m·g). The hover action term below
+# overrides thrust_to_weight and rate_command_scale; the rest of the values match racing's
+# anemos profiles as of the split.
+# ---------------------------------------------------------------------------
+def _anemos_profile(robot_cfg):
+    return make_drone_profile(
+        robot_cfg,
+        body_name="base_link",
+        thrust_to_weight=4.1056,
+        moment_scale=(1.16, 1.40, 0.020),
+        motor_k_t=8.54858e-6,
+        motor_k_d=1e-8,
+        motor_arm_length_m=0.110,
+        motor_omega_max_rad_s=1000.0,
+        rate_command_scale=30.0,
+        pid_scales=0.005,
+        pid_p=(45.0, 47.0, 0.64),
+        pid_i=(0.0, 0.0, 0.0),
+        pid_d=(32.0, 34.0, 0.45),
+        pid_f=(0.0, 0.0, 0.0),
+    )
+
+
+HOVERING_DRONE_PROFILES = {
+    "anemos_usd": _anemos_profile(ANEMOS_DRONE_CFG_USD),
+    "anemos_urdf": _anemos_profile(ANEMOS_DRONE_CFG_URDF),
+}
+
+# ---------------------------------------------------------------------------
 # Drone selection
 # ---------------------------------------------------------------------------
 DRONE_MODEL_ENV_VAR = "HOVERING_DRONE_MODEL"
 WAYPOINTS_ENV_VAR = "WAYPOINTS"
 
-_ALLOWED_DRONE_MODELS = ("anemos_usd", "anemos_urdf")
+_ALLOWED_DRONE_MODELS = tuple(HOVERING_DRONE_PROFILES)
 DRONE_MODEL = _os.environ.get(DRONE_MODEL_ENV_VAR, "anemos_urdf")
 assert DRONE_MODEL in _ALLOWED_DRONE_MODELS, (
     f"Invalid {DRONE_MODEL_ENV_VAR}={DRONE_MODEL!r}. Allowed: {_ALLOWED_DRONE_MODELS}"
 )
-PROFILE = DRONE_PROFILES[DRONE_MODEL]
+PROFILE = HOVERING_DRONE_PROFILES[DRONE_MODEL]
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +115,10 @@ class WaypointRewardWeights:
     WAYPOINT_PROXIMITY: float = 0.2
     WAYPOINT_PROXIMITY_FINE: float = 0.14
     LIN_VEL: float = -0.04                 # -0.2 * 0.2
-    ANG_VEL: float = -0.1                 # -0.05 * 0.2
+    ANG_VEL: float = -0.1                 # retuned (legacy was -0.05 * 0.2 = -0.01)
     NEAR_WAYPOINT_LIN_VEL: float = -0.12
     NEAR_WAYPOINT_ANG_VEL: float = -0.20
-    # Match Competition's action regularization. The shared magnitude term
+    # Match AI-GP experimental's action regularization. The shared magnitude term
     # operates on the raw policy output and applies a 100x excess multiplier
     # outside [-1, 1], so a policy cannot exploit the action clamp.
     ACTION_MAGNITUDE: float = -1.0
@@ -131,7 +161,7 @@ class ActionsCfg:
         #   climbs at 1g until it crashes the ceiling, never finding the
         #   hover bonus. T2W=1.9 places hover at action ≈ 0 (matches the old
         #   direct hovering env exactly).
-        # * ``rate_command_scale``: match Competition's ±6.5 rad/s envelope.
+        # * ``rate_command_scale``: match AI-GP experimental's ±6.5 rad/s envelope.
         #   Hovering does not need racing-level body rates, and the tighter
         #   envelope gives the low-authority yaw axis a realistic safe bound.
         thrust_to_weight=1.9,
@@ -176,6 +206,11 @@ class ObservationsCfg:
         enable_corruption: bool = True
         concatenate_terms: bool = True
 
+        # NOTE on noise: with adaptive_curriculum_enabled (default) the curriculum owns the
+        # gravity / gyro noise: it switches it OFF at construction (scale 0) and ramps it to the
+        # hovering_randomization.py targets (0.05 / 0.01). The literals below (0.02 / 0.005,
+        # enable=True) only apply when the curriculum is disabled or bypassed (eval / PLAY).
+        # mocap_lin_vel noise has no curriculum target and is always on.
         projected_gravity = ObsTerm(
             func=observations.projected_gravity,
             params={"asset_cfg": SceneEntityCfg("robot")},
@@ -209,7 +244,7 @@ class ObservationsCfg:
             history_length=_HOVER_OBS_WINDOW,
         )
         last_action = ObsTerm(
-            func=observations.last_action,
+            func=observations.last_applied_action,
             history_length=_HOVER_OBS_WINDOW,
         )
         speed_limits = ObsTerm(func=shared_features.speed_limits_obs)
@@ -262,9 +297,11 @@ class RewardsCfg:
         params={"clip_threshold": 1.0, "clip_excess_multiplier": 100.0},
     )
     action_smoothness = RewTerm(
-        func=rewards.penalty_action_smoothness, weight=WaypointRewardWeights.ACTION_SMOOTHNESS
+        func=rewards.penalty_action_smoothness,
+        weight=WaypointRewardWeights.ACTION_SMOOTHNESS,
+        params={"skip_first_step": False},
     )
-    crash = RewTerm(func=rewards.penalty_crash, weight=WaypointRewardWeights.CRASH)
+    crash = RewTerm(func=rewards.penalty_out_of_bounds_or_upside_down, weight=WaypointRewardWeights.CRASH)
 
     # Waypoint-task extensions.
     waypoint_collected = RewTerm(
@@ -332,7 +369,11 @@ class EventsCfg:
 
 @configclass
 class CurriculumCfg:
-    """Shared route-progress curricula, wired but disabled by default."""
+    """Shared route-progress curricula (enabled by default via ``adaptive_curriculum_enabled``).
+
+    They start at scale 0 and ramp the collection gates, noise and speed limits with route
+    progress. In eval mode (PLAY) they are bypassed, so eval uses the cfg values directly.
+    """
 
     route_progress_rewards = CurrTerm(
         func=AdaptiveRewardScaleFromRouteProgress,
@@ -351,7 +392,7 @@ class CurriculumCfg:
             # Once the policy can make route progress, progressively emphasize
             # accurate centring, low-speed arrival, and stable dwell.  On weak
             # progress, all non-envelope terms relax back toward baseline.
-            # Speed-envelope penalties instead match Competition: once they
+            # Speed-envelope penalties instead match AI-GP experimental: once they
             # have been strengthened, a transient progress regression does not
             # relax the commanded-speed discipline.
             "increase_only_term_names": (
@@ -361,7 +402,7 @@ class CurriculumCfg:
             "eval_interval_s": 120.0,
             "low_ratio_threshold": 0.50,
             "high_ratio_threshold": 0.75,
-            # Match Competition's progressive smooth-control schedule.  The
+            # Match AI-GP experimental's progressive smooth-control schedule.  The
             # shared controller relaxes this back toward 1× when route progress
             # falls below the low threshold.
             "scale_step_fraction": 2.0,
@@ -373,7 +414,7 @@ class CurriculumCfg:
                 "waypoint_proximity_fine": 25.0,
                 "near_waypoint_lin_vel": 20.0,
                 "near_waypoint_ang_vel": 20.0,
-                # Match Competition's speed-envelope penalty ceiling.
+                # Match AI-GP experimental's speed-envelope penalty ceiling.
                 "velocity_limit": 20.0,
                 "angular_velocity_limit": 20.0,
             },
@@ -491,11 +532,14 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     max_height: float = 5.0
     upside_down_threshold: float = 0.7
 
-    # Domain-randomization toggles (all default off).
-    randomize_mass: bool = True
-    randomize_com: bool = True
-    randomize_actuator_gains: bool = True
-    apply_external_disturbances: bool = True
+    # Domain-randomization toggles. NON-WORKING: the matching event terms in EventsCfg are
+    # commented out (inside a string), so no DR runs regardless of these flags; they default to
+    # False to reflect that. Restore the EventTerms before enabling. Like all flags consumed in
+    # __post_init__, --override / Hydra cannot change them (edit the defaults instead).
+    randomize_mass: bool = False
+    randomize_com: bool = False
+    randomize_actuator_gains: bool = False
+    apply_external_disturbances: bool = False
 
     # Vis toggle.
     draw_waypoints: bool = True
@@ -509,6 +553,8 @@ class HoveringQuadcopterEnvCfg(ManagerBasedRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 50,
         render_interval=2,
+        # Same aggregate-pair headroom as racing (default 2**21 is short at 8192 envs).
+        physx=sim_utils.PhysxCfg(gpu_total_aggregate_pairs_capacity=2**22),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
@@ -564,4 +610,9 @@ class HoveringQuadcopterEnvCfg_PLAY(HoveringQuadcopterEnvCfg):
         self.scene.num_envs = 1024
         self.episode_length_s = 30.0
         self.eval_mode = True
+        # Eval bypasses the curriculum, so grade waypoint collection against the FINAL trained
+        # stability gates (not the permissive curriculum start values the cfg defaults to).
+        self.collection_max_linear_speed_m_s = HOVERING_RANDOMIZATION.collection_max_linear_speed_m_s
+        self.collection_max_angular_speed_rad_s = HOVERING_RANDOMIZATION.collection_max_angular_speed_rad_s
+        self.collection_max_tilt_sin = HOVERING_RANDOMIZATION.collection_max_tilt_sin
         print("[INFO] Hovering quadcopter — evaluation mode is ON.")

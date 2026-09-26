@@ -1,0 +1,382 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Racing quadcopter: episode metrics at reset and racing spawn (event manager reset mode)."""
+
+from __future__ import annotations
+
+import torch
+
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs.mdp.events import *
+from isaaclab.utils.math import quat_apply
+
+from .stats import accumulate_episode_stats
+
+
+def collect_episode_metrics_before_reset(env: ManagerBasedRLEnv, env_ids_tensor: torch.Tensor) -> dict:
+    """Snapshot episode stats into _last_episode_* and zero accumulators for the next episode.
+
+    Must be called BEFORE super()._reset_idx so the accumulators still hold the
+    completed episode's data. After super()._reset_idx the EventManager will call
+    reset_racing_spawn which zeros _current_gate_idx and _gates_passed.
+    """
+    gate_log: dict = {}
+    if env_ids_tensor.numel() == 0:
+        return gate_log
+
+    # Restrict all stats to drones that spawned at the offset origin (when configured). The
+    # curriculum snapshots and buffer zeroing further below still apply to ALL resetting envs.
+    if bool(getattr(env.cfg, "stats_origin_only", False)) and hasattr(env, "_spawned_at_origin"):
+        stats_ids = env_ids_tensor[env._spawned_at_origin[env_ids_tensor]]
+    else:
+        stats_ids = env_ids_tensor
+
+    # Overall (run-wide) peak speed over any completed run; folded origin-only in gate_utils.
+    gate_log["Episode_Metrics/top_speed"] = env._top_speed.item()
+
+    if stats_ids.numel() > 0:
+        gate_log["Episode_Metrics/gates_passed"] = env._gates_passed[stats_ids].float().mean().item()
+
+        step_counts = env._episode_step_count[stats_ids]
+        valid_steps = step_counts > 0
+        if valid_steps.any():
+            gate_log["Episode_Metrics/mean_velocity"] = (
+                env._episode_velocity_sum[stats_ids][valid_steps] / step_counts[valid_steps]
+            ).mean().item()
+        else:
+            gate_log["Episode_Metrics/mean_velocity"] = 0.0
+
+        gate_log["Episode_Metrics/collision_count"] = env._episode_collision_count[stats_ids].mean().item()
+
+        lap_counts = env._episode_lap_count[stats_ids]
+        has_laps = lap_counts > 0
+        if has_laps.any():
+            gate_log["Episode_Metrics/mean_lap_time_s"] = (
+                env._episode_lap_time_sum[stats_ids][has_laps] / lap_counts[has_laps]
+            ).mean().item()
+            env._total_lap_time_sum += float(env._episode_lap_time_sum[stats_ids][has_laps].sum().item())
+            env._total_lap_count += int(lap_counts[has_laps].sum().item())
+
+        step_counts_all = env._episode_step_count[stats_ids]
+        episode_mean_speed = torch.where(
+            step_counts_all > 0,
+            env._episode_velocity_sum[stats_ids] / step_counts_all.clamp(min=1),
+            torch.zeros_like(step_counts_all),
+        )
+        accumulate_episode_stats(
+            env,
+            stats_ids,
+            env._gates_passed[stats_ids],
+            lap_counts,
+            env._gate_counts[stats_ids],
+            episode_mean_speed,
+        )
+
+    # Save passage-quality averages for the curriculum check in the NEXT episode.
+    # _last_episode_* persist across resets; the live accumulators are zeroed below.
+    env._last_episode_gates_passed[env_ids_tensor] = env._gates_passed[env_ids_tensor].float()
+    has_passages = env._passage_count[env_ids_tensor] > 0
+    env._last_episode_mean_velocity[env_ids_tensor] = torch.where(
+        has_passages,
+        env._passage_velocity_sum[env_ids_tensor] / env._passage_count[env_ids_tensor],
+        torch.zeros_like(env._passage_velocity_sum[env_ids_tensor]),
+    )
+    env._last_episode_center_offset[env_ids_tensor] = torch.where(
+        has_passages,
+        env._passage_centering_sum[env_ids_tensor] / env._passage_count[env_ids_tensor],
+        torch.zeros_like(env._passage_centering_sum[env_ids_tensor]),
+    )
+
+    # Zero all live accumulators so the next episode starts clean.
+    env._episode_velocity_sum[env_ids_tensor] = 0.0
+    env._episode_step_count[env_ids_tensor] = 0.0
+    env._episode_collision_count[env_ids_tensor] = 0.0
+    env._passage_velocity_sum[env_ids_tensor] = 0.0
+    env._passage_centering_sum[env_ids_tensor] = 0.0
+    env._passage_count[env_ids_tensor] = 0.0
+    env._episode_lap_time_sum[env_ids_tensor] = 0.0
+    env._episode_lap_count[env_ids_tensor] = 0.0
+    env._last_lap_step[env_ids_tensor] = 0.0
+    env._run_max_speed[env_ids_tensor] = 0.0  # discard peak speed of the (now-ended) run
+
+    return gate_log
+
+
+def _quat_from_euler_xyz(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Quaternion from XYZ Euler angles in wxyz order."""
+    hr = 0.5 * roll
+    hp = 0.5 * pitch
+    hy = 0.5 * yaw
+    cr, sr = torch.cos(hr), torch.sin(hr)
+    cp, sp = torch.cos(hp), torch.sin(hp)
+    cy, sy = torch.cos(hy), torch.sin(hy)
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    return torch.stack([qw, qx, qy, qz], dim=-1)
+
+
+def _write_spawn_state(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    start_pos: torch.Tensor,
+    start_quat: torch.Tensor,
+    root_vel: torch.Tensor,
+    init_actions: torch.Tensor | None = None,
+) -> None:
+    """Write root pose, velocity, and joint state to simulation and reset racing buffers."""
+    root_poses = torch.zeros(len(env_ids), 7, device=env.device)
+    root_poses[:, :3] = start_pos
+    root_poses[:, 3:7] = start_quat
+
+    joint_pos = env._robot.data.default_joint_pos[env_ids]
+    joint_vel = env._robot.data.default_joint_vel[env_ids]
+    env._robot.write_root_pose_to_sim(root_poses, env_ids)
+    env._robot.write_root_velocity_to_sim(root_vel, env_ids)
+    env._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+    # Sync _prev_drone_pos to the new spawn position so the first step's gate-progress
+    # reward computes a valid (zero) distance reduction rather than a garbage delta.
+    env._prev_drone_pos[env_ids] = start_pos
+    if init_actions is None:
+        env._actions_buf[env_ids] = 0.0
+        env._prev_actions[env_ids] = 0.0
+    else:
+        # Randomised initial actions prevent the action-smoothness penalty from
+        # producing a large spike on the very first step after reset.
+        env._actions_buf[env_ids] = init_actions
+        env._prev_actions[env_ids] = init_actions
+
+    if hasattr(env, "_motor_speeds"):
+        env._motor_speeds[env_ids] = 0.0
+    if hasattr(env, "_prev_motor_speeds"):
+        env._prev_motor_speeds[env_ids] = 0.0
+
+
+def _sample_spawn_gate(
+    env: ManagerBasedRLEnv, env_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample a gate index per env and return (spawn_idx, gate_pos, gate_ori).
+
+    The distribution over gates is controlled by ``cfg.spawn_gate_bias`` (a power-law
+    exponent on each gate's rank from the end of the track)::
+
+        weight(gate i) ∝ (gate_count - i) ** spawn_gate_bias
+
+    - ``bias = 0`` → uniform over [0, gate_count-1] (default; original behaviour).
+    - ``bias = 1`` → linear, favouring earlier gates; the first:last spawn ratio is
+      ``gate_count : 1`` (e.g. 6:1 on a 6-gate track → gate 0 ≈ 28.6 %, last ≈ 4.8 %).
+    - higher values steepen the bias toward the first gate.
+
+    Earlier gates are favoured because a drone spawned at gate i also flies the
+    downstream gates once competent, so late gates accrue pass-through coverage;
+    the non-zero tail still gives the final segments direct spawns early in training.
+
+    Each env draws independently so multi-difficulty grids (different gate counts
+    per row) are handled correctly.
+    """
+    n = len(env_ids)
+    gate_counts = env._gate_counts[env_ids].float()  # [N]
+    bias = float(getattr(env.cfg, "spawn_gate_bias", 0.0))
+
+    if bias == 0.0:
+        spawn_idx = (torch.rand(n, device=env.device) * gate_counts).long()  # [N] in [0, count-1]
+    else:
+        max_count = int(env._gate_counts[env_ids].max().item())
+        idx = torch.arange(max_count, device=env.device).unsqueeze(0)  # [1, max_count]
+        rank_from_end = gate_counts.unsqueeze(1) - idx                  # [N, max_count]; >0 for valid gates
+        weights = torch.where(
+            rank_from_end > 0, rank_from_end.pow(bias), torch.zeros_like(rank_from_end)
+        )
+        spawn_idx = torch.multinomial(weights, num_samples=1).squeeze(1)  # [N] in [0, count-1]
+
+    idx_pos = spawn_idx.view(n, 1, 1).expand(n, 1, 3)
+    gate_pos = env._gate_positions[env_ids].gather(1, idx_pos).squeeze(1)  # [N, 3]
+    idx_ori = spawn_idx.view(n, 1, 1).expand(n, 1, 4)
+    gate_ori = env._gate_orientations[env_ids].gather(1, idx_ori).squeeze(1)  # [N, 4]
+    return spawn_idx, gate_pos, gate_ori
+
+
+def _apply_fixed_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Spawn all drones at a deterministic 8-lane starting grid behind gate 0.
+
+    Envs that share the same terrain cell get unique positions so they don't
+    stack on top of each other. Lanes are 0.6 m wide; rows are 0.6 m deep,
+    starting 2 m behind the gate.
+    """
+    n = len(env_ids)
+    spawn_idx = torch.zeros(n, dtype=torch.long, device=env.device)
+
+    idx_pos = spawn_idx.view(n, 1, 1).expand(n, 1, 3)
+    gate_pos = env._gate_positions[env_ids].gather(1, idx_pos).squeeze(1)  # [N, 3]
+    idx_ori = spawn_idx.view(n, 1, 1).expand(n, 1, 4)
+    gate_ori = env._gate_orientations[env_ids].gather(1, idx_ori).squeeze(1)  # [N, 4]
+
+    env._spawn_gate_idx[env_ids] = spawn_idx
+    env._current_gate_idx[env_ids] = spawn_idx
+    env._gates_passed[env_ids] = 0
+
+    fwd   = quat_apply(gate_ori, env._y_local.expand(n, -1))
+    right = quat_apply(gate_ori, env._x_local.expand(n, -1))
+
+    n_lanes = 8
+    rank    = torch.arange(n, device=env.device)
+    lane    = (rank % n_lanes).float() - (n_lanes - 1) / 2.0  # -3.5 … +3.5
+    row     = (rank // n_lanes).float()
+
+    start_pos = (
+        gate_pos
+        - (2.0 + row * 0.6).unsqueeze(-1) * fwd
+        + (lane * 0.6).unsqueeze(-1) * right
+    )
+    start_pos[:, 2] = gate_pos[:, 2]
+    root_vel = torch.zeros(n, 6, device=env.device)
+
+    _write_spawn_state(env, env_ids, start_pos, gate_ori, root_vel)
+
+
+def _apply_ground_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Start 2 m behind a randomly chosen gate, aligned with gate orientation."""
+    n = len(env_ids)
+    spawn_idx, gate_pos, gate_ori = _sample_spawn_gate(env, env_ids)
+    env._spawn_gate_idx[env_ids] = spawn_idx
+    env._current_gate_idx[env_ids] = spawn_idx
+    env._gates_passed[env_ids] = 0
+    fwd = quat_apply(gate_ori, env._y_local.expand(n, -1))
+
+    start_pos = gate_pos - 2.0 * fwd  # 2 m behind gate along gate forward axis
+    start_pos[:, 2] = gate_pos[:, 2]  # same height as gate centre
+    start_quat = gate_ori              # drone faces the gate directly
+    root_vel = torch.zeros(n, 6, device=env.device)
+
+    _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel)
+
+
+def _apply_uniform_initialization(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Uniform spawn in a small box on the approach side of a randomly chosen gate.
+
+    Box is defined in the gate's own frame so it is always before the gate
+    regardless of world orientation:
+      - depth  [1.0, 4.0] m behind the gate (negative forward axis)
+      - right  ±1.5 m along gate right axis
+      - up     ±0.75 m around gate center height
+    """
+    n = len(env_ids)
+    spawn_idx, gate_pos, gate_ori = _sample_spawn_gate(env, env_ids)
+    env._spawn_gate_idx[env_ids] = spawn_idx
+    env._current_gate_idx[env_ids] = spawn_idx
+    env._gates_passed[env_ids] = 0
+
+    # World-frame gate axes for placing the spawn box in gate-local coordinates.
+    fwd   = quat_apply(gate_ori, env._y_local.expand(n, -1))  # passage direction
+    right = quat_apply(gate_ori, env._x_local.expand(n, -1))
+    up    = quat_apply(gate_ori, env._z_local.expand(n, -1))
+
+    depth   = 1.0 + torch.rand(n, device=env.device) * 3.0          # [1, 4] m before gate
+    lateral = 1.5 * (2.0 * torch.rand(n, device=env.device) - 1.0)  # ±1.5 m right/left
+    vert    = 0.75 * (2.0 * torch.rand(n, device=env.device) - 1.0) # ±0.75 m up/down
+
+    start_pos = (
+        gate_pos
+        - depth.unsqueeze(-1)   * fwd    # behind gate (approach side)
+        + lateral.unsqueeze(-1) * right
+        + vert.unsqueeze(-1)    * up
+    )
+    # Never go below ground. Clamp above min_height (0.2 m) to avoid instant termination.
+    start_pos[:, 2] = start_pos[:, 2].clamp(min=0.3)
+
+    # Roll/pitch within ±20° (±π/9), full random yaw.
+    # Random orientation prevents the agent from exploiting a fixed spawn heading.
+    roll  = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
+    pitch = -torch.pi / 9.0 + torch.rand(n, device=env.device) * (2.0 * torch.pi / 9.0)
+    yaw   = -torch.pi + torch.rand(n, device=env.device) * (2.0 * torch.pi)
+    start_quat = _quat_from_euler_xyz(roll, pitch, yaw)
+
+    # Small random initial velocity and angular rate to improve robustness to
+    # mid-flight perturbations during training.
+    lin_vel = -0.5 + torch.rand(n, 3, device=env.device) * 1.0   # ±0.5 m/s per axis
+    ang_vel = -0.1 + torch.rand(n, 3, device=env.device) * 0.2   # ±0.1 rad/s per axis
+    root_vel = torch.cat([lin_vel, ang_vel], dim=-1)
+
+    init_actions = -1.0 + torch.rand(n, 4, device=env.device) * 2.0  # uniform in [-1, 1]
+    _write_spawn_state(env, env_ids, start_pos, start_quat, root_vel, init_actions=init_actions)
+
+
+def _apply_recovery_override(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
+    """Overwrite orientation and velocity with fully random values for recovery training.
+
+    Position is kept from the preceding normal spawn (read from _prev_drone_pos).
+    Orientation is a uniformly random unit quaternion (any attitude, including inverted).
+    Linear velocity is 2–6 m/s in a random direction; angular velocity is ±3 rad/s.
+    """
+    n = len(env_ids)
+
+    # Position from the normal spawn (already written via _write_spawn_state).
+    start_pos = env._prev_drone_pos[env_ids].clone()
+
+    # Uniformly random unit quaternion via Gaussian normalisation.
+    quat = torch.randn(n, 4, device=env.device)
+    quat = quat / quat.norm(dim=-1, keepdim=True)
+
+    # Random linear velocity: random direction, speed in [2, 6] m/s.
+    speed     = 2.0 + torch.rand(n, device=env.device) * 4.0
+    direction = torch.randn(n, 3, device=env.device)
+    direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+    lin_vel   = direction * speed.unsqueeze(-1)
+
+    # Random angular velocity up to ±3 rad/s per axis.
+    ang_vel  = (torch.rand(n, 3, device=env.device) * 2.0 - 1.0) * 3.0
+    root_vel = torch.cat([lin_vel, ang_vel], dim=-1)
+
+    init_actions = -1.0 + torch.rand(n, 4, device=env.device) * 2.0
+    _write_spawn_state(env, env_ids, start_pos, quat, root_vel, init_actions=init_actions)
+
+
+def reset_racing_spawn(
+    env: ManagerBasedRLEnv, env_ids: torch.Tensor | slice | None, method: str = "mixed"
+) -> None:
+    """Reset gate progress and sample initialization method.
+
+    Args:
+        method: One of ``"ground"``, ``"uniform"``, or ``"mixed"``.
+    """
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    if getattr(env.cfg, "fixed_spawn", False):
+        _apply_fixed_initialization(env, env_ids)
+    elif method == "ground":
+        _apply_ground_initialization(env, env_ids)
+    elif method == "uniform":
+        _apply_uniform_initialization(env, env_ids)
+    elif method == "mixed":
+        # Stochastically choose per-env whether to use ground or uniform spawn.
+        # ground_init_prob=0.5 gives equal chance; tune to bias toward harder starts.
+        ground_prob = float(getattr(env.cfg, "ground_init_prob", 0.5))
+        use_ground = torch.rand(n, device=env.device) < ground_prob
+        ground_ids = env_ids[use_ground]
+        uniform_ids = env_ids[~use_ground]
+        if len(ground_ids) > 0:
+            _apply_ground_initialization(env, ground_ids)
+        if len(uniform_ids) > 0:
+            _apply_uniform_initialization(env, uniform_ids)
+    else:
+        raise ValueError(f"Unknown reset method '{method}'. Use 'ground', 'uniform', or 'mixed'.")
+
+    # Recovery spawns active only in curriculum stage 3+.
+    recovery_prob = float(getattr(env.cfg, "recovery_spawn_prob", 0.0))
+    if recovery_prob > 0.0 and getattr(env, "_curriculum_stage", 0) >= 2 and not getattr(env.cfg, "eval_mode", False):
+        mask = torch.rand(n, device=env.device) < recovery_prob
+        if mask.any():
+            _apply_recovery_override(env, env_ids[mask])
+
+    if env.cfg.randomize_velocity_limit:
+        # Re-sample per-env speed cap from the configured range each episode.
+        # The new limit is also written into the observation so the policy can adapt.
+        lo, hi = env.cfg.velocity_limit_range
+        env._velocity_limit[env_ids] = torch.rand(len(env_ids), device=env.device) * (hi - lo) + lo

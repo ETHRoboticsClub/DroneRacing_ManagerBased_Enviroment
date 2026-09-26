@@ -1,3 +1,8 @@
+# NON-WORKING (as of 2026-09): HOVERING_DRONE_MODEL=anemos_sitl is rejected by the hovering cfg
+# (allowed: anemos_usd, anemos_urdf), so the task fails to import. Hovering no longer has a
+# SITL actuator path (BetaflightSitlSurrogateActionCfg is unused and unstable at 25 Hz), and the
+# overrides listed below do not resolve either.
+#
 # NOTE: written against the pre-merge hovering reward set from fix/hovering_dime.
 # main's hovering uses a different formulation, so 7 of these overrides no longer
 # resolve: spawn_xy_jitter, spawn_z_jitter, rewards.moving_to_target,

@@ -35,19 +35,19 @@ High-level inspiration is aligned with robust racing pipelines (for example SWIF
 
 The implementation is deliberately split into two layers:
 
-- Shared behavior lives in `tasks/manager_based/shared_features.py` and
-  `tasks/manager_based/adaptive_curriculums.py`.  Those modules allocate,
+- Shared behavior lives in `tasks/manager_based/mdp/shared_features.py` and
+  `tasks/manager_based/mdp/adaptive_curriculums.py`.  Those modules allocate,
   reset, sample, observe, penalize, and progressively scale the features for
   every manager-based task.
 - Each task configuration is only a client: it enables or disables the shared
   features, declares local limits/reward policy, and selects one named
   randomization profile.  Base racing and hovering default to disabled zero
-  values; competition opts in.
+  values; the AI-GP experimental snapshot opts in (with its own frozen copy of this code).
 
 Each task keeps its profile declarations beside its task code:
 
-- `racing_quadcopter/racing_randomization.py`
-- `racing_quadcopter/competition_randomization.py`
+- `racing_quadcopter/racing_quadcopter_env_cfg.py` (class `RacingRandomizationProfile`)
+- `ai_gp_quadcopter/experimental/competition_randomization.py` (frozen snapshot)
 - `hovering_quadcopter/hovering_randomization.py`
 
 Profiles contain values and typed bindings only.  They do not implement
@@ -56,7 +56,7 @@ randomization, speed-limit, or curriculum behavior.
 ## 2.1 Observation Randomization (State Estimation)
 
 ### Files
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/noise.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/noise.py`
 - each task's observation configuration
 
 ### How it works
@@ -74,11 +74,13 @@ configures angular velocity and gravity.
 ## 2.2 Action Randomization (Control Channel)
 
 ### File
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/racing_quadcopter/mdp/actions.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/shared_features.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/actions.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/shared_features.py`
 
 ### Where applied
-In `QuadcopterThrustAction.process_actions(...)`, before converting action commands to thrust and moments.
+In `QuadcopterRatesAction._compute_delayed_actions(...)` (default `ACTION_TYPE=rates`) or
+`QuadcopterMomentsAction.process_actions(...)` (`ACTION_TYPE=moments`), before converting action
+commands to thrust and moments. There is no `QuadcopterThrustAction` class.
 
 ### Operation order
 Given incoming normalized action $a_t \in [-1,1]^4$:
@@ -112,9 +114,9 @@ This is important: randomization is done in the action term itself, so it affect
 ## 2.3 Dynamics Randomization
 
 ### Files
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/route_progress.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/adaptive_curriculums.py`
-- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/shared_features.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/route_progress.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/adaptive_curriculums.py`
+- `source/Racing_Quadcopter/Racing_Quadcopter/tasks/manager_based/mdp/shared_features.py`
 - each task's environment configuration
 
 ### Mechanisms
@@ -127,68 +129,77 @@ penalties. When enabled, the policy sees both limits from episode zero; they sta
 maxima until curriculum activation.
 After activation, the reset `randomize_speed_limits` event samples both per environment and never
 deactivates if later normalized route progress falls.
-The competition reward curriculum also scales `velocity_limit` and
+The AI-GP experimental reward curriculum also scales `velocity_limit` and
 `angular_velocity_limit` upward on successful route-progress windows (up to 5× their
 base weights). Unlike centering and action-smoothness scales, these two scales never
 decrease during a later low-progress window.
 
 Curriculum performance is continuous geometry rather than an integer gate count. The
 episode's first and last drone positions are projected onto the closest points of an
-ordered polyline. Racing supplies gate centers (with the official start prepended for
-the competition); hovering supplies ordered target-pose centers. Covered arc length is
+ordered polyline. Racing supplies gate centers (the AI-GP experimental snapshot prepends
+its official start); hovering supplies ordered target-pose centers. Covered arc length is
 divided by the distance physically reachable from the episode's linear limit and full
 time budget. Hovering additionally removes required pose dwell time from the travel
 budget. Existing lap- and waypoint-completion metrics remain unchanged and separately logged.
 
 ## 3) Configuration Reference
 
-Shared knobs live in `tasks/manager_based/shared_features.py`; each task owns only
+Shared knobs live in `tasks/manager_based/mdp/shared_features.py`; each task owns only
 its selected targets, ranges, reward weights, and opt-in flags.
 
-## 3.1 `ObservationNoiseCfg`
+## 3.1 Per-term observation noise (`mdp/noise.py`)
+
+There is no single `ObservationNoiseCfg` dataclass. Each observation term that wants noise gets
+its own `NoiseModelWithAdditiveBiasAndDropoutCfg`, built by `drone_noise_model_factory(std_noise,
+std_bias, enable=False, dropout=0.0)` and passed as that `ObsTerm`'s `noise=` argument. Relevant
+fields (on the built noise-model cfg, per term):
 
 | Field | Meaning | Default |
 |---|---|---|
-| `enable` | Master switch for observation corruption | `True` (train cfg) |
-| `per_episode_bias` | Enable per-episode additive bias | `True` |
-| `gaussian_std_default` | Fallback std | `0.0` |
-| `gaussian_std_base_lin_vel` | Std for linear velocity obs | `0.02` |
-| `gaussian_std_base_ang_vel` | Std for angular velocity obs | `0.02` |
-| `gaussian_std_projected_gravity` | Std for projected gravity obs | `0.01` |
-| `gaussian_std_obs_gates` | Std for gate observation vector | `0.02` |
-| `gaussian_std_last_action` | Std for last-action obs | `0.0` |
-| `bias_range_base_lin_vel` | Uniform bias range | `(-0.05, 0.05)` |
-| `bias_range_base_ang_vel` | Uniform bias range | `(-0.02, 0.02)` |
-| `bias_range_projected_gravity` | Uniform bias range | `(-0.01, 0.01)` |
-| `bias_range_obs_gates` | Uniform bias range | `(-0.1, 0.1)` |
-| `bias_range_last_action` | Uniform bias range | `(-0.05, 0.05)` |
-| `dropout_prob` | Per-step term dropout probability | `0.0` |
+| `enable` | Master switch for that term's corruption | `False` |
+| `noise_cfg.std` | Per-step Gaussian std | term-specific (see below) |
+| `bias_noise_cfg.std` | Per-episode additive-bias std | term-specific (see below) |
+| `dropout` | Per-step term dropout probability | `0.0` |
 
-## 3.2 `ActionNoiseCfg`
+Racing's `base_lin_vel` / `base_ang_vel` / `projected_gravity` / `obs_gates` terms are all
+constructed with `enable` left at its default `False`. The `(std_noise, std_bias)` values passed
+in (e.g. `RACING_RANDOMIZATION.base_lin_vel_noise = (0.2, 1.0)`) are the *targets* the optional
+adaptive-randomization curriculum lerps `enable`/`std` toward — they have no effect while that
+curriculum is disabled. `last_action` and `speed_limits` have no noise model.
+
+## 3.2 `ActionNoiseCfg` (`mdp/shared_features.py`)
 
 | Field | Meaning | Default |
 |---|---|---|
-| `enable` | Master switch for action randomization | `False` (shared default) |
+| `enable` | Master switch for action randomization | `False` |
 | `per_episode_bias` | Enable per-episode action bias | `True` |
-| `gaussian_std` | Action Gaussian std | `0.015` |
-| `bias_range` | Uniform action bias range | `(-0.05, 0.05)` |
-| `lpf_alpha` | LPF factor (1.0 = no lag) | `0.9` |
+| `gaussian_std` | Action Gaussian std | `0.0` |
+| `bias_range` | Uniform action bias range | `(0.0, 0.0)` |
+| `lpf_alpha` | Static LPF factor (1.0 = no lag); used only when `per_episode_lpf_alpha=False` | `1.0` |
+| `per_episode_lpf_alpha` | Sample `lpf_alpha` per episode from `lpf_alpha_range` instead of using the static `lpf_alpha` | `True` |
+| `lpf_alpha_range` | Per-episode LPF sampling range | `(1.0, 1.0)` |
 | `clip_actions` | Clamp randomized action to `[-1, 1]` | `True` |
+
+Every numeric default is a no-op value (`gaussian_std=0`, `bias_range=(0,0)`,
+`lpf_alpha_range=(1,1)`), so setting `enable=True` alone adds no corruption — see
+[§11](#11-enabling-randomization--quick-reference).
 
 ## 3.3 Existing dynamics knobs
 
 | Field | Meaning | Default |
 |---|---|---|
-| `adaptive_curriculum_enabled` | Route-progress reward/noise/dynamics curriculum | `False` outside competition |
-| `speed_limits.enabled` | Add both observations and curriculum-latched randomization | `False` |
-| `speed_limits.linear_range` | Linear speed-limit sampling range (m/s) | `(0.0, 0.0)` when disabled |
-| `speed_limits.angular_range` | Angular speed-limit sampling range (rad/s) | `(0.0, 0.0)` when disabled |
+| `adaptive_curriculum_enabled` | Route-progress reward/noise/dynamics curriculum | Racing: depends on `RACING_REWARD_PRESET` (`False` for `may`, `True` for `current`). Hovering: `True`. |
+| `speed_limits.enabled` | Add both observations and curriculum-latched randomization | Racing: depends on `RACING_REWARD_PRESET` (`False` for `may`, `True` for `current`). Hovering: `True`. |
+| `speed_limits.linear_range` | Linear speed-limit sampling range (m/s) | Racing (`current`): `(2.0, 15.0)`. Hovering: `(0.2, 2.0)`. |
+| `speed_limits.angular_range` | Angular speed-limit sampling range (rad/s) | Racing (`current`): `(1.0, 5.0)`. Hovering: `(0.5, 1.5)`. |
 
 ## 4) Train vs Eval Behavior
 
-By default, general racing, fixed-track racing, and hovering expose the shared
-terms but keep adaptive curriculum and speed limits disabled. Competition enables
-paired limits and its route-progress curricula; its play config disables curriculum.
+By default, general racing and fixed-track racing expose the shared terms but keep adaptive
+curriculum and speed limits disabled (`RACING_REWARD_PRESET=may`, the default; setting it to
+`current` enables both). Hovering enables both paired speed limits and its route-progress
+curriculum by default. The AI-GP experimental snapshot likewise enables paired limits and its route-progress
+curricula; its play config disables curriculum.
 
 This explicit split is conventional and recommended:
 - training with noise,
@@ -214,8 +225,11 @@ Use a staged schedule rather than maximum randomization from step 0.
 - Keep dropout at `0.0`.
 
 ### Phase B: Robustness growth
-- Increase `gaussian_std_obs_gates` and `gaussian_std_base_lin_vel` gradually.
-- Enable moderate action lag (`lpf_alpha` from `1.0` toward `0.9`-`0.8`).
+- Increase the `obs_gates` and `base_lin_vel` observation-noise terms gradually (either by
+  enabling `adaptive_curriculum_enabled` so they lerp toward the profile's targets, or by
+  overriding e.g. `observations.policy.obs_gates.noise.noise_cfg.std` directly).
+- Enable moderate action lag (`action_noise.lpf_alpha` from `1.0` toward `0.9`-`0.8`, with
+  `action_noise.per_episode_lpf_alpha=False`).
 - Add small per-episode biases.
 
 ### Phase C: Hardening
@@ -226,12 +240,14 @@ Use a staged schedule rather than maximum randomization from step 0.
 
 ## 7) Suggested Initial Ranges (Conservative)
 
-These are reasonable starting points for racing:
-- `observation_noise.gaussian_std_base_lin_vel`: `0.01` to `0.03`
-- `observation_noise.gaussian_std_base_ang_vel`: `0.01` to `0.03`
-- `observation_noise.gaussian_std_obs_gates`: `0.01` to `0.04`
+These are reasonable starting points for racing. There is no flat `observation_noise.*` cfg
+object — override the per-term noise model directly (e.g.
+`observations.policy.base_lin_vel.noise.noise_cfg.std`) or enable `adaptive_curriculum_enabled`:
+- `base_lin_vel` observation-noise std: `0.01` to `0.03`
+- `base_ang_vel` observation-noise std: `0.01` to `0.03`
+- `obs_gates` observation-noise std: `0.01` to `0.04`
 - `action_noise.gaussian_std`: `0.005` to `0.02`
-- `action_noise.lpf_alpha`: `0.85` to `0.98`
+- `action_noise.lpf_alpha` (with `action_noise.per_episode_lpf_alpha=False`): `0.85` to `0.98`
 - `action_noise.bias_range`: around `(-0.03, 0.03)` to `(-0.08, 0.08)`
 
 If the policy stops learning entirely, first reduce:
@@ -264,7 +280,7 @@ If possible, keep one deterministic eval benchmark and one noisy eval benchmark.
    selected noise model; changing only one is insufficient.
 2. Action delay buffers reserve the configured curriculum maximum while the active
    delay remains zero, allowing delay to grow safely during training.
-3. Observation and action per-episode bias tensors are sampled in `_reset_idx(...)` and zeroed if disabled.
+3. The action per-episode bias tensor is sampled by the `reset_action_noise` `EventTerm` (`mode="reset"`, `mdp/shared_features.py`), and zeroed when `action_noise.enable` is `False`. Per-term observation noise models are sampled by IsaacLab's own `ObsTerm.noise` pipeline, not a shared reset event.
 
 ## 10) Usage Examples
 
@@ -288,7 +304,7 @@ python scripts/rsl_rl/play.py --task Isaac-Racing-Quadcopter-Manager-Fixed-Play-
 
 ## 11) Enabling Randomization — Quick Reference
 
-All randomization is **off by default**. Each technique is controlled by a top-level flag on `RacingQuadcopterEnvCfg` so it can be toggled via `--override` without editing any file.
+Startup physics randomization is **off by default** on `RacingQuadcopterEnvCfg`.
 
 ### Flags and what they control
 
@@ -296,51 +312,47 @@ All randomization is **off by default**. Each technique is controlled by a top-l
 |---|---|---|
 | `randomize_mass` | `False` | Startup mass scale ±10 % (`randomize_robot_mass` event) |
 | `randomize_com` | `False` | Startup CoM shift ±15 mm per axis (`randomize_base_com` event) |
+| `randomize_inertia` | `False` | Startup principal-inertia scale `[0.8, 1.2]` (`randomize_robot_inertia` event) |
 | `randomize_actuator_gains` | `False` | Startup stiffness/damping scale ±10 % (`randomize_robot_actuator_gains` event) |
 | `apply_external_disturbances` | `False` | Interval random force/torque + velocity push (`base_external_force_torque`, `push_robot` events) |
-| `observation_noise_enable` | `False` | Per-step Gaussian noise + per-episode bias on all obs terms (sets `PolicyCfg.enable_corruption`) |
-| `action_noise.enable` | `False` | Per-step Gaussian noise, per-episode bias, and LPF lag on actions (`ActionNoiseCfg`) |
-| `recovery_spawn_prob` | `0.0` | Fraction of envs that respawn with fully random attitude and velocity (stage 2+ only) |
-| `speed_limits.enabled` | `False` | Add paired observations and permanently enable sampling after curriculum activation; maximum penalties always apply |
+| `observation_noise_enable` | `False` | Declared on the cfg and logged (`Config/observation_noise_enable` in TensorBoard), but **not wired to anything** in the racing task — it does not gate `enable_corruption` or any noise model |
+| `action_noise.enable` | `False` | Per-step Gaussian noise, per-episode bias, and LPF lag on actions (`ActionNoiseCfg`) — see [§3.2](#32-actionnoisecfg-mdpshared_featurespy) for why the other knobs must also be set |
+| `recovery_spawn_prob` | `0.2` | Fraction of envs that respawn with fully random attitude and velocity (stage 2+ only) |
+| `speed_limits.enabled` | Depends on `RACING_REWARD_PRESET` (see [§3.3](#33-existing-dynamics-knobs)) | Add paired observations and permanently enable sampling after curriculum activation; maximum penalties always apply |
 
-### Enable full DR stack for a training run
+### `--override randomize_*=True` does **not** work
+
+`_apply_dr_flags()` (which nulls out the corresponding `EventTerm` when the flag is `False`) runs
+inside each env cfg's `__post_init__`, and both `--override` and Hydra's `env.*` CLI overrides are
+applied to the already-constructed cfg object **after** `__post_init__` has already run. Setting
+`randomize_mass`, `randomize_com`, `randomize_inertia`, `randomize_actuator_gains`, or
+`apply_external_disturbances` via `--override` therefore has no effect — the event term stays
+`None`. To actually enable startup DR, edit the default value on `RacingQuadcopterEnvCfg` (or a
+subclass) in `racing_quadcopter_env_cfg.py` and rerun. `action_noise.*` and `speed_limits.*` are
+read live every step/reset (not consumed once in `__post_init__`), so overriding those does work.
+
+### Enable action noise for a training run
 
 ```bash
 python scripts/skrl/train.py \
     --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
     --headless \
-    --override randomize_mass=True \
-    --override randomize_com=True \
-    --override randomize_actuator_gains=True \
-    --override apply_external_disturbances=True \
-    --override observation_noise_enable=True \
     --override action_noise.enable=True \
-    --override recovery_spawn_prob=0.2
+    --override action_noise.gaussian_std=0.02 \
+    --override action_noise.bias_range="(-0.05, 0.05)" \
+    --override action_noise.per_episode_lpf_alpha=False \
+    --override action_noise.lpf_alpha=0.9
 ```
 
-### Enable selectively (e.g. obs noise only)
-
-```bash
-python scripts/skrl/train.py \
-    --task Isaac-Racing-Quadcopter-Manager-Fixed-v0 \
-    --headless \
-    --override observation_noise_enable=True
-```
-
-### Tune action noise parameters
-
-`action_noise.enable=True` uses the values already set in `ActionNoiseCfg`. Override individual knobs if needed:
-
-```bash
---override action_noise.enable=True \
---override action_noise.gaussian_std=0.015 \
---override action_noise.bias_range="(-0.05, 0.05)" \
---override action_noise.lpf_alpha=0.9
-```
+`action_noise.enable=True` alone is a no-op — every numeric knob defaults to zero/no-op (see
+[§3.2](#32-actionnoisecfg-mdpshared_featurespy)); set `gaussian_std`, `bias_range`, and either
+`lpf_alpha_range` or (`per_episode_lpf_alpha=False` + `lpf_alpha`) explicitly.
 
 ### Note on Play configs
 
-Play configs (`*-Play-v0`) inherit the same defaults (all DR off) and additionally set `eval_mode=True` and `fixed_spawn=True`. No extra flags are needed to run a clean evaluation.
+Play configs (`*-Play-v0`) inherit the same startup-DR defaults (off) and additionally set
+`eval_mode=True`, `fixed_spawn=True`, and `stats_warmup_s=30.0`. No extra flags are needed to run
+a clean evaluation.
 
 ---
 

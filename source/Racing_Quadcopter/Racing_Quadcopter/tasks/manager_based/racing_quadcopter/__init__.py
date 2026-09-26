@@ -66,15 +66,16 @@ gym.register(
 
 gym.register(
     id="Isaac-Racing-Quadcopter-Manager-SkillEval-v0",
-    entry_point=f"{__name__}.racing_quadcopter_multi_track_env:RacingQuadcopterSkillEvalRLEnv",
+    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterSkillEvalRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.racing_quadcopter_multi_track_cfg:RacingQuadcopterSkillEvalEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.racing_quadcopter_env_cfg:RacingQuadcopterSkillEvalEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
 
+# GRU policy (rsl_rl only; skrl uses the MLP config for these IDs too).
 for _id, _cfg in (
     ("Isaac-Racing-Quadcopter-Manager-RNN-v0", "RacingQuadcopterEnvCfg"),
     ("Isaac-Racing-Quadcopter-Manager-RNN-Play-v0", "RacingQuadcopterEnvCfg_PLAY"),
@@ -91,48 +92,3 @@ for _id, _cfg in (
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         },
     )
-
-gym.register(
-    id="Isaac-Racing-Quadcopter-Competition-v0",
-    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="Isaac-Racing-Quadcopter-Competition-Play-v0",
-    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterPPORunnerCfg",
-        "rsl_rl_rnn_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterRecurrentPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="Isaac-Racing-Quadcopter-Competition-RNN-v0",
-    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterRecurrentPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="Isaac-Racing-Quadcopter-Competition-RNN-Play-v0",
-    entry_point=f"{__name__}.racing_quadcopter_env:RacingQuadcopterRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.competition_env_cfg:CompetitionEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RacingQuadcopterRecurrentPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_competition_cfg.yaml",
-    },
-)

@@ -1,3 +1,12 @@
+"""NON-WORKING (as of 2026-09): static SITL-parity checks written for a monorepo layout.
+
+* REPO_ROOT / MANAGER_ROOT assume this repo lives under <root>/ext/, and the Gazebo SDF and
+  Betaflight config paths point outside this repo -> FileNotFoundError.
+* The hovering assertions (default drone anemos_sitl, MAXIMUM_THRUST, BetaflightSitlSurrogateActionCfg,
+  DR flags False) describe a hovering config that no longer exists.
+Kept for reference until the SITL tooling is revived.
+"""
+
 from __future__ import annotations
 
 import json

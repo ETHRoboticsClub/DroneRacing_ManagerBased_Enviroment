@@ -1,62 +1,63 @@
 # Custom Track — Design, Save, and Test Racing Tracks
 
-This directory lets you design drone-racing gate layouts interactively, save them as JSON files, and test a trained policy on any saved track — all without booting Isaac Sim until the final play step.
+This directory lets you design drone-racing gate layouts interactively, save them as YAML files, and test a trained policy on any saved track — all without booting Isaac Sim until the final play step.
 
 ```
 scripts/custom_track/
 ├── track_io.py            # shared I/O + math library (no Isaac, no GUI deps)
 ├── track_designer.py      # PySide6 visual editor
 ├── play_custom_track.py   # load a saved track + run a trained policy
-├── config.json            # default values for gate_size, bar_thickness, etc.
-├── tracks/                # where saved tracks live (JSON files)
-│   ├── track_01_slalom_straights.json
-│   └── ...
-└── tests/
-    └── test_play_custom_track.py   # offline smoke tests (no Isaac required)
+├── config.yaml            # default values for gate_size, bar_thickness, loop_closed
+└── tracks/                # where saved tracks live (YAML files)
+    ├── track_01_slalom_straights.yaml
+    └── ...
 ```
+
+There is currently no `tests/` directory or offline smoke-test script in this folder.
 
 ---
 
 ## Files at a Glance
 
 ### `track_io.py`
-Pure Python (numpy + scipy + stdlib). No Isaac Sim or torch imports — safe to use in the designer, in tests, or anywhere you want to read/write a track programmatically.
+Pure Python (numpy + scipy + PyYAML). No Isaac Sim or torch imports — safe to use in the designer or anywhere you want to read/write a track programmatically.
 
 Key functions:
 
 | Function | What it does |
 |---|---|
-| `default_track()` | Empty track dict with defaults from `config.json` |
-| `save_track(path, track)` | Write track to disk as pretty-printed JSON |
-| `load_track(path)` | Read JSON; back-fills `pitch`/`roll`/`auto_yaw` for old tracks |
+| `default_track()` | Empty track dict with defaults from `config.yaml` |
+| `save_track(path, track)` | Write track to disk as YAML |
+| `load_track(path)` | Read a track YAML (schema `1`); raises on an unsupported `schema_version` |
 | `track_to_arrays(track)` | Convert to `(positions[N,3], quats_wxyz[N,4], meta)` — resolves auto-yaw |
 | `interpolate_loop(centres, n, closed)` | Sample a chord-length cubic spline through the gates |
 | `gate_tangents_from_spline(centres, closed)` | Unit tangent at each gate — used for auto-yaw |
-| `euler_to_quat_wxyz(yaw, pitch, roll)` | Intrinsic ZXY Euler → Isaac Lab `(w,x,y,z)` quaternion |
+| `euler_to_quat_wxyz(roll, pitch, yaw)` | Extrinsic XYZ (ROS RPY) Euler → Isaac Lab `(w,x,y,z)` quaternion |
 | `quat_axes_wxyz(quats)` | Rotate canonical basis by each quaternion → `(right, forward, up)` |
 
-**Track JSON format (schema v1):**
-```json
-{
-  "schema_version": 1,
-  "gate_size":     0.7,
-  "bar_thickness": 0.05,
-  "loop_closed":   true,
-  "gates": [
-    {"x": 0.0, "y": 0.0, "z": 1.5,
-     "yaw": 0.0, "pitch": 0.0, "roll": 0.0, "auto_yaw": true},
-    ...
-  ]
-}
+**Track YAML format (schema v1):**
+```yaml
+schema_version: 1
+track_name: ""
+description: ""
+elements_tested: []
+gate_size:     0.7
+bar_thickness: 0.05
+loop_closed:   true
+gate_track:
+  - position: [0.0, 0.0, 1.5]
+    rotation: [0.0, 0.0, 0.0]   # [roll, pitch, yaw], degrees
+    auto_yaw: true
+  - ...
 ```
 
-Gate angles use **radians on disk**; the designer shows them in degrees.
+Gate angles use **degrees on disk** (same convention the designer shows).
 
-**Angle conventions:**
-- `yaw` — rotates the gate about the world vertical (`+Z`). `yaw=0` means the passage direction points along world `+Y`.
-- `pitch` — tips the gate forward/back about its local right axis (`+X`, after yaw). Positive pitch tilts the top toward the incoming drone.
-- `roll` — banks the gate left/right about its local passage axis (`+Y`, after yaw + pitch).
-- `auto_yaw=true` — the stored yaw is ignored; the yaw is computed from the closed-loop spline tangent at that gate when `track_to_arrays` is called.
+**Angle conventions** (extrinsic XYZ / ROS RPY order; see `track_io.py::euler_to_quat_wxyz`):
+- `rotation[0]` (**roll**) — rotation about world/gate-local `+X` (the bar's right axis).
+- `rotation[1]` (**pitch**) — rotation about `+Y` (the passage direction), applied after roll.
+- `rotation[2]` (**yaw**) — rotation about world `+Z`, **clockwise from +Y** viewed from above: `yaw=0` → passage direction points along world `+Y`, `yaw=90` → `+X`.
+- `auto_yaw=true` — the stored yaw is ignored; the yaw is computed from the closed-loop spline tangent at that gate when `track_to_arrays` is called. Pitch and roll are unaffected by `auto_yaw` and always come from the stored value.
 
 ---
 
@@ -76,23 +77,14 @@ Fork of `scripts/skrl/play.py`. Loads a saved track, builds a one-cell Isaac ter
 Usage:
 ```bash
 python scripts/custom_track/play_custom_track.py \
-    --track my_track \                          # bare name → tracks/my_track.json
+    --track my_track \                          # bare name → tracks/my_track.yaml
     --task Isaac-Racing-Quadcopter-Manager-v0 \
     --checkpoint logs/skrl/my_run/checkpoints/agent_200000.pt
 ```
 
 Pass a full path instead of a bare name if the track lives elsewhere:
 ```bash
---track /absolute/path/to/track.json
-```
-
----
-
-### `tests/test_play_custom_track.py`
-Offline smoke tests that verify track-path resolution, terrain cell sizing, and the world↔local-frame coordinate round-trip. No Isaac Sim required.
-
-```bash
-python scripts/custom_track/tests/test_play_custom_track.py
+--track /absolute/path/to/track.yaml
 ```
 
 ---
@@ -116,7 +108,7 @@ python scripts/custom_track/track_designer.py
 To open an existing track directly:
 
 ```bash
-python scripts/custom_track/track_designer.py scripts/custom_track/tracks/track_01_slalom_straights.json
+python scripts/custom_track/track_designer.py scripts/custom_track/tracks/track_01_slalom_straights.yaml
 ```
 
 ---
@@ -160,8 +152,8 @@ Click the **Select** button in the toolbar. Then **left-click** a gate (blue dot
 
 - **X / Y / Z** — position in metres. Z is the height above the ground.
 - **Yaw** — horizontal rotation in degrees. Leave **Auto-yaw** checked and this field is ignored; the gate will automatically face the next gate along the spline.
-- **Pitch** — tips the gate forward or backward (0 = upright). Positive values tilt the top toward the incoming drone.
-- **Roll** — banks the gate left or right around the passage axis (0 = upright).
+- **Roll** — rotates about the gate's right axis (`+X`), tipping the top forward/backward (0 = upright).
+- **Pitch** — rotates about the gate's passage axis (`+Y`, applied after roll), banking the gate left/right (0 = upright).
 - **Auto-yaw** — when checked, the yaw is derived from the spline tangent at that gate. Uncheck if you want a specific yaw angle.
 
 You can also **drag** a selected gate to a new XY position directly on the canvas.
@@ -190,10 +182,10 @@ In the **Track** section at the bottom of the properties panel:
 | `Default Z` | 1.5 m | Height applied to newly placed gates |
 
 #### 8. Save the track
-**File → Save** (or `Ctrl+S`) saves to the current file. **File → Save As** lets you choose a name. Tracks are always saved to `scripts/custom_track/tracks/` by default. Give your file a descriptive name, e.g. `my_oval.json`.
+**File → Save** (or `Ctrl+S`) saves to the current file. **File → Save As** lets you choose a name. Tracks are always saved to `scripts/custom_track/tracks/` by default. Give your file a descriptive name, e.g. `my_oval.yaml`.
 
 #### 9. Open an existing track
-**File → Open** opens a file dialog rooted at `scripts/custom_track/tracks/`. Select any `.json` file.
+**File → Open** opens a file dialog rooted at `scripts/custom_track/tracks/`. Select any `.yaml` file.
 
 ---
 
@@ -219,10 +211,10 @@ python scripts/custom_track/play_custom_track.py \
     --checkpoint <path/to/checkpoint.pt>
 ```
 
-Replace `<track_name>` with the filename (without `.json`) of any track in `scripts/custom_track/tracks/`, and `<path/to/checkpoint.pt>` with the path to a trained skrl checkpoint.
+Replace `<track_name>` with the filename (without `.yaml`) of any track in `scripts/custom_track/tracks/`, and `<path/to/checkpoint.pt>` with the path to a trained skrl checkpoint.
 
 The script:
-1. Loads the track JSON.
+1. Loads the track YAML.
 2. Computes a square terrain cell just large enough to contain all gates (plus a 2 m margin).
 3. Spawns a single Isaac Sim environment with one drone.
 4. Runs the policy in eval mode — no training, no gradient updates.

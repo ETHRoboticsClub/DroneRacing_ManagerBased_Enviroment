@@ -1,3 +1,7 @@
+# STALE (runs, but is NOT SITL parity any more): written when hovering defaulted to the
+# anemos_sitl profile + Betaflight SITL action. Hovering now trains anemos_urdf with the direct
+# rates action, so this is a plain hovering run at 8192 envs / 10000 iterations.
+
 task_train: Isaac-Hovering-Quadcopter-Manager-v0
 task_play:  Isaac-Hovering-Quadcopter-Manager-Play-v0
 

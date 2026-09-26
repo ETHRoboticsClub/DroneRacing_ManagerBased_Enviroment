@@ -1,7 +1,7 @@
 """Hovering curriculum policy; every value is local to hovering."""
 from __future__ import annotations
 from dataclasses import dataclass
-from Racing_Quadcopter.tasks.manager_based.adaptive_curriculums import (
+from Racing_Quadcopter.tasks.manager_based.mdp.adaptive_curriculums import (
     CurriculumTarget,
     register_randomization_profile,
 )

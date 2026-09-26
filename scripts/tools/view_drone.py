@@ -92,7 +92,7 @@ import Racing_Quadcopter.tasks  # noqa: F401
 from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.racing_quadcopter_env_cfg import (
     DRONE_PROFILES,
 )
-from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.vis.trajectory_vis import (
+from Racing_Quadcopter.tasks.manager_based.racing_quadcopter.trajectory_vis import (
     apply_emissive_to_robots,
 )
 
